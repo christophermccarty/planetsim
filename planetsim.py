@@ -1,4 +1,4 @@
-from generation5 import (regenerate_map_with_slider_values, generate_terrain, generate_temperature_map,
+from generation import (regenerate_map_with_slider_values, generate_terrain, generate_temperature_map,
                          render_terrain_map, render_temperature_map)
 import tkinter as tk
 import cProfile, pstats, io
