@@ -1,12 +1,9 @@
-import cProfile
-import pstats
 import tkinter as tk
 import json
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image, ImageTk
+from PIL import Image
 from opensimplex import OpenSimplex
-from tkinter import ttk
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 
@@ -105,17 +102,17 @@ def create_sidebar(window, frame_update_function):
         "width": 500,
         "height": 500,
         "scale": 200.0,
-        "octaves": 1,
+        "octaves": 2,
         "persistence": 0.7,
         "lacunarity": 2.0,
         "strength": 0.5,
         "scale_factor": 4,
-        "num_small_craters": 15,
-        "num_large_craters": 3,
-        "max_small_radius": 10,
-        "max_large_radius": 40,
-        "max_depth": 0.1,
-        "sigma": 1
+        "num_small_craters": 500,
+        "num_large_craters": 10,
+        "max_small_radius": 30,
+        "max_large_radius": 120,
+        "max_depth": 0.3,
+        "sigma": 2
     }
 
     entries = {}
