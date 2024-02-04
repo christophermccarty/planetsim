@@ -2,13 +2,23 @@ import tkinter as tk
 import json
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from PIL import Image
 from opensimplex import OpenSimplex
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
+import tkinter as tk
+from tkinter import Menu
 
-# Global variable to keep track of whether settings have been saved
-settings_saved = False
+
+# Global variable to store the current terrain map
+current_terrain = None
+
+# Constants for solar radiation simulation
+SOLAR_CONSTANT = 1361  # Solar constant in W/m^2
+DISTANCE_FROM_SUN = 1  # Distance from the sun in AU
+ALBEDO = 0  # Albedo of the planet
+STEFAN_BOLTZMANN_CONSTANT = 5.67e-8  # Stefan-Boltzmann constant in W/m^2/K^4
 
 
 def generate_terrain(width, height, seed=None, scale=200.0, octaves=1, persistence=0.7, lacunarity=2.0):
@@ -162,35 +172,36 @@ def update_terrain_display(terrain, canvas):
             canvas.create_rectangle(j, i, j+1, i+1, fill=color, outline="")
 
 def update_frame(window, canvas, params):
-    terrain = generate_terrain(
+    global current_terrain
+    current_terrain = generate_terrain(
         int(params['width']), int(params['height']), scale=params['scale'],
         octaves=int(params['octaves']), persistence=params['persistence'], lacunarity=params['lacunarity']
     )
-    if terrain is None:
+    if current_terrain is None:
         print("Error: generate_terrain returned None")
         return
 
-    terrain = overlay_large_features(terrain, strength=params['strength'], scale_factor=params['scale_factor'])
-    if terrain is None:
+    current_terrain = overlay_large_features(current_terrain, strength=params['strength'], scale_factor=params['scale_factor'])
+    if current_terrain is None:
         print("Error: overlay_large_features returned None")
         return
 
-    terrain = generate_craters(
-        terrain, num_small_craters=int(params['num_small_craters']),
+    current_terrain = generate_craters(
+        current_terrain, num_small_craters=int(params['num_small_craters']),
         num_large_craters=int(params['num_large_craters']),
         max_small_radius=params['max_small_radius'], max_large_radius=params['max_large_radius'],
         max_depth=params['max_depth']
     )
-    if terrain is None:
+    if current_terrain is None:
         print("Error: generate_craters returned None")
         return
 
-    terrain = apply_minimal_smoothing(terrain, sigma=params['sigma'])
-    if terrain is None:
+    current_terrain = apply_minimal_smoothing(current_terrain, sigma=params['sigma'])
+    if current_terrain is None:
         print("Error: apply_minimal_smoothing returned None")
         return
 
-    update_terrain_display(terrain, canvas)
+    update_terrain_display(current_terrain, canvas)
 
 
 def create_image(terrain):
@@ -200,16 +211,10 @@ def create_image(terrain):
 
 
 def save_settings(entries):
-    global settings_saved
-    if settings_saved:
-        return
-
     settings = {param: float(entry.get()) for param, entry in entries.items() if entry.winfo_exists()}
     print("Settings to save:", settings)  # Debug print
     with open('settings.json', 'w') as f:
         json.dump(settings, f, indent=4)
-
-    settings_saved = True
 
 def exit_program(window, entries):
     print("Exit button clicked")  # Debug print
@@ -238,19 +243,92 @@ def load_settings(entries):
     return settings
 
 
+def calculate_temperature():
+    # Calculate the amount of solar radiation received per unit area
+    solar_radiation = SOLAR_CONSTANT / (DISTANCE_FROM_SUN ** 2)
+
+    # Calculate the amount of solar radiation absorbed per unit area
+    absorbed_radiation = solar_radiation * (1 - ALBEDO)
+
+    # Calculate the average temperature of the planet
+    temperature = (absorbed_radiation / STEFAN_BOLTZMANN_CONSTANT) ** 0.25
+
+    return temperature
+
+
+def view_terrain(window, canvas, entries):
+    if current_terrain is not None:
+        update_terrain_display(current_terrain, canvas)
+    else:
+        print("No terrain map available.")
+
+def view_temperature(window, canvas, entries):
+    params = load_settings(entries)  # Load the updated settings
+    # Calculate the temperature of the planet
+    base_temperature = calculate_temperature()
+
+    # Create a color map from blue (cooler) to red (hotter)
+    cmap = mcolors.LinearSegmentedColormap.from_list("temp_map", ["blue", "red"])
+
+    # Clear the canvas
+    canvas.delete('all')
+
+    # Create a grid of rectangles on the canvas
+    temperatures = []
+    for i in range(1, int(params['height']) - 1):
+        for j in range(1, int(params['width']) - 1):
+            # Define the sun angle based on the y-coordinate
+            sun_angle = np.pi / 2 * (1 - abs(i - params['height'] / 2) / (params['height'] / 2))  # 90 degrees at the equator, decreasing towards the poles
+
+            # Calculate the gradient of the terrain at this location
+            gradient_x = current_terrain[i, j+1] - current_terrain[i, j-1]
+            gradient_y = current_terrain[i+1, j] - current_terrain[i-1, j]
+            terrain_angle = np.arctan(np.sqrt(gradient_x**2 + gradient_y**2))
+
+            # Calculate the angle at which the sun's rays strike the terrain
+            strike_angle = max(0, sun_angle - terrain_angle)
+
+            # Adjust the temperature based on the strike angle
+            temperature = base_temperature * strike_angle / sun_angle
+            temperatures.append(temperature)
+
+    min_temp = min(temperatures)
+    max_temp = max(temperatures)
+
+    for i in range(1, int(params['height']) - 1):
+        for j in range(1, int(params['width']) - 1):
+            # Normalize the temperature to the range [0, 1]
+            normalized_temperature = (temperatures[(i-1) * (int(params['width']) - 2) + (j-1)] - min_temp) / (max_temp - min_temp)
+
+            # Get the color for this tile from the colormap
+            color = cmap(normalized_temperature)
+
+            # Convert the color from RGB to hexadecimal
+            color = '#%02x%02x%02x' % (int(color[0]*255), int(color[1]*255), int(color[2]*255))
+
+            # Create a rectangle on the canvas for this tile
+            canvas.create_rectangle(j, i, j+1, i+1, fill=color, outline="")
+
+
 def main():
     window = tk.Tk()
     window.title("Planet Simulator")
+    # Create a menu bar
+    menubar = Menu(window)
+    # Create a view menu
+    view_menu = Menu(menubar, tearoff=0)
     sidebar, entries = create_sidebar(window, update_frame)
-    params = load_settings(entries)  # Load settings from the JSON file
-    global label
-    label = tk.Label(window)
-    label.pack(side='right', expand=True)
     global canvas  # This global is necessary to prevent the canvas from being garbage collected
-    canvas = tk.Canvas(window, width=params['width'], height=params['height'])  # Set initial size, it will be updated later
+    canvas = tk.Canvas(window, width=500, height=500)  # Set initial size, it will be updated later
     canvas.pack(side='right', expand=True)
+    view_menu.add_command(label="Terrain", command=lambda: view_terrain(window, canvas, entries))
+    view_menu.add_command(label="Temperature", command=lambda: view_temperature(window, canvas, entries))
+    # Add the view menu to the menu bar
+    menubar.add_cascade(label="View", menu=view_menu)
+    # Add the menu bar to the window
+    window.config(menu=menubar)
+    params = load_settings(entries)  # Load settings from the JSON file
     update_frame(window, canvas, params)  # Generate initial terrain after loading settings
-    window.bind('<Destroy>', lambda event: save_settings(entries))  # Save settings when window is about to close
     window.mainloop()
 
 
