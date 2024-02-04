@@ -1,107 +1,16 @@
-import tkinter as tk
 import json
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from PIL import Image
-from opensimplex import OpenSimplex
-from tqdm import tqdm
-from scipy.ndimage import gaussian_filter
 import tkinter as tk
+from PIL import Image
 from tkinter import Menu
+from generation import (generate_terrain, overlay_large_features, add_crater_optimized, generate_craters,
+                        apply_minimal_smoothing, scale_to_grayscale, calculate_temperature)
 
 
 # Global variable to store the current terrain map
 current_terrain = None
-
-# Constants for solar radiation simulation
-SOLAR_CONSTANT = 1361  # Solar constant in W/m^2
-DISTANCE_FROM_SUN = 1  # Distance from the sun in AU
-ALBEDO = 0  # Albedo of the planet
-STEFAN_BOLTZMANN_CONSTANT = 5.67e-8  # Stefan-Boltzmann constant in W/m^2/K^4
-
-
-def generate_terrain(width, height, seed=None, scale=200.0, octaves=1, persistence=0.7, lacunarity=2.0):
-    if seed is None:
-        seed = np.random.randint(0, 100)
-    simplex = OpenSimplex(seed)
-
-    max_amp = 0
-    amp = 1
-    freq = 3
-
-    terrain = np.zeros((height, width))
-
-    # Wrap the outer loop with tqdm for a progress bar
-    for o in tqdm(range(octaves), desc='Generating terrain'):
-        for i in range(height):
-            for j in range(width):
-                terrain[i][j] += simplex.noise2(i / scale * freq, j / scale * freq) * amp
-        max_amp += amp
-        amp *= persistence
-        freq *= lacunarity
-
-    # Normalizing the terrain
-    terrain = (terrain + max_amp) / (2 * max_amp)
-
-    return terrain
-
-def overlay_large_features(terrain, seed=None, strength=0.5, scale_factor=4):
-    if seed is None:
-        seed = np.random.randint(0, 100)
-    simplex = OpenSimplex(seed)
-    height, width = terrain.shape
-    large_scale = max(width, height) / scale_factor
-
-    for i in range(height):
-        for j in range(width):
-            terrain[i][j] += simplex.noise2(i / large_scale, j / large_scale) * strength
-
-    return terrain
-
-def add_crater_optimized(terrain, cx, cy, radius, depth):
-    height, width = terrain.shape
-    y, x = np.ogrid[-cx:height-cx, -cy:width-cy]
-    mask = x**2 + y**2 <= radius**2
-
-    # Apply crater effect within the masked area
-    distance_from_center = np.sqrt(x**2 + y**2)[mask]
-    delta = depth * (1 - distance_from_center / radius)
-    terrain[mask] -= delta
-    terrain[terrain < 0] = 0  # Ensure terrain height doesn't go below 0
-
-def generate_craters(terrain, num_small_craters=15, num_large_craters=3, max_small_radius=10, max_large_radius=40,
-                     max_depth=0.1):
-    total_craters = num_small_craters + num_large_craters
-    with tqdm(total=total_craters, desc='Adding craters') as pbar:
-        # Add small craters
-        for _ in range(num_small_craters):
-            height, width = terrain.shape
-            # Random center, radius, and depth for each crater
-            cx, cy = np.random.randint(0, height), np.random.randint(0, width)
-            radius = np.random.uniform(0, max_small_radius)
-            depth = np.random.uniform(0, max_depth)
-            add_crater_optimized(terrain, cx, cy, radius, depth)
-            pbar.update()
-
-        # Add large craters
-        for _ in range(num_large_craters):
-            height, width = terrain.shape
-            # Random center, radius, and depth for each crater
-            cx, cy = np.random.randint(0, height), np.random.randint(0, width)
-            radius = np.random.uniform(0, max_large_radius)
-            depth = np.random.uniform(0, max_depth)
-            add_crater_optimized(terrain, cx, cy, radius, depth)
-            pbar.update()
-
-    return terrain
-
-def apply_minimal_smoothing(terrain, sigma=1):
-    return gaussian_filter(terrain, sigma=sigma)
-
-def scale_to_grayscale(arr):
-    min_val, max_val = arr.min(), arr.max()
-    return (arr - min_val) / (max_val - min_val) * 255
 
 
 def create_sidebar(window, frame_update_function):
@@ -243,24 +152,12 @@ def load_settings(entries):
     return settings
 
 
-def calculate_temperature():
-    # Calculate the amount of solar radiation received per unit area
-    solar_radiation = SOLAR_CONSTANT / (DISTANCE_FROM_SUN ** 2)
-
-    # Calculate the amount of solar radiation absorbed per unit area
-    absorbed_radiation = solar_radiation * (1 - ALBEDO)
-
-    # Calculate the average temperature of the planet
-    temperature = (absorbed_radiation / STEFAN_BOLTZMANN_CONSTANT) ** 0.25
-
-    return temperature
-
-
 def view_terrain(window, canvas, entries):
     if current_terrain is not None:
         update_terrain_display(current_terrain, canvas)
     else:
         print("No terrain map available.")
+
 
 def view_temperature(window, canvas, entries):
     params = load_settings(entries)  # Load the updated settings
