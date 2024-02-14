@@ -135,7 +135,7 @@ from tqdm import tqdm
 
 from tqdm import tqdm
 
-def calculate_temperature(elevation, latitude):
+def calculate_temperature(elevation, latitude, ocean_map):
     # Constants for solar radiation simulation
     SOLAR_CONSTANT = 1361  # Solar constant in W/m^2
     BOND_ALBEDO = 0.306  # Albedo of the planet
@@ -165,7 +165,54 @@ def calculate_temperature(elevation, latitude):
             greenhouse_effect = WATER_VAPOR + CARBON_DIOXIDE_GHG + METHANE + NITROUS_OXIDE + OZONE
             temp *= (1 + greenhouse_effect) * SUNLIGHT_ABSORPTION
 
+            # Check if the tile is an ocean tile
+            if ocean_map[i, j]:
+                # Adjust the temperature calculation for ocean tiles
+                temp += 2  # Increase the temperature by 2 degrees for ocean tiles
+
             # Store the calculated temperature
             temperature[i][j] = temp
 
     return temperature
+
+
+def flood_fill(i, j, ocean_map, flood_fill_map, terrain_shape):
+    # Stack for the tiles to be checked
+    stack = [(i, j)]
+
+    while stack:
+        i, j = stack.pop()
+
+        if not flood_fill_map[i, j]:
+            flood_fill_map[i, j] = True
+
+            # Check the neighboring tiles
+            if i > 0 and ocean_map[i - 1, j]:
+                stack.append((i - 1, j))
+            if j > 0 and ocean_map[i, j - 1]:
+                stack.append((i, j - 1))
+            if i < terrain_shape[0] - 1 and ocean_map[i + 1, j]:
+                stack.append((i + 1, j))
+            if j < terrain_shape[1] - 1 and ocean_map[i, j + 1]:
+                stack.append((i, j + 1))
+
+
+def simulate_oceans(current_terrain):
+    # Step 1: Initialize ocean_map
+    ocean_map = current_terrain <= 0
+
+    # Step 2: Identify ocean tiles
+    # This is already done in the initialization of ocean_map
+
+    # Step 3: Perform flood fill operation
+    flood_fill_map = np.zeros_like(ocean_map, dtype=bool)
+    for i in tqdm(range(current_terrain.shape[0]), desc='Generating ocean map'):
+        for j in range(current_terrain.shape[1]):
+            if i == 0 or j == 0 or i == current_terrain.shape[0] - 1 or j == current_terrain.shape[1] - 1:
+                if ocean_map[i, j]:
+                    flood_fill(i, j, ocean_map, flood_fill_map, current_terrain.shape)
+
+    # Step 4: Update ocean_map to remove inland areas that are below 0 elevation
+    ocean_map = np.logical_and(ocean_map, flood_fill_map)
+
+    return ocean_map
