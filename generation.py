@@ -3,13 +3,34 @@ from opensimplex import OpenSimplex
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 
-# Constants for solar radiation simulation
-SOLAR_CONSTANT = 1361  # Solar constant in W/m^2
-DISTANCE_FROM_SUN = 1  # Distance from the sun in AU
-ALBEDO = 0  # Albedo of the planet
-STEFAN_BOLTZMANN_CONSTANT = 5.67e-8  # Stefan-Boltzmann constant in W/m^2/K^4
 
-def generate_terrain(width, height, seed=None, scale=200.0, octaves=1, persistence=0.7, lacunarity=2.0):
+
+# Constants for atmospheric composition
+NITROGEN = 0.78084
+OXYGEN = 0.20946
+ARGON = 0.00934
+CARBON_DIOXIDE = 0.000413
+NEON = 0.00001818
+HELIUM = 0.00000524
+METHANE = 0.00000179
+KRYPTON = 0.00000114
+HYDROGEN = 0.00000055
+NITROUS_OXIDE = 0.00000032
+XENON = 0.000000009
+OZONE = 0.000000004
+NITROGEN_DIOXIDE = 0.000000002
+IODINE = 0.000000001
+CARBON_MONOXIDE = 0.000000001
+
+# Constants for greenhouse gases
+WATER_VAPOR = 0.25
+CARBON_DIOXIDE_GHG = 0.65
+METHANE = 0.06
+NITROUS_OXIDE = 0.03
+OZONE = 0.01
+
+
+def generate_terrain(width, height, seed=None, scale=400.0, octaves=1, persistence=0.7, lacunarity=2.0):
     if seed is None:
         seed = np.random.randint(0, 100)
     simplex = OpenSimplex(seed)
@@ -31,6 +52,9 @@ def generate_terrain(width, height, seed=None, scale=200.0, octaves=1, persisten
 
     # Normalizing the terrain
     terrain = (terrain + max_amp) / (2 * max_amp)
+
+    # Scale the normalized terrain values to the range [0, 20000]
+    terrain *= 20000
 
     return terrain
 
@@ -97,14 +121,51 @@ def scale_to_grayscale(arr):
     return (arr - min_val) / (max_val - min_val) * 255
 
 
-def calculate_temperature():
-    # Calculate the amount of solar radiation received per unit area
-    solar_radiation = SOLAR_CONSTANT / (DISTANCE_FROM_SUN ** 2)
+def calculate_greenhouse_effect(temperature):
+    # The greenhouse effect increases the temperature based on the concentration of greenhouse gases
+    greenhouse_effect = WATER_VAPOR + CARBON_DIOXIDE_GHG + METHANE + NITROUS_OXIDE + OZONE
+    return temperature * (1 + greenhouse_effect)
 
-    # Calculate the amount of solar radiation absorbed per unit area
-    absorbed_radiation = solar_radiation * (1 - ALBEDO)
+def apply_atmospheric_model(temperatures):
+    # Apply the greenhouse effect to each temperature in the map
+    return [[calculate_greenhouse_effect(temp) for temp in row] for row in temperatures]
 
-    # Calculate the average temperature of the planet
-    temperature = (absorbed_radiation / STEFAN_BOLTZMANN_CONSTANT) ** 0.25
+
+from tqdm import tqdm
+
+from tqdm import tqdm
+
+def calculate_temperature(elevation, latitude):
+    # Constants for solar radiation simulation
+    SOLAR_CONSTANT = 1361  # Solar constant in W/m^2
+    BOND_ALBEDO = 0.306  # Albedo of the planet
+    STEFAN_BOLTZMANN_CONSTANT = 5.670374419e-8  # Stefan-Boltzmann constant in W/m^2/K^4
+    # Constants for sunlight absorption
+    SUNLIGHT_ABSORPTION = 0.7
+
+    # Calculate equilibrium temperature, T_eq
+    equilibrium_temperature = ((SOLAR_CONSTANT * (1 - BOND_ALBEDO)) / (4 * STEFAN_BOLTZMANN_CONSTANT)) ** 0.25
+
+    # Initialize the temperature array
+    temperature = np.zeros_like(elevation)
+
+    # Iterate over the elevation array with a progress bar
+    for i in tqdm(range(elevation.shape[0]), desc='Calculating temperatures'):
+        for j in range(elevation.shape[1]):
+            # Adjust the temperature based on the elevation and latitude of the tile
+            if elevation[i][j] <= 11000:  # For the troposphere
+                temp = equilibrium_temperature - (0.0065 * elevation[i][j])  # Temperature decreases by 6.5 degrees per km of elevation
+            else:  # For the stratosphere and above
+                temp = equilibrium_temperature - (0.0065 * 11000)  # Temperature is constant
+
+            temp *= 1 - 0.0025 * np.abs(latitude[i])  # Temperature decreases by 2.5 degrees per degree of latitude from the equator
+            temp = temp - 273.15  # Convert from Kelvin to Celsius
+
+            # Adjust the temperature based on the greenhouse gas concentration and solar radiation
+            greenhouse_effect = WATER_VAPOR + CARBON_DIOXIDE_GHG + METHANE + NITROUS_OXIDE + OZONE
+            temp *= (1 + greenhouse_effect) * SUNLIGHT_ABSORPTION
+
+            # Store the calculated temperature
+            temperature[i][j] = temp
 
     return temperature
