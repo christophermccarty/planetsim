@@ -1,226 +1,213 @@
-import random
 import numpy as np
-from PIL import Image, ImageDraw, ImageTk
 from opensimplex import OpenSimplex
-
-class Tile:
-    def __init__(self, altitude, temperature=20.0, biome="Unknown", precipitation=0.0, plate_type="Unknown",
-                 drift_rate=0.0):
-        self.altitude = altitude
-        self.temperature = temperature
-        self.biome = biome
-        self.precipitation = precipitation
-        self.plate_type = plate_type
-        self.drift_rate = drift_rate
+from tqdm import tqdm
+from scipy.ndimage import gaussian_filter
 
 
-def get_terrain_color(altitude, max_altitude, min_altitude):
-    """Maps an altitude value to a terrain color."""
-    color_mapping = {
-        -1.0: "#0b3d91",  # Deep Sea
-        -0.5: "#1e5fb5",  # Ocean
-        -0.0: "#3e8ce3",  # Shallow Sea
-        0.05: "#44a5e5",  # Beach
-        0.1: "#00cc9c",  # Coastal Plain
-        0.2: "#00cc58",  # Lowlands
-        0.3: "#00cc00",  # Plateau
-        0.35: "#7fff00",  # Foothills
-        0.4: "#adff2f",  # Low Mountains
-        0.45: "#ffff00",  # High Mountains
-        0.5: "#ffcc00",  # Snowy Mountains
-        0.55: "#ffa500",  # Alpine
-        0.6: "#ff7f50",  # High Alpine
-        0.65: "#ff6347",  # High Ice Fields
-        0.7: "#ff4500",  # Glacial Peaks
-        0.75: "#8b0000",  # Snowy Peaks
-        0.8: "#8b4513",  # High Peaks
-        0.85: "#a0522d",  # Summit Range
-        0.9: "#d2691e",  # Summit Peaks
-        0.95: "#f4a460",  # High Summit Peaks
-        1.0: "#ffffff"  # Mountaintops
-    }
+# Constants for atmospheric composition
+NITROGEN = 0.78084
+OXYGEN = 0.20946
+ARGON = 0.00934
+CARBON_DIOXIDE = 0.000413
+NEON = 0.00001818
+HELIUM = 0.00000524
+METHANE = 0.00000179
+KRYPTON = 0.00000114
+HYDROGEN = 0.00000055
+NITROUS_OXIDE = 0.00000032
+XENON = 0.000000009
+OZONE = 0.000000004
+NITROGEN_DIOXIDE = 0.000000002
+IODINE = 0.000000001
+CARBON_MONOXIDE = 0.000000001
 
-    # Normalize the altitude value between -1 and 1
-    normalized = 2 * (altitude - min_altitude) / (max_altitude - min_altitude) - 1
-
-    # Find the appropriate color based on the altitude
-    previous_key = None
-    for key in sorted(color_mapping.keys()):
-        if normalized <= key:
-            if previous_key is None:
-                return color_mapping[key]
-            # Choose the color whose key is closest to the normalized altitude
-            if abs(normalized - previous_key) < abs(normalized - key):
-                return color_mapping[previous_key]
-            return color_mapping[key]
-        previous_key = key
-
-def batch_noise3(simplex, x, y, z):
-    # Create an empty array to store the noise values
-    noise_values = np.empty_like(x)
-
-    # Compute the noise values for each coordinate
-    for i in np.ndindex(x.shape):
-        noise_values[i] = simplex.noise3(x[i], y[i], z[i])
-
-    return noise_values
+# Constants for greenhouse gases
+WATER_VAPOR = 0.25
+CARBON_DIOXIDE_GHG = 0.65
+METHANE = 0.06
+NITROUS_OXIDE = 0.03
+OZONE = 0.01
 
 
-def generate_terrain(canvas, width, height, tiles_count, warp_factor,
-                     num_octaves, persistence, lacunarity, amplitude, frequency, scale):
-    simplex = OpenSimplex(seed=random.randint(0, 1000000))
-    frequency *= scale  # Scaling the frequency
-    tiles_x = int((tiles_count // (height / width)) ** 0.5)
-    tiles_y = tiles_count // tiles_x
-    tile_width = width / tiles_x
-    tile_height = height / tiles_y
+def generate_terrain(width, height, seed=None, scale=400.0, octaves=1, persistence=0.7, lacunarity=2.0):
+    if seed is None:
+        seed = np.random.randint(0, 100)
+    simplex = OpenSimplex(seed)
 
-    min_altitude, max_altitude = random.randint(-11000, 0), random.randint(0, 9000)
+    max_amp = 0
+    amp = 1
+    freq = 3
 
-    # Create a grid of u and v coordinates
-    u, v = np.meshgrid(np.linspace(0, 1, tiles_x), np.linspace(0, 1, tiles_y))
+    terrain = np.zeros((height, width))
 
-    # Convert u, v to theta, phi, and then to x, y, z
-    theta = 2 * np.pi * u
-    phi = np.pi * v
-    x = np.sin(phi) * np.cos(theta)
-    y = np.sin(phi) * np.sin(theta)
-    z = np.cos(phi)
+    # Wrap the outer loop with tqdm for a progress bar
+    for o in tqdm(range(octaves), desc='Generating terrain'):
+        for i in range(height):
+            for j in range(width):
+                terrain[i][j] += simplex.noise2(i / scale * freq, j / scale * freq) * amp
+        max_amp += amp
+        amp *= persistence
+        freq *= lacunarity
 
-    # Warp x, y, z
-    warp_x = x + warp_factor * batch_noise3(simplex, x, y, z)
-    warp_y = y + warp_factor * batch_noise3(simplex, y, z, x)
-    warp_z = z + warp_factor * batch_noise3(simplex, z, x, y)
+    # Normalizing the terrain
+    terrain = (terrain + max_amp) / (2 * max_amp)
 
-    # Generate noise values using octaves
-    noise_value = np.zeros_like(u)
-    # amplitude = 1.0
-    # frequency = 0.005
-    for k in range(num_octaves):
-        noise_value += batch_noise3(simplex, warp_x * frequency, warp_y * frequency, warp_z * frequency) * amplitude
-        frequency *= lacunarity
-        amplitude *= persistence
+    # Scale the normalized terrain values to the range [0, 20000]
+    terrain *= 20000
 
-    # Calculate altitude
-    altitude = min_altitude + (noise_value + 1) * 0.5 * (max_altitude - min_altitude)
-
-    # Create an offscreen image buffer and a drawing context
-    buffer = Image.new("RGB", (width, height))
-    draw = ImageDraw.Draw(buffer)
-
-    # Create tiles and draw them onto the offscreen buffer
-    tiles = []
-    for i in range(tiles_x):
-        row = []
-        for j in range(tiles_y):
-            tile_altitude = altitude[j, i]
-            tile = Tile(tile_altitude)
-            color = get_terrain_color(tile_altitude, max_altitude, min_altitude)
-            x0, y0 = i * tile_width, j * tile_height
-            x1, y1 = x0 + tile_width, y0 + tile_height
-            draw.rectangle([(x0, y0), (x1, y1)], fill=color, outline=color)
-            row.append(tile)
-        tiles.append(row)
-
-    # Update the last column of tiles based on the first column
-    for j in range(tiles_y):
-        tiles[tiles_x - 1][j].altitude = tiles[0][j].altitude
-        color = get_terrain_color(tiles[0][j].altitude, max_altitude, min_altitude)
-        x0, y0 = (tiles_x - 1) * tile_width, j * tile_height
-        x1, y1 = x0 + tile_width, y0 + tile_height
-        draw.rectangle([(x0, y0), (x1, y1)], fill=color, outline=color)
-
-    # Convert the PIL image to a Tkinter-compatible image and draw it onto the canvas
-    global tk_image
-    tk_image = ImageTk.PhotoImage(buffer)
-    canvas.create_image(0, 0, anchor="nw", image=tk_image)
-
-    return tiles
+    return terrain
 
 
-def regenerate_map_with_slider_values(sliders, canvas, window_width, window_height, tiles_count):
-    """Retrieve values from the sliders and regenerate the map."""
-    values = {key: slider.get() for key, slider in sliders.items()}
-    simplex = OpenSimplex(seed=random.randint(0, 1000000))
-    generate_terrain(canvas, window_width, window_height, tiles_count,
-                     num_octaves=values["num_octaves"],
-                     persistence=values["persistence"], lacunarity=values["lacunarity"],
-                     amplitude=values["amplitude"], frequency=values["frequency"], scale=values["scale"],
-                     warp_factor=values["warp_factor"])
+def overlay_large_features(terrain, seed=None, strength=0.5, scale_factor=4):
+    if seed is None:
+        seed = np.random.randint(0, 100)
+    simplex = OpenSimplex(seed)
+    height, width = terrain.shape
+    large_scale = max(width, height) / scale_factor
+
+    for i in range(height):
+        for j in range(width):
+            terrain[i][j] += simplex.noise2(i / large_scale, j / large_scale) * strength
+
+    return terrain
 
 
-def generate_temperature_map(tiles):
-    watts_per_square_meter = 1361.0
-    for row in tiles:
-        for tile in row:
-            # Calculate temperature based on solar energy and tile's altitude
-            tile.temperature = (watts_per_square_meter / 100) - (tile.altitude / 1000)
+def add_crater_optimized(terrain, cx, cy, radius, depth):
+    height, width = terrain.shape
+    y, x = np.ogrid[-cx:height-cx, -cy:width-cy]
+    mask = x**2 + y**2 <= radius**2
 
-def get_temperature_color(temperature, max_temperature, min_temperature):
-    # Normalize the temperature value between 0 and 1
-    normalized_temp = (temperature - min_temperature) / (max_temperature - min_temperature)
-
-    # Map the normalized temperature to a color (example: blue to red)
-    r = int(normalized_temp * 255)
-    g = 0
-    b = int((1 - normalized_temp) * 255)
-
-    return (r, g, b)
+    # Apply crater effect within the masked area
+    distance_from_center = np.sqrt(x**2 + y**2)[mask]
+    delta = depth * (1 - distance_from_center / radius)
+    terrain[mask] -= delta
+    terrain[terrain < 0] = 0  # Ensure terrain height doesn't go below 0
 
 
-def render_terrain_map(tiles, canvas, width, height):
-    tiles_x = len(tiles)
-    tiles_y = len(tiles[0])
-    tile_width = width / tiles_x
-    tile_height = height / tiles_y
+def generate_craters(terrain, num_small_craters=15, num_large_craters=3, max_small_radius=10, max_large_radius=40,
+                     max_depth=0.1):
+    total_craters = num_small_craters + num_large_craters
+    with tqdm(total=total_craters, desc='Adding craters') as pbar:
+        # Add small craters
+        for _ in range(num_small_craters):
+            height, width = terrain.shape
+            # Random center, radius, and depth for each crater
+            cx, cy = np.random.randint(0, height), np.random.randint(0, width)
+            radius = np.random.uniform(0, max_small_radius)
+            depth = np.random.uniform(0, max_depth)
+            add_crater_optimized(terrain, cx, cy, radius, depth)
+            pbar.update()
 
-    # Find the maximum and minimum altitude values
-    max_altitude = max(max(tile.altitude for tile in row) for row in tiles)
-    min_altitude = min(min(tile.altitude for tile in row) for row in tiles)
+        # Add large craters
+        for _ in range(num_large_craters):
+            height, width = terrain.shape
+            # Random center, radius, and depth for each crater
+            cx, cy = np.random.randint(0, height), np.random.randint(0, width)
+            radius = np.random.uniform(0, max_large_radius)
+            depth = np.random.uniform(0, max_depth)
+            add_crater_optimized(terrain, cx, cy, radius, depth)
+            pbar.update()
 
-    # Create an offscreen image buffer and a drawing context
-    buffer = Image.new("RGB", (width, height))
-    draw = ImageDraw.Draw(buffer)
-
-    # Draw the tiles onto the offscreen buffer with colors based on altitude
-    for i in range(tiles_x):
-        for j in range(tiles_y):
-            tile_altitude = tiles[i][j].altitude
-            color = get_terrain_color(tile_altitude, max_altitude, min_altitude)
-            x0, y0 = i * tile_width, j * tile_height
-            x1, y1 = x0 + tile_width, y0 + tile_height
-            draw.rectangle([(x0, y0), (x1, y1)], fill=color, outline=color)
-
-    # Convert the PIL image to a Tkinter-compatible image and draw it onto the canvas
-    global tk_image_terrain
-    tk_image_terrain = ImageTk.PhotoImage(buffer)
-    canvas.create_image(0, 0, anchor="nw", image=tk_image_terrain)
+    return terrain
 
 
-def render_temperature_map(tiles, canvas, width, height):
-    tiles_x = len(tiles)
-    tiles_y = len(tiles[0])
-    tile_width = width / tiles_x
-    tile_height = height / tiles_y
+def apply_minimal_smoothing(terrain, sigma=1):
+    return gaussian_filter(terrain, sigma=sigma)
 
-    # Find the maximum and minimum temperature values
-    max_temperature = max(max(tile.temperature for tile in row) for row in tiles)
-    min_temperature = min(min(tile.temperature for tile in row) for row in tiles)
 
-    # Create an offscreen image buffer and a drawing context
-    buffer = Image.new("RGB", (width, height))
-    draw = ImageDraw.Draw(buffer)
+def scale_to_grayscale(arr):
+    min_val, max_val = arr.min(), arr.max()
+    return (arr - min_val) / (max_val - min_val) * 255
 
-    # Draw the tiles onto the offscreen buffer with colors based on temperature
-    for i in range(tiles_x):
-        for j in range(tiles_y):
-            tile_temperature = tiles[i][j].temperature
-            color = get_temperature_color(tile_temperature, max_temperature, min_temperature)
-            x0, y0 = i * tile_width, j * tile_height
-            x1, y1 = x0 + tile_width, y0 + tile_height
-            draw.rectangle([(x0, y0), (x1, y1)], fill=color, outline=color)
 
-    # Convert the PIL image to a Tkinter-compatible image and draw it onto the canvas
-    global tk_image_temperature
-    tk_image_temperature = ImageTk.PhotoImage(buffer)
-    canvas.create_image(0, 0, anchor="nw", image=tk_image_temperature)
+def calculate_greenhouse_effect(temperature):
+    # The greenhouse effect increases the temperature based on the concentration of greenhouse gases
+    greenhouse_effect = WATER_VAPOR + CARBON_DIOXIDE_GHG + METHANE + NITROUS_OXIDE + OZONE
+    return temperature * (1 + greenhouse_effect)
+
+
+def apply_atmospheric_model(temperatures):
+    # Apply the greenhouse effect to each temperature in the map
+    return [[calculate_greenhouse_effect(temp) for temp in row] for row in temperatures]
+
+
+def calculate_temperature(elevation, latitude, ocean_map):
+    # Constants for solar radiation simulation
+    SOLAR_CONSTANT = 1361  # Solar constant in W/m^2
+    BOND_ALBEDO = 0.306  # Albedo of the planet
+    STEFAN_BOLTZMANN_CONSTANT = 5.670374419e-8  # Stefan-Boltzmann constant in W/m^2/K^4
+    # Constants for sunlight absorption
+    SUNLIGHT_ABSORPTION = 0.7
+
+    # Calculate equilibrium temperature, T_eq
+    equilibrium_temperature = ((SOLAR_CONSTANT * (1 - BOND_ALBEDO)) / (4 * STEFAN_BOLTZMANN_CONSTANT)) ** 0.25
+
+    # Initialize the temperature array
+    temperature = np.zeros_like(elevation)
+
+    # Iterate over the elevation array with a progress bar
+    for i in tqdm(range(elevation.shape[0]), desc='Calculating temperatures'):
+        for j in range(elevation.shape[1]):
+            # Adjust the temperature based on the elevation and latitude of the tile
+            if elevation[i][j] <= 11000:  # For the troposphere
+                temp = equilibrium_temperature - (0.0065 * elevation[i][j])  # Temperature decreases by 6.5 degrees per km of elevation
+            else:  # For the stratosphere and above
+                temp = equilibrium_temperature - (0.0065 * 11000)  # Temperature is constant
+
+            temp *= 1 - 0.0025 * np.abs(latitude[i])  # Temperature decreases by 2.5 degrees per degree of latitude from the equator
+            temp = temp - 273.15  # Convert from Kelvin to Celsius
+
+            # Adjust the temperature based on the greenhouse gas concentration and solar radiation
+            greenhouse_effect = WATER_VAPOR + CARBON_DIOXIDE_GHG + METHANE + NITROUS_OXIDE + OZONE
+            temp *= (1 + greenhouse_effect) * SUNLIGHT_ABSORPTION
+
+            # Check if the tile is an ocean tile
+            if ocean_map[i, j]:
+                # Adjust the temperature calculation for ocean tiles
+                temp += 2  # Increase the temperature by 2 degrees for ocean tiles
+
+            # Store the calculated temperature
+            temperature[i][j] = temp
+
+    return temperature
+
+
+def flood_fill(i, j, ocean_map, flood_fill_map, terrain_shape):
+    # Stack for the tiles to be checked
+    stack = [(i, j)]
+
+    while stack:
+        i, j = stack.pop()
+
+        if not flood_fill_map[i, j]:
+            flood_fill_map[i, j] = True
+
+            # Check the neighboring tiles
+            if i > 0 and ocean_map[i - 1, j]:
+                stack.append((i - 1, j))
+            if j > 0 and ocean_map[i, j - 1]:
+                stack.append((i, j - 1))
+            if i < terrain_shape[0] - 1 and ocean_map[i + 1, j]:
+                stack.append((i + 1, j))
+            if j < terrain_shape[1] - 1 and ocean_map[i, j + 1]:
+                stack.append((i, j + 1))
+
+
+def simulate_oceans(current_terrain, zero_elevation_pixel_value):
+    # Step 1: Initialize ocean_map
+    ocean_map = current_terrain < 497.68
+
+    # Step 2: Identify ocean tiles
+    # This is already done in the initialization of ocean_map
+
+    # Step 3: Perform flood fill operation
+    flood_fill_map = np.zeros_like(ocean_map, dtype=bool)
+    for i in tqdm(range(current_terrain.shape[0]), desc='Generating ocean map'):
+        for j in range(current_terrain.shape[1]):
+            if ocean_map[i, j]:
+                flood_fill(i, j, ocean_map, flood_fill_map, current_terrain.shape)
+
+    # Step 4: Update ocean_map to remove inland areas that are below 15.94 elevation
+    ocean_map = np.logical_and(ocean_map, flood_fill_map)
+
+    return ocean_map
