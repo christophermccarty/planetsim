@@ -171,9 +171,18 @@ class PlanetSim:
         # Update the canvas's width and height to match the canvas size
         self.canvas.config(width=self.canvas_size[1], height=self.canvas_size[0])
 
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
     def update_terrain_display(self, terrain, ocean_map):
-        # Create a colormap to map terrain heights to colors
-        cmap = plt.get_cmap('terrain')
+        # Get the 'terrain' colormap
+        terrain_cmap = plt.get_cmap('terrain')
+
+        # Create a new colormap that excludes the blue color values
+        # Adjust the range values as needed to exclude the blue colors
+        no_blue_cmap = mcolors.LinearSegmentedColormap.from_list(
+            'no_blue_terrain', terrain_cmap(np.linspace(0.3, 1, 256))
+        )
 
         # Create an empty array for the colors
         colors = np.zeros((terrain.shape[0], terrain.shape[1], 3), dtype=np.uint8)
@@ -185,8 +194,8 @@ class PlanetSim:
                 if ocean_map[i, j] or terrain[i, j] < 0:
                     colors[i, j] = [0, 0, 139]  # Dark blue color for ocean tiles
                 else:
-                    # Get the color for this tile from the colormap
-                    color = cmap(terrain[i, j] / 8848)  # use elevation value for colormap
+                    # Get the color for this tile from the new colormap
+                    color = no_blue_cmap(terrain[i, j] / 8848)  # use elevation value for colormap
 
                     # Convert the color from RGB to hexadecimal
                     colors[i, j] = [int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)]
