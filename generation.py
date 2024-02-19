@@ -195,7 +195,7 @@ def flood_fill(i, j, ocean_map, flood_fill_map, terrain_shape):
 
 def simulate_oceans(current_terrain, zero_elevation_pixel_value):
     # Step 1: Initialize ocean_map
-    ocean_map = current_terrain < 497.68
+    ocean_map = current_terrain <= 0
 
     # Step 2: Identify ocean tiles
     # This is already done in the initialization of ocean_map

@@ -128,22 +128,28 @@ class PlanetSim:
         print("Loading image...")
         image = Image.open(image_path).convert('L')
         image_np = np.array(image)
+        self.original_image = np.array(image)  # Store the original grayscale image
 
-        # Print the grayscale range
-        print("Grayscale range:", image_np.min(), image_np.max())
+        # Set the canvas size to match the image size
+        self.canvas_size = image_np.shape
 
-        # Resize the canvas to fit the image
-        self.canvas.config(width=image.width, height=image.height)
+        # Print a table of pixel values and their count
+        unique, counts = np.unique(image_np, return_counts=True)
+        print("Pixel values and their count:" + "\n" + str(np.asarray((unique, counts)).T) + "\n")
 
-        # Normalize the grayscale values to the range [-10984, 8848]
+        # Subtract 45 from all pixel values in the image
+        image_np_adjusted = image_np - 45
+
+        # Set all terrain color values that are below pixel values of 45 to 0
+        image_np_adjusted[image_np < 45] = 0
+
+        # Normalize the adjusted pixel values to the range [0, max_height]
         print("Normalizing grayscale values...")
-        min_height = -10984
+        min_height = 0
         max_height = 8848
-        zero_elevation_pixel_value = 497.68
-        min_pixel_value = 0
-        max_pixel_value = 247
-        image_np_scaled = ((image_np - min_pixel_value) / (max_pixel_value - min_pixel_value)) * (
-                    max_height - min_height) + min_height
+        min_pixel_value = image_np_adjusted.min()
+        max_pixel_value = image_np_adjusted.max()
+        image_np_scaled = ((image_np_adjusted - min_pixel_value) / (max_pixel_value - min_pixel_value)) * max_height
 
         # Convert the scaled grayscale values to elevations
         self.current_terrain = image_np_scaled
@@ -151,7 +157,7 @@ class PlanetSim:
         print("Elevation range:", self.current_terrain.min(), self.current_terrain.max())
 
         # Generate the ocean map
-        ocean_map = simulate_oceans(self.current_terrain, zero_elevation_pixel_value)
+        ocean_map = simulate_oceans(self.current_terrain, min_height)
 
         # Display the terrain map on the canvas
         self.update_terrain_display(self.current_terrain, ocean_map)
@@ -160,24 +166,14 @@ class PlanetSim:
         latitudes = np.linspace(-90, 90, self.current_terrain.shape[0])
 
         # Generate the initial temperatures
-        self.temperatures = calculate_temperature(self.current_terrain, latitudes[:, np.newaxis], ocean_map)
+        #self.temperatures = calculate_temperature(self.current_terrain, latitudes[:, np.newaxis], ocean_map)
+
+        # Update the canvas's width and height to match the canvas size
+        self.canvas.config(width=self.canvas_size[1], height=self.canvas_size[0])
 
     def update_terrain_display(self, terrain, ocean_map):
         # Create a colormap to map terrain heights to colors
         cmap = plt.get_cmap('terrain')
-
-        # Initialize terrain_normalized as a copy of terrain
-        terrain_normalized = terrain.copy()
-
-        # Get the indices of the terrain at or above zero_elevation_pixel_value
-        zero_elevation_pixel_value = 497.68
-        indices_above_zero = terrain >= zero_elevation_pixel_value
-
-        # Normalize the terrain heights at indices_above_zero to the range [zero_elevation_pixel_value, max_pixel_value]
-        max_pixel_value = np.max(
-            terrain[indices_above_zero])  # Get the maximum pixel value at or above zero_elevation_pixel_value
-        terrain_normalized[indices_above_zero] = (terrain[indices_above_zero] - zero_elevation_pixel_value) / (
-                max_pixel_value - zero_elevation_pixel_value)
 
         # Create an empty array for the colors
         colors = np.zeros((terrain.shape[0], terrain.shape[1], 3), dtype=np.uint8)
@@ -186,14 +182,11 @@ class PlanetSim:
         for i in tqdm(range(terrain.shape[0]), desc='Generating terrain colors'):
             for j in range(terrain.shape[1]):
                 # Check if the tile is an ocean tile
-                if ocean_map[i, j] or terrain[i, j] < zero_elevation_pixel_value:
+                if ocean_map[i, j] or terrain[i, j] < 0:
                     colors[i, j] = [0, 0, 139]  # Dark blue color for ocean tiles
                 else:
-                    # Adjust the normalized value to start at 0.25 and proceed upwards
-                    adjusted_value = terrain_normalized[i, j] * 0.75 + 0.25
-
                     # Get the color for this tile from the colormap
-                    color = cmap(adjusted_value)  # use adjusted value for colormap
+                    color = cmap(terrain[i, j] / 8848)  # use elevation value for colormap
 
                     # Convert the color from RGB to hexadecimal
                     colors[i, j] = [int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)]
@@ -315,9 +308,6 @@ class PlanetSim:
                 canvas.create_rectangle(j, i, j + 1, i + 1, fill=hex_colors[i][j], outline="")
 
     def on_mouse_move(self, event):
-        if self.temperatures is None or self.current_terrain is None:
-            self.temperatures = self.update_frame(self.params)
-
         # Calculate the tile's index based on the mouse's position
         tile_x = int(event.x // self.TILE_SIZE)
         tile_y = int(event.y // self.TILE_SIZE)
@@ -327,16 +317,24 @@ class PlanetSim:
         tile_y = min(tile_y, self.current_terrain.shape[0] - 1)
 
         # Retrieve the tile's temperature and elevation
-        temperature = round(self.temperatures[tile_y][tile_x], 2)
-        elevation = round(self.current_terrain[tile_y][tile_x], 2)
+        #temperature = round(self.temperatures[tile_y][tile_x], 2)
+        elevation = round(self.current_terrain[tile_y][tile_x], 2)  # self.current_terrain already contains elevations
 
         # Calculate the tile's latitude and longitude
         latitude = round(tile_y / self.current_terrain.shape[0] * 180 - 90, 2)
         longitude = round(tile_x / self.current_terrain.shape[1] * 360 - 180, 2)
 
+        # Retrieve the grayscale pixel value
+        grayscale_pixel_value = self.original_image[tile_y][tile_x]
+
         # Update the window title with the tile's information
+        # self.window.title(
+        #     f"Temperature: {temperature}, Elevation: {elevation}, Latitude: {latitude}, Longitude: {longitude}, "
+        #     f"Grayscale Pixel Value: {grayscale_pixel_value}")
+
         self.window.title(
-            f"Temperature: {temperature}, Elevation: {elevation}, Latitude: {latitude}, Longitude: {longitude}")
+            f"Elevation: {elevation}, Latitude: {latitude}, Longitude: {longitude}, "
+            f"Grayscale Pixel Value: {grayscale_pixel_value}")
 
     def save_settings(self, entries):
         settings = {param: float(entry.get()) for param, entry in entries.items() if entry.winfo_exists()}
@@ -367,7 +365,7 @@ class PlanetSim:
         self.sidebar, self.entries = self.create_sidebar(self.update_frame)  # Initialize self.entries and self.sidebar
         self.params = self.load_settings()  # Load settings from the JSON file
         # Load the image as the tilemap
-        self.load_image_as_terrain(r"D:\dev\planetsim\images\HuffmanPatterson_lowres.png")
+        self.load_image_as_terrain(r"D:\dev\planetsim\images\16_bit_dem_small_earth_1280.png")
         # Display the terrain map on the canvas
         self.view_terrain()
         self.window.mainloop()
