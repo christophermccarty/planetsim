@@ -5,10 +5,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import tkinter as tk
 from tqdm import tqdm
-from tkinter import ttk
 from PIL import Image, ImageTk
 from tkinter import Menu
-from scipy.ndimage import convolve
 from generation import (generate_terrain, overlay_large_features, add_crater_optimized, generate_craters,
                         apply_minimal_smoothing, scale_to_grayscale, calculate_temperature, apply_atmospheric_model,
                         flood_fill)
@@ -244,6 +242,45 @@ class PlanetSim:
 
         return new_ocean_map
 
+    def flood_fill(self, i, j, ocean_map, flood_fill_map):
+        # Stack for the tiles to be checked
+        stack = [(i, j)]
+
+        while stack:
+            i, j = stack.pop()
+            if not flood_fill_map[i, j] and ocean_map[i, j]:
+                flood_fill_map[i, j] = True
+                if i > 0:
+                    stack.append((i - 1, j))
+                if i < ocean_map.shape[0] - 1:
+                    stack.append((i + 1, j))
+                if j > 0:
+                    stack.append((i, j - 1))
+                if j < ocean_map.shape[1] - 1:
+                    stack.append((i, j + 1))
+
+    def remove_inland_oceans(self, ocean_map):
+        flood_fill_map = np.zeros_like(ocean_map, dtype=bool)
+        for i in range(ocean_map.shape[0]):
+            for j in range(ocean_map.shape[1]):
+                if i == 0 or i == ocean_map.shape[0] - 1 or j == 0 or j == ocean_map.shape[1] - 1:
+                    if ocean_map[i, j]:
+                        self.flood_fill(i, j, ocean_map, flood_fill_map)
+
+        return np.logical_and(ocean_map, flood_fill_map)
+
+    def load_water_mask(self, image_path):
+        # Load the image
+        img = Image.open(image_path)
+        # Convert the image to grayscale
+        img = img.convert('L')
+        # Convert the image to a numpy array
+        img_array = np.array(img)
+        # Classify the tiles as ocean or not
+        ocean_map = img_array == 255
+
+        return ocean_map
+
     def update_frame(self, params):
         # Generate the terrain
         self.current_terrain = generate_terrain(
@@ -361,7 +398,7 @@ class PlanetSim:
         tile_y = min(tile_y, self.current_terrain.shape[0] - 1)
 
         # Retrieve the tile's elevation and truncate to 1 decimal place
-        elevation = np.around(self.current_terrain[tile_y][tile_x], 1)
+        elevation = "{:.1f}".format(self.current_terrain[tile_y][tile_x])
 
         # Calculate the tile's latitude and longitude
         latitude = round(90 - tile_y / self.current_terrain.shape[0] * 180, 2)  # Adjusted latitude calculation
@@ -412,10 +449,10 @@ class PlanetSim:
         self.params = self.load_settings()  # Load settings from the JSON file
         self.elevation_matrix = self.load_terrain(
             r"D:\dev\planetsim\images\16_bit_dem_small_1280.tif", -420, 8848)
-        print(f"Terrain loaded with shape {self.elevation_matrix.shape}")
         self.current_terrain = self.elevation_matrix  # Set self.current_terrain to the result of load_terrain
         self.ocean_map = self.classify_ocean(self.elevation_matrix)
-        print(f"Ocean map classified with shape {self.ocean_map.shape}")
+        self.ocean_map = self.remove_inland_oceans(self.ocean_map)
+        self.ocean_map = self.load_water_mask("D:\dev\planetsim\images\water_8k.png")
         # Call the update_terrain_display function
         self.update_terrain_display(self.current_terrain, self.ocean_map)
         # Display the terrain map
