@@ -193,21 +193,32 @@ def flood_fill(i, j, ocean_map, flood_fill_map, terrain_shape):
                 stack.append((i, j + 1))
 
 
-def simulate_oceans(current_terrain, zero_elevation_pixel_value):
-    # Step 1: Initialize ocean_map
-    ocean_map = current_terrain <= 0
+# def simulate_oceans(current_terrain, zero_elevation_pixel_value):
+#     # Step 1: Initialize ocean_map
+#     ocean_map = current_terrain <= 0
+#
+#     # Step 2: Identify ocean tiles
+#     # This is already done in the initialization of ocean_map
+#
+#     # Step 3: Perform flood fill operation
+#     flood_fill_map = np.zeros_like(ocean_map, dtype=bool)
+#     for i in tqdm(range(current_terrain.shape[0]), desc='Generating ocean map'):
+#         for j in range(current_terrain.shape[1]):
+#             if ocean_map[i, j]:
+#                 flood_fill(i, j, ocean_map, flood_fill_map, current_terrain.shape)
+#
+#     # Step 4: Update ocean_map to remove inland areas
+#     ocean_map = np.logical_and(ocean_map, flood_fill_map)
+#
+#     # Iterate over each tile in the terrain
+#     for i in range(3, current_terrain.shape[0] - 3):
+#         for j in range(3, current_terrain.shape[1] - 3):
+#             # Check if the tile is surrounded by land on all sides within a 3-tile radius
+#             if ocean_map[i, j] and all(current_terrain[i + di, j + dj] > zero_elevation_pixel_value for di in range(-3, 4) for dj in range(-3, 4) if not (di == 0 and dj == 0)):
+#                 # If it is, then it is not an ocean tile
+#                 ocean_map[i, j] = False
+#
+#     return ocean_map
 
-    # Step 2: Identify ocean tiles
-    # This is already done in the initialization of ocean_map
 
-    # Step 3: Perform flood fill operation
-    flood_fill_map = np.zeros_like(ocean_map, dtype=bool)
-    for i in tqdm(range(current_terrain.shape[0]), desc='Generating ocean map'):
-        for j in range(current_terrain.shape[1]):
-            if ocean_map[i, j]:
-                flood_fill(i, j, ocean_map, flood_fill_map, current_terrain.shape)
 
-    # Step 4: Update ocean_map to remove inland areas that are below 15.94 elevation
-    ocean_map = np.logical_and(ocean_map, flood_fill_map)
-
-    return ocean_map

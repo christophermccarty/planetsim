@@ -1,5 +1,6 @@
 import json
 import numpy as np
+import rasterio
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import tkinter as tk
@@ -7,16 +8,17 @@ from tqdm import tqdm
 from tkinter import ttk
 from PIL import Image, ImageTk
 from tkinter import Menu
+from scipy.ndimage import convolve
 from generation import (generate_terrain, overlay_large_features, add_crater_optimized, generate_craters,
                         apply_minimal_smoothing, scale_to_grayscale, calculate_temperature, apply_atmospheric_model,
-                        simulate_oceans, flood_fill)
+                        flood_fill)
 
 
 class PlanetSim:
     def __init__(self):
         self.current_terrain = None
         self.temperatures = None
-        self.TILE_SIZE = 10
+        self.TILE_SIZE = 20
         self.canvas_size = 500
         self.terrain_size = 500
         self.TILE_SIZE = self.canvas_size / self.terrain_size
@@ -26,6 +28,9 @@ class PlanetSim:
         self.info_label = tk.Label(self.window)
         self.info_label.pack()
         self.current_ocean_map = None
+        self.min_elevation = -420
+        self.max_elevation = 8848
+
 
     def create_sidebar(self, frame_update_function):
         sidebar = tk.Frame(self.window, width=200, bg='gray')
@@ -92,7 +97,7 @@ class PlanetSim:
 
         # Display the terrain map on the canvas
         if self.current_terrain is not None:
-            ocean_map = simulate_oceans(self.current_terrain)
+            ocean_map = self.classify_ocean(self.current_terrain)
             self.update_terrain_display(self.current_terrain, ocean_map)
         else:
             print("No terrain map available.")
@@ -123,97 +128,121 @@ class PlanetSim:
         # Update the terrain display
         self.update_terrain_display(self.current_terrain)
 
-    def load_image_as_terrain(self, image_path):
-        # Load the image
-        print("Loading image...")
-        image = Image.open(image_path).convert('L')
-        image_np = np.array(image)
-        self.original_image = np.array(image)  # Store the original grayscale image
+    def load_terrain(self, image_path, min_elevation, max_elevation):
+        # Open the image file
+        with rasterio.open(image_path) as src:
+            # Read the data into a numpy array
+            image_data = src.read(1)
 
-        # Set the canvas size to match the image size
-        self.canvas_size = image_np.shape
+        # Update the canvas size to match the image size
+        self.canvas.config(width=image_data.shape[1], height=image_data.shape[0])
 
-        # Print a table of pixel values and their count
-        unique, counts = np.unique(image_np, return_counts=True)
-        print("Pixel values and their count:" + "\n" + str(np.asarray((unique, counts)).T) + "\n")
+        # Store the original image data
+        self.original_image = image_data
 
-        # Subtract 45 from all pixel values in the image
-        image_np_adjusted = image_np - 45
+        # Print the range of grayscale values
+        print(f"Grayscale range: {image_data.min()} - {image_data.max()}")
 
-        # Set all terrain color values that are below pixel values of 45 to 0
-        image_np_adjusted[image_np < 45] = 0
+        # Calculate the scale factor to map pixel values to the elevation range
+        scale_factor = (max_elevation - min_elevation) / (image_data.max() - image_data.min() + 1)
 
-        # Normalize the adjusted pixel values to the range [0, max_height]
-        print("Normalizing grayscale values...")
-        min_height = 0
-        max_height = 8848
-        min_pixel_value = image_np_adjusted.min()
-        max_pixel_value = image_np_adjusted.max()
-        image_np_scaled = ((image_np_adjusted - min_pixel_value) / (max_pixel_value - min_pixel_value)) * max_height
+        # Initialize an elevation matrix
+        elevation_matrix = np.zeros_like(image_data, dtype=np.float32)
 
-        # Convert the scaled grayscale values to elevations
-        self.current_terrain = image_np_scaled
-        print("Loading terrain...")
-        print("Elevation range:", self.current_terrain.min(), self.current_terrain.max())
+        # Map the grayscale values to elevations
+        total_pixels = image_data.shape[0] * image_data.shape[1]
+        with tqdm(total=total_pixels, desc='Loading terrain') as pbar:
+            for i in range(image_data.shape[0]):
+                for j in range(image_data.shape[1]):
+                    # Map the pixel value to the elevation range
+                    elevation = (image_data[i][j] - image_data.min()) * scale_factor + min_elevation
+                    # If the elevation is less than 1 and greater than -1, round it up to 1
+                    if -2 < elevation < 1:
+                        elevation = 1
+                    # Truncate the elevation to 1 decimal place
+                    elevation = np.around(elevation, 1)
+                    elevation_matrix[i][j] = elevation
+                    pbar.update(1)
 
-        # Generate the ocean map
-        ocean_map = simulate_oceans(self.current_terrain, min_height)
+        return elevation_matrix
 
-        # Display the terrain map on the canvas
-        self.update_terrain_display(self.current_terrain, ocean_map)
+    def update_terrain_display(self, terrain, ocean_map=None):
+        try:
+            # Get the 'terrain' colormap
+            terrain_cmap = plt.get_cmap('terrain')
 
-        # Calculate the latitude for each row in the terrain
-        latitudes = np.linspace(-90, 90, self.current_terrain.shape[0])
+            # Create a custom colormap that excludes the bottom 25% of color values
+            custom_cmap = mcolors.LinearSegmentedColormap.from_list(
+                'custom_cmap',
+                terrain_cmap(np.linspace(0.25, 1, 256))
+            )
 
-        # Generate the initial temperatures
-        #self.temperatures = calculate_temperature(self.current_terrain, latitudes[:, np.newaxis], ocean_map)
+            # Normalize the terrain values to the range of the colormap
+            norm = plt.Normalize(vmin=self.min_elevation, vmax=self.max_elevation)
 
-        # Update the canvas's width and height to match the canvas size
-        self.canvas.config(width=self.canvas_size[1], height=self.canvas_size[0])
+            # Calculate the colors for the terrain using vectorized operations
+            terrain_colors = terrain_cmap(norm(terrain))
+            terrain_colors = np.array(terrain_colors)  # Convert terrain_colors to a numpy array
+            terrain_colors[terrain > 0] = custom_cmap(norm(terrain[terrain > 0]))
 
-    import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
+            # Store the terrain colors
+            self.terrain_colors = terrain_colors
 
-    def update_terrain_display(self, terrain, ocean_map):
-        # Get the 'terrain' colormap
-        terrain_cmap = plt.get_cmap('terrain')
+            # If ocean_map is provided, set the color of ocean tiles to blue
+            if ocean_map is not None:
+                print(f"ocean_map shape: {ocean_map.shape}, terrain shape: {terrain.shape}")  # Debug print
+                terrain_colors[ocean_map] = [0, 0, 1, 1]  # Blue color for ocean tiles
 
-        # Create a new colormap that excludes the blue color values
-        # Adjust the range values as needed to exclude the blue colors
-        no_blue_cmap = mcolors.LinearSegmentedColormap.from_list(
-            'no_blue_terrain', terrain_cmap(np.linspace(0.3, 1, 256))
-        )
+            # Convert the colors from RGBA to RGB and scale to [0, 255]
+            colors = (terrain_colors[:, :, :3] * 255).astype(np.uint8)
 
-        # Create an empty array for the colors
-        colors = np.zeros((terrain.shape[0], terrain.shape[1], 3), dtype=np.uint8)
+            # Create an image from the colors array
+            image = Image.fromarray(colors)
 
-        # Calculate the colors for the terrain
-        for i in tqdm(range(terrain.shape[0]), desc='Generating terrain colors'):
-            for j in range(terrain.shape[1]):
-                # Check if the tile is an ocean tile
-                if ocean_map[i, j] or terrain[i, j] < 0:
-                    colors[i, j] = [0, 0, 139]  # Dark blue color for ocean tiles
-                else:
-                    # Get the color for this tile from the new colormap
-                    color = no_blue_cmap(terrain[i, j] / 8848)  # use elevation value for colormap
+            # Convert the PIL.Image.Image object to a tkinter.PhotoImage object
+            photo_image = ImageTk.PhotoImage(image)
 
-                    # Convert the color from RGB to hexadecimal
-                    colors[i, j] = [int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)]
+            # Clear the canvas
+            self.canvas.delete('all')
 
-        # Create an image from the colors array
-        image = Image.fromarray(colors)
+            # Draw the PhotoImage on the canvas
+            self.canvas.create_image(0, 0, image=photo_image, anchor='nw')
 
-        # Create a PhotoImage from the image
-        photo_image = ImageTk.PhotoImage(image)
+            # Keep a reference to the PhotoImage to prevent it from being garbage collected
+            self.photo_image = photo_image
 
-        # Clear the canvas
-        self.canvas.delete('all')
+            print("Canvas updated")
 
-        # Draw the PhotoImage on the canvas
-        self.canvas.create_image(0, 0, image=photo_image, anchor='nw')
+        except Exception as e:
+            print(f"An error occurred: {e}")
 
-        # Keep a reference to the PhotoImage to prevent it from being garbage collected
-        self.photo_image = photo_image
+    def classify_ocean(self, elevation_matrix, ocean_level=394.66, neighbor_threshold=4):
+        # Initialize the ocean map
+        ocean_map = np.zeros_like(elevation_matrix, dtype=bool)
+
+        # Classify ocean tiles
+        for i in tqdm(range(elevation_matrix.shape[0]), desc='Classifying ocean tiles'):
+            for j in range(elevation_matrix.shape[1]):
+                # Mark tiles as ocean if their elevation is at or below the ocean level
+                ocean_map[i][j] = elevation_matrix[i][j] < ocean_level
+
+        # Create a copy of the ocean map to modify
+        new_ocean_map = ocean_map.copy()
+
+        # Iterate over the ocean map again
+        for i in range(1, ocean_map.shape[0] - 1):
+            for j in range(1, ocean_map.shape[1] - 1):
+                # If the current tile is not an ocean tile
+                if not ocean_map[i][j]:
+                    # Count the number of neighboring ocean tiles
+                    neighbor_count = np.sum(ocean_map[i - 1:i + 2, j - 1:j + 2]) - ocean_map[i][j]
+
+                    # If the number of neighboring ocean tiles is greater than or equal to the threshold
+                    if neighbor_count >= neighbor_threshold:
+                        # Mark the current tile as an ocean tile
+                        new_ocean_map[i][j] = True
+
+        return new_ocean_map
 
     def update_frame(self, params):
         # Generate the terrain
@@ -277,6 +306,7 @@ class PlanetSim:
     def view_terrain(self):
         if self.current_terrain is not None and self.current_ocean_map is not None:
             self.update_terrain_display(self.current_terrain, self.current_ocean_map)
+            print("Terrain viewed")
         else:
             print("No terrain map available.")
 
@@ -317,6 +347,11 @@ class PlanetSim:
                 canvas.create_rectangle(j, i, j + 1, i + 1, fill=hex_colors[i][j], outline="")
 
     def on_mouse_move(self, event):
+        # Check if self.current_terrain is None
+        if self.current_terrain is None:
+            print("Warning: current_terrain is None")
+            return
+
         # Calculate the tile's index based on the mouse's position
         tile_x = int(event.x // self.TILE_SIZE)
         tile_y = int(event.y // self.TILE_SIZE)
@@ -325,24 +360,26 @@ class PlanetSim:
         tile_x = min(tile_x, self.current_terrain.shape[1] - 1)
         tile_y = min(tile_y, self.current_terrain.shape[0] - 1)
 
-        # Retrieve the tile's temperature and elevation
-        #temperature = round(self.temperatures[tile_y][tile_x], 2)
-        elevation = round(self.current_terrain[tile_y][tile_x], 2)  # self.current_terrain already contains elevations
+        # Retrieve the tile's elevation and truncate to 1 decimal place
+        elevation = np.around(self.current_terrain[tile_y][tile_x], 1)
 
         # Calculate the tile's latitude and longitude
-        latitude = round(tile_y / self.current_terrain.shape[0] * 180 - 90, 2)
+        latitude = round(90 - tile_y / self.current_terrain.shape[0] * 180, 2)  # Adjusted latitude calculation
         longitude = round(tile_x / self.current_terrain.shape[1] * 360 - 180, 2)
 
         # Retrieve the grayscale pixel value
         grayscale_pixel_value = self.original_image[tile_y][tile_x]
 
-        # Update the window title with the tile's information
-        # self.window.title(
-        #     f"Temperature: {temperature}, Elevation: {elevation}, Latitude: {latitude}, Longitude: {longitude}, "
-        #     f"Grayscale Pixel Value: {grayscale_pixel_value}")
+        # Calculate the altitude and truncate to 1 decimal place
+        altitude = np.around(max(0, (grayscale_pixel_value - 8068) / (self.original_image.max() - 8068) * 8848), 1)
 
+        # If the altitude is greater than 0 and less than 1, round it up to 1
+        if 0 < altitude < 1:
+            altitude = 1
+
+        # Update the window title with the tile's information
         self.window.title(
-            f"Elevation: {elevation}, Latitude: {latitude}, Longitude: {longitude}, "
+            f"Elevation: {elevation}, Altitude: {altitude}, Latitude: {latitude}, Longitude: {longitude}, "
             f"Grayscale Pixel Value: {grayscale_pixel_value}")
 
     def save_settings(self, entries):
@@ -373,9 +410,15 @@ class PlanetSim:
         self.window.config(menu=menubar)
         self.sidebar, self.entries = self.create_sidebar(self.update_frame)  # Initialize self.entries and self.sidebar
         self.params = self.load_settings()  # Load settings from the JSON file
-        # Load the image as the tilemap
-        self.load_image_as_terrain(r"D:\dev\planetsim\images\16_bit_dem_small_earth_1280.png")
-        # Display the terrain map on the canvas
+        self.elevation_matrix = self.load_terrain(
+            r"D:\dev\planetsim\images\16_bit_dem_small_1280.tif", -420, 8848)
+        print(f"Terrain loaded with shape {self.elevation_matrix.shape}")
+        self.current_terrain = self.elevation_matrix  # Set self.current_terrain to the result of load_terrain
+        self.ocean_map = self.classify_ocean(self.elevation_matrix)
+        print(f"Ocean map classified with shape {self.ocean_map.shape}")
+        # Call the update_terrain_display function
+        self.update_terrain_display(self.current_terrain, self.ocean_map)
+        # Display the terrain map
         self.view_terrain()
         self.window.mainloop()
 
