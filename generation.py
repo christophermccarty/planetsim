@@ -21,12 +21,16 @@ NITROGEN_DIOXIDE = 0.000000002
 IODINE = 0.000000001
 CARBON_MONOXIDE = 0.000000001
 
-# Constants for greenhouse gases
-WATER_VAPOR = 0.25
-CARBON_DIOXIDE_GHG = 0.65
-METHANE = 0.06
-NITROUS_OXIDE = 0.03
-OZONE = 0.01
+# Constants for radiative forcing of greenhouse gases (W/m^2)
+WATER_VAPOR_RF = 0.15  # Estimated value, actual value varies greatly
+CARBON_DIOXIDE_RF = 1.82
+METHANE_RF = 0.48
+NITROUS_OXIDE_RF = 0.17
+OZONE_RF = 0.35  # Tropospheric Ozone
+
+# Constants for albedo
+ALBEDO_LAND = 0.3  # Albedo of land
+ALBEDO_WATER = 0.06  # Albedo of water
 
 
 def generate_terrain(width, height, seed=None, scale=400.0, octaves=1, persistence=0.7, lacunarity=2.0):
@@ -120,27 +124,43 @@ def scale_to_grayscale(arr):
     return (arr - min_val) / (max_val - min_val) * 255
 
 
-def calculate_greenhouse_effect(temperature):
-    # The greenhouse effect increases the temperature based on the concentration of greenhouse gases
-    greenhouse_effect = WATER_VAPOR + CARBON_DIOXIDE_GHG + METHANE + NITROUS_OXIDE + OZONE
-    return temperature * (1 + greenhouse_effect)
-
-
 def apply_atmospheric_model(temperatures):
     # Apply the greenhouse effect to each temperature in the map
     return [[calculate_greenhouse_effect(temp) for temp in row] for row in temperatures]
 
 
-def calculate_temperature(elevation, latitude, ocean_map):
-    # Constants for solar radiation simulation
+def calculate_greenhouse_effect(temperature, radiative_forcing):
+    # The greenhouse effect increases the temperature based on the radiative forcing of greenhouse gases
+    return temperature * (1 + radiative_forcing)
+
+
+def calculate_solar_insolation(latitude, day_of_year, time_of_day):
+    # Constants for solar insolation calculation
     SOLAR_CONSTANT = 1361  # Solar constant in W/m^2
+    PLANET_TILT = 0  # Tilt of the Earth's axis in degrees
+
+    # Calculate the declination angle
+    declination_angle = np.radians(PLANET_TILT * np.cos((day_of_year + 10) / 365.25 * 2 * np.pi))
+
+    # Calculate the hour angle
+    hour_angle = np.radians((time_of_day - 12) * 15)
+
+    # Calculate the solar zenith angle
+    solar_zenith_angle = np.arccos(np.sin(np.radians(latitude)) * np.sin(declination_angle) +
+                                    np.cos(np.radians(latitude)) * np.cos(declination_angle) * np.cos(hour_angle))
+
+    # Calculate the solar insolation
+    solar_insolation = SOLAR_CONSTANT * np.cos(solar_zenith_angle)
+
+    return solar_insolation
+
+
+def calculate_temperature(elevation, latitude, ocean_map, day_of_year, time_of_day):
+    # Constants for solar radiation simulation
     BOND_ALBEDO = 0.306  # Albedo of the planet
     STEFAN_BOLTZMANN_CONSTANT = 5.670374419e-8  # Stefan-Boltzmann constant in W/m^2/K^4
     # Constants for sunlight absorption
     SUNLIGHT_ABSORPTION = 0.7
-
-    # Calculate equilibrium temperature, T_eq
-    equilibrium_temperature = ((SOLAR_CONSTANT * (1 - BOND_ALBEDO)) / (4 * STEFAN_BOLTZMANN_CONSTANT)) ** 0.25
 
     # Initialize the temperature array
     temperature = np.zeros_like(elevation)
@@ -148,18 +168,29 @@ def calculate_temperature(elevation, latitude, ocean_map):
     # Iterate over the elevation array with a progress bar
     for i in tqdm(range(elevation.shape[0]), desc='Calculating temperatures'):
         for j in range(elevation.shape[1]):
-            # Adjust the temperature based on the elevation and latitude of the tile
+            # Calculate the solar insolation
+            solar_insolation = calculate_solar_insolation(latitude[i], day_of_year, time_of_day)
+
+            # Adjust the solar insolation based on the albedo of the tile
+            if ocean_map[i, j]:
+                solar_insolation *= (1 - ALBEDO_WATER)
+            else:
+                solar_insolation *= (1 - ALBEDO_LAND)
+
+            # Calculate the equilibrium temperature
+            equilibrium_temperature = ((solar_insolation * (1 - BOND_ALBEDO)) / (4 * STEFAN_BOLTZMANN_CONSTANT)) ** 0.25
+
+            # Adjust the temperature based on the elevation of the tile
             if elevation[i][j] <= 11000:  # For the troposphere
                 temp = equilibrium_temperature - (0.0065 * elevation[i][j])  # Temperature decreases by 6.5 degrees per km of elevation
             else:  # For the stratosphere and above
                 temp = equilibrium_temperature - (0.0065 * 11000)  # Temperature is constant
 
-            temp *= 1 - 0.0025 * np.abs(latitude[i])  # Temperature decreases by 2.5 degrees per degree of latitude from the equator
             temp = temp - 273.15  # Convert from Kelvin to Celsius
 
             # Adjust the temperature based on the greenhouse gas concentration and solar radiation
-            greenhouse_effect = WATER_VAPOR + CARBON_DIOXIDE_GHG + METHANE + NITROUS_OXIDE + OZONE
-            temp *= (1 + greenhouse_effect) * SUNLIGHT_ABSORPTION
+            radiative_forcing = WATER_VAPOR_RF + CARBON_DIOXIDE_RF + METHANE_RF + NITROUS_OXIDE_RF + OZONE_RF
+            temp = calculate_greenhouse_effect(temp, radiative_forcing)
 
             # Check if the tile is an ocean tile
             if ocean_map[i, j]:
@@ -170,7 +201,6 @@ def calculate_temperature(elevation, latitude, ocean_map):
             temperature[i][j] = temp
 
     return temperature
-
 
 def flood_fill(i, j, ocean_map, flood_fill_map, terrain_shape):
     # Stack for the tiles to be checked
@@ -191,34 +221,3 @@ def flood_fill(i, j, ocean_map, flood_fill_map, terrain_shape):
                 stack.append((i + 1, j))
             if j < terrain_shape[1] - 1 and ocean_map[i, j + 1]:
                 stack.append((i, j + 1))
-
-
-# def simulate_oceans(current_terrain, zero_elevation_pixel_value):
-#     # Step 1: Initialize ocean_map
-#     ocean_map = current_terrain <= 0
-#
-#     # Step 2: Identify ocean tiles
-#     # This is already done in the initialization of ocean_map
-#
-#     # Step 3: Perform flood fill operation
-#     flood_fill_map = np.zeros_like(ocean_map, dtype=bool)
-#     for i in tqdm(range(current_terrain.shape[0]), desc='Generating ocean map'):
-#         for j in range(current_terrain.shape[1]):
-#             if ocean_map[i, j]:
-#                 flood_fill(i, j, ocean_map, flood_fill_map, current_terrain.shape)
-#
-#     # Step 4: Update ocean_map to remove inland areas
-#     ocean_map = np.logical_and(ocean_map, flood_fill_map)
-#
-#     # Iterate over each tile in the terrain
-#     for i in range(3, current_terrain.shape[0] - 3):
-#         for j in range(3, current_terrain.shape[1] - 3):
-#             # Check if the tile is surrounded by land on all sides within a 3-tile radius
-#             if ocean_map[i, j] and all(current_terrain[i + di, j + dj] > zero_elevation_pixel_value for di in range(-3, 4) for dj in range(-3, 4) if not (di == 0 and dj == 0)):
-#                 # If it is, then it is not an ocean tile
-#                 ocean_map[i, j] = False
-#
-#     return ocean_map
-
-
-
