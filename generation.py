@@ -2,6 +2,8 @@ import numpy as np
 from opensimplex import OpenSimplex
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
+from scipy.optimize import fsolve
+from scipy.interpolate import interp1d
 
 
 # Constants for atmospheric composition
@@ -124,100 +126,41 @@ def scale_to_grayscale(arr):
     return (arr - min_val) / (max_val - min_val) * 255
 
 
-def apply_atmospheric_model(temperatures):
-    # Apply the greenhouse effect to each temperature in the map
-    return [[calculate_greenhouse_effect(temp) for temp in row] for row in temperatures]
+# Create a function to calculate the latitude of each tile
+def calculate_latitudes(terrain, step=10):
+    # Constants
+    R = 6371  # Radius of the Earth (km)
+
+    # Calculate the latitude of each tile for a subset of points
+    subset_indices = np.arange(0, terrain.shape[0], step)
+    subset_latitudes = 90 - (subset_indices / terrain.shape[0]) * 180
+
+    # Use interpolation to estimate the latitudes for the remaining points
+    interpolate = interp1d(subset_indices, subset_latitudes, kind='linear', fill_value="extrapolate")
+    latitudes_array = interpolate(np.arange(terrain.shape[0]))
+
+    return latitudes_array
 
 
-def calculate_greenhouse_effect(temperature, radiative_forcing):
-    # The greenhouse effect increases the temperature based on the radiative forcing of greenhouse gases
-    return temperature * (1 + radiative_forcing)
+def calculate_temperature(args):
+    # Eventually add back in atmospheric temperature generation with
+    # atmospheric_temperatures = np.zeros_like(terrain)
+    # Tatm_solution = f * Ts_solution
+    # atmospheric_temperatures[i][j] = Tatm_solution
+    # and return atmospheric_temperatures as well
+    terrain, resized_shape, lat = args
+    # Constants
+    S0 = 1361  # Solar constant (W/m2)
+    sigma = 5.67e-8  # Stefan-Boltzmann constant (W/m2/K4)
+    A = 0.3  # Albedo
+    G = 0.85  # Greenhouse factor
+    epsilon = 0.8  # Atmospheric emissivity
+    f = 0.7  # Factor to relate Tatm to Ts
 
+    # Create a 2D array of latitudes
+    latitudes_2d = np.tile(lat, (resized_shape[1], 1)).T
 
-def calculate_solar_insolation(latitude, day_of_year, time_of_day):
-    # Constants for solar insolation calculation
-    SOLAR_CONSTANT = 1361  # Solar constant in W/m^2
-    PLANET_TILT = 0  # Tilt of the Earth's axis in degrees
+    # Linear model for temperature based on latitude
+    Ts_solutions = 288 - 0.5 * np.abs(latitudes_2d)  # 288 is the average global temperature in K, 0.5 is a scaling factor
 
-    # Calculate the declination angle
-    declination_angle = np.radians(PLANET_TILT * np.cos((day_of_year + 10) / 365.25 * 2 * np.pi))
-
-    # Calculate the hour angle
-    hour_angle = np.radians((time_of_day - 12) * 15)
-
-    # Calculate the solar zenith angle
-    solar_zenith_angle = np.arccos(np.sin(np.radians(latitude)) * np.sin(declination_angle) +
-                                    np.cos(np.radians(latitude)) * np.cos(declination_angle) * np.cos(hour_angle))
-
-    # Calculate the solar insolation
-    solar_insolation = SOLAR_CONSTANT * np.cos(solar_zenith_angle)
-
-    return solar_insolation
-
-
-def calculate_temperature(elevation, latitude, ocean_map, day_of_year, time_of_day):
-    # Constants for solar radiation simulation
-    BOND_ALBEDO = 0.306  # Albedo of the planet
-    STEFAN_BOLTZMANN_CONSTANT = 5.670374419e-8  # Stefan-Boltzmann constant in W/m^2/K^4
-    # Constants for sunlight absorption
-    SUNLIGHT_ABSORPTION = 0.7
-
-    # Initialize the temperature array
-    temperature = np.zeros_like(elevation)
-
-    # Iterate over the elevation array with a progress bar
-    for i in tqdm(range(elevation.shape[0]), desc='Calculating temperatures'):
-        for j in range(elevation.shape[1]):
-            # Calculate the solar insolation
-            solar_insolation = calculate_solar_insolation(latitude[i], day_of_year, time_of_day)
-
-            # Adjust the solar insolation based on the albedo of the tile
-            if ocean_map[i, j]:
-                solar_insolation *= (1 - ALBEDO_WATER)
-            else:
-                solar_insolation *= (1 - ALBEDO_LAND)
-
-            # Calculate the equilibrium temperature
-            equilibrium_temperature = ((solar_insolation * (1 - BOND_ALBEDO)) / (4 * STEFAN_BOLTZMANN_CONSTANT)) ** 0.25
-
-            # Adjust the temperature based on the elevation of the tile
-            if elevation[i][j] <= 11000:  # For the troposphere
-                temp = equilibrium_temperature - (0.0065 * elevation[i][j])  # Temperature decreases by 6.5 degrees per km of elevation
-            else:  # For the stratosphere and above
-                temp = equilibrium_temperature - (0.0065 * 11000)  # Temperature is constant
-
-            temp = temp - 273.15  # Convert from Kelvin to Celsius
-
-            # Adjust the temperature based on the greenhouse gas concentration and solar radiation
-            radiative_forcing = WATER_VAPOR_RF + CARBON_DIOXIDE_RF + METHANE_RF + NITROUS_OXIDE_RF + OZONE_RF
-            temp = calculate_greenhouse_effect(temp, radiative_forcing)
-
-            # Check if the tile is an ocean tile
-            if ocean_map[i, j]:
-                # Adjust the temperature calculation for ocean tiles
-                temp += 2  # Increase the temperature by 2 degrees for ocean tiles
-
-            # Store the calculated temperature
-            temperature[i][j] = temp
-
-    return temperature
-
-def flood_fill(i, j, ocean_map, flood_fill_map, terrain_shape):
-    # Stack for the tiles to be checked
-    stack = [(i, j)]
-
-    while stack:
-        i, j = stack.pop()
-
-        if not flood_fill_map[i, j]:
-            flood_fill_map[i, j] = True
-
-            # Check the neighboring tiles
-            if i > 0 and ocean_map[i - 1, j]:
-                stack.append((i - 1, j))
-            if j > 0 and ocean_map[i, j - 1]:
-                stack.append((i, j - 1))
-            if i < terrain_shape[0] - 1 and ocean_map[i + 1, j]:
-                stack.append((i + 1, j))
-            if j < terrain_shape[1] - 1 and ocean_map[i, j + 1]:
-                stack.append((i, j + 1))
+    return Ts_solutions

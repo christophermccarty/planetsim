@@ -9,7 +9,9 @@ import tkinter as tk
 from tqdm import tqdm
 from PIL import Image, ImageTk, ImageGrab
 from tkinter import Menu
-from generation import (generate_terrain, generate_craters, scale_to_grayscale, calculate_temperature)
+from multiprocessing import Pool, cpu_count
+from generation import (generate_terrain, generate_craters, scale_to_grayscale, calculate_temperature,
+                        calculate_latitudes)
 
 
 class PlanetSim:
@@ -149,6 +151,19 @@ class PlanetSim:
             # Read the data into a numpy array
             image_data = src.read(1)
 
+        # Resize the image to half its original size using nearest-neighbor interpolation
+        image_data_resized = Image.fromarray(image_data).resize((image_data.shape[1] // 2, image_data.shape[0] // 2),
+                                                                Image.NEAREST)
+
+        # Calculate the total number of pixels based on the resized image
+        total_pixels = image_data_resized.size[0] * image_data_resized.size[1]
+
+        # Scale the image back up to the original size
+        image_data = image_data_resized.resize((image_data.shape[1], image_data.shape[0]), Image.NEAREST)
+
+        # Convert the image back to a numpy array
+        image_data = np.array(image_data)
+
         # Update the canvas size to match the image size
         self.canvas.config(width=image_data.shape[1], height=image_data.shape[0])
 
@@ -165,10 +180,9 @@ class PlanetSim:
         elevation_matrix = np.zeros_like(image_data, dtype=np.float32)
 
         # Map the grayscale values to elevations
-        total_pixels = image_data.shape[0] * image_data.shape[1]
         with tqdm(total=total_pixels, desc='Loading terrain') as pbar:
-            for i in range(image_data.shape[0]):
-                for j in range(image_data.shape[1]):
+            for i in range(image_data_resized.size[1]):
+                for j in range(image_data_resized.size[0]):
                     # Map the pixel value to the elevation range
                     elevation = (image_data[i][j] - image_data.min()) * scale_factor + min_elevation
                     # If the elevation is less than 1 and greater than -1, round it up to 1
@@ -326,20 +340,14 @@ class PlanetSim:
             print("Error: generate_craters returned None")
             return
 
-        # Calculate the latitude for each row in the terrain
-        latitudes = np.linspace(-90, 90, self.current_terrain.shape[0])
-
-        # Calculate the temperature
-        self.temperatures = calculate_temperature(self.current_terrain, latitudes[:, np.newaxis], self.ocean_map,
-                                                  self.day_of_year, self.time_of_day)
-        if self.temperatures is None:
-            print("Error: calculate_temperature returned None")
-            return
+        # Ensure self.current_terrain is a 2D array
+        if len(self.current_terrain.shape) != 2:
+            # Reshape self.current_terrain into a 2D array
+            self.current_terrain = self.current_terrain.reshape(
+                (self.current_terrain.shape[0], self.current_terrain.shape[1]))
 
         # Update the terrain display
         self.update_terrain_display(self.current_terrain)
-
-        return self.temperatures
 
     def create_image(self, terrain):
         terrain_scaled = scale_to_grayscale(terrain).astype('uint8')
@@ -388,10 +396,14 @@ class PlanetSim:
         # Create a color map from blue (cooler) to red (hotter)
         cmap = plt.get_cmap('coolwarm')
 
+        # Squeeze self.temperatures to remove dimensions of size 1
+        self.temperatures = np.squeeze(self.temperatures)
+
         # Normalize the temperatures to the range [0, 1]
         min_temp = self.temperatures.min()
         max_temp = self.temperatures.max()
-        normalized_temperatures = (self.temperatures - min_temp) / (max_temp - min_temp)
+        epsilon = 1e-7
+        normalized_temperatures = (self.temperatures - min_temp) / (max_temp - min_temp + epsilon)
 
         # Create a new figure with the same size as the terrain map canvas
         fig = Figure(figsize=(self.current_terrain.shape[1] / 100, self.current_terrain.shape[0] / 100))
@@ -522,12 +534,17 @@ class PlanetSim:
         self.ocean_map = self.load_water_mask("D:\dev\planetsim\images\water_8k.png")
 
         # Calculate the temperatures
-        self.temperatures = calculate_temperature(self.current_terrain, self.latitude, self.ocean_map, self.day_of_year, self.time_of_day)
-        # Call the update_terrain_display function
+        with Pool(cpu_count() - 1) as p:
+            latitudes = calculate_latitudes(self.current_terrain)
+            args = [(self.current_terrain, self.current_terrain.shape, lat) for lat in latitudes]
+            self.temperatures = np.array(p.map(calculate_temperature, args))
 
+        # Call the update_terrain_display function
         self.update_terrain_display(self.current_terrain, self.ocean_map)
         # Display the terrain map
         self.view_terrain()
+        # Display the temperature map but remove this after testing
+        self.view_temperature()
         self.window.mainloop()
 
 
