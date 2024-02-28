@@ -1,5 +1,13 @@
 {
     "width": 500.0,
     "height": 500.0,
-    "sigma": 2.0
+    "scale": 1.0,
+    "octaves": 1.0,
+    "persistence": 0.7,
+    "lacunarity": 2.0,
+    "num_small_craters": 15.0,
+    "num_large_craters": 3.0,
+    "max_small_radius": 10.0,
+    "max_large_radius": 40.0,
+    "max_depth": 0.3
 }
