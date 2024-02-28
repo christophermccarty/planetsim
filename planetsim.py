@@ -9,7 +9,7 @@ import tkinter as tk
 from tqdm import tqdm
 from PIL import Image, ImageTk, ImageGrab
 from tkinter import Menu
-from multiprocessing import Pool, cpu_count
+import multiprocessing
 from scipy.ndimage import zoom
 from generation import (generate_terrain, generate_craters, scale_to_grayscale, calculate_temperature,
                         calculate_latitudes)
@@ -147,36 +147,39 @@ class PlanetSim:
         # Update the terrain display
         self.update_terrain_display(self.current_terrain)
 
+    @staticmethod
+    def load_terrain_chunk(args):
+        image_data, min_elevation, max_elevation, start_row, end_row = args
+        total_pixels = (end_row - start_row) * image_data.shape[1]
+        scale_factor = (max_elevation - min_elevation) / (image_data.max() - image_data.min() + 1)
+        elevation_matrix = np.zeros((end_row - start_row, image_data.shape[1]), dtype=np.float32)
+        for i in range(start_row, end_row):
+            for j in range(image_data.shape[1]):
+                elevation = (image_data[i][j] - image_data.min()) * scale_factor + min_elevation
+                if -2 < elevation < 1:
+                    elevation = 1
+                elevation = np.around(elevation, 1)
+                elevation_matrix[i - start_row][j] = elevation
+        return elevation_matrix
+
     def load_terrain(self, image_path, min_elevation, max_elevation):
-        # Open the image file
         with rasterio.open(image_path) as src:
-            # Read the data into a numpy array
             image_data = src.read(1)
 
         self.original_image = image_data
 
-        # Calculate the total number of pixels based on the image
-        total_pixels = image_data.size
+        num_cores = multiprocessing.cpu_count()
+        num_cores = num_cores - 1 if num_cores > 1 else 1
+        pool = multiprocessing.Pool(num_cores)
 
-        # Calculate the scale factor to map pixel values to the elevation range
-        scale_factor = (max_elevation - min_elevation) / (image_data.max() - image_data.min() + 1)
+        chunk_size = image_data.shape[0] // num_cores
+        args = [(image_data, min_elevation, max_elevation, i * chunk_size, (i + 1) * chunk_size) for i in
+                range(num_cores)]
+        args[-1] = (image_data, min_elevation, max_elevation, (num_cores - 1) * chunk_size,
+                    image_data.shape[0])  # Make sure the last chunk goes to the end of the image
 
-        # Initialize an elevation matrix
-        elevation_matrix = np.zeros_like(image_data, dtype=np.float32)
-
-        # Map the grayscale values to elevations
-        with tqdm(total=total_pixels, desc='Loading terrain') as pbar:
-            for i in range(image_data.shape[0]):  # iterate over the height
-                for j in range(image_data.shape[1]):  # iterate over the width
-                    # Map the pixel value to the elevation range
-                    elevation = (image_data[i][j] - image_data.min()) * scale_factor + min_elevation
-                    # If the elevation is less than 1 and greater than -1, round it up to 1
-                    if -2 < elevation < 1:
-                        elevation = 1
-                    # Truncate the elevation to 1 decimal place
-                    elevation = np.around(elevation, 1)
-                    elevation_matrix[i][j] = elevation
-                    pbar.update(1)
+        results = pool.map(self.load_terrain_chunk, args)
+        elevation_matrix = np.concatenate(results, axis=0)
 
         return elevation_matrix
 
@@ -429,7 +432,7 @@ class PlanetSim:
         for item in datas:
             # change all white (also shades of whites)
             # pixels to yellow
-            newData.append((item[0], item[1], item[2], 128))
+            newData.append((item[0], item[1], item[2], 200))
 
         temp_img.putdata(newData)
 
@@ -477,8 +480,8 @@ class PlanetSim:
             altitude = np.around(max(0, (grayscale_pixel_value - 8068) / (self.original_image.max() - 8068) * 8848), 1)
         else:
             altitude = "N/A"
-        # If the altitude is greater than 0 and less than 1, round it up to 1
-        if 0 < altitude < 1:
+        # Convert altitude to float before comparison if it's not 'N/A'
+        if altitude != 'N/A' and 0 < float(altitude) < 1:
             altitude = 1
 
         # Convert self.temperatures to a 2D array
