@@ -3,13 +3,16 @@ import numpy as np
 import rasterio
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import tkinter as tk
 from tqdm import tqdm
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageGrab
 from tkinter import Menu
-from generation import (generate_terrain, overlay_large_features, add_crater_optimized, generate_craters,
-                        apply_minimal_smoothing, scale_to_grayscale, calculate_temperature, apply_atmospheric_model,
-                        flood_fill)
+from multiprocessing import Pool, cpu_count
+from scipy.ndimage import zoom
+from generation import (generate_terrain, generate_craters, scale_to_grayscale, calculate_temperature,
+                        calculate_latitudes)
 
 
 class PlanetSim:
@@ -22,12 +25,22 @@ class PlanetSim:
         self.TILE_SIZE = self.canvas_size / self.terrain_size
         self.window = tk.Tk()
         self.window.title("Planet Simulator")
-        self.canvas = tk.Canvas(self.window, width=500, height=500)
+        self.canvas = tk.Canvas(self.window, width=self.canvas_size, height=self.canvas_size)
         self.info_label = tk.Label(self.window)
         self.info_label.pack()
         self.current_ocean_map = None
+        self.original_image = None
+
         self.min_elevation = -420
         self.max_elevation = 8848
+        self.ocean_level = 0
+
+        # Set the day of the year and time of day
+        self.day_of_year = 80  # March 21st
+        self.time_of_day = 12  # Noon
+
+        self.ALBEDO_WATER = 0.06
+        self.ALBEDO_LAND = 0.3
 
 
     def create_sidebar(self, frame_update_function):
@@ -36,7 +49,15 @@ class PlanetSim:
         params = {
             "width": 500,
             "height": 500,
-            "sigma": 2
+            "scale": 1.0,
+            "octaves": 1,
+            "persistence": 0.7,
+            "lacunarity": 2.0,
+            "num_small_craters": 15,
+            "num_large_craters": 3,
+            "max_small_radius": 10,
+            "max_large_radius": 40,
+            "max_depth": 0.3
         }
 
         terrain_params = {
@@ -132,14 +153,10 @@ class PlanetSim:
             # Read the data into a numpy array
             image_data = src.read(1)
 
-        # Update the canvas size to match the image size
-        self.canvas.config(width=image_data.shape[1], height=image_data.shape[0])
-
-        # Store the original image data
         self.original_image = image_data
 
-        # Print the range of grayscale values
-        print(f"Grayscale range: {image_data.min()} - {image_data.max()}")
+        # Calculate the total number of pixels based on the image
+        total_pixels = image_data.size
 
         # Calculate the scale factor to map pixel values to the elevation range
         scale_factor = (max_elevation - min_elevation) / (image_data.max() - image_data.min() + 1)
@@ -148,10 +165,9 @@ class PlanetSim:
         elevation_matrix = np.zeros_like(image_data, dtype=np.float32)
 
         # Map the grayscale values to elevations
-        total_pixels = image_data.shape[0] * image_data.shape[1]
         with tqdm(total=total_pixels, desc='Loading terrain') as pbar:
-            for i in range(image_data.shape[0]):
-                for j in range(image_data.shape[1]):
+            for i in range(image_data.shape[0]):  # iterate over the height
+                for j in range(image_data.shape[1]):  # iterate over the width
                     # Map the pixel value to the elevation range
                     elevation = (image_data[i][j] - image_data.min()) * scale_factor + min_elevation
                     # If the elevation is less than 1 and greater than -1, round it up to 1
@@ -188,23 +204,44 @@ class PlanetSim:
 
             # If ocean_map is provided, set the color of ocean tiles to blue
             if ocean_map is not None:
-                print(f"ocean_map shape: {ocean_map.shape}, terrain shape: {terrain.shape}")  # Debug print
-                terrain_colors[ocean_map] = [0, 0, 1, 1]  # Blue color for ocean tiles
+                # Resize ocean_map to match terrain_colors using PIL.Image.resize
+                ocean_map_image = Image.fromarray(ocean_map)
+                ocean_map_resized = ocean_map_image.resize((terrain_colors.shape[1], terrain_colors.shape[0]),
+                                                           Image.NEAREST)
+                ocean_map = np.array(ocean_map_resized)
+                print(ocean_map.shape)
+
+                # Only update the colors of the tiles that are classified as ocean tiles
+                terrain_colors[np.where(ocean_map)] = [0, 0, 1, 1]  # Blue color for ocean tiles
 
             # Convert the colors from RGBA to RGB and scale to [0, 255]
             colors = (terrain_colors[:, :, :3] * 255).astype(np.uint8)
 
             # Create an image from the colors array
-            image = Image.fromarray(colors)
+            with tqdm(total=1, desc='Creating image') as pbar:
+                image = Image.fromarray(colors)
+                pbar.update()
 
             # Convert the PIL.Image.Image object to a tkinter.PhotoImage object
+            with tqdm(total=1, desc='Converting to PhotoImage') as pbar:
+                photo_image = ImageTk.PhotoImage(image)
+                pbar.update()
+
+            image = Image.fromarray(colors)
+            image = image.resize((terrain.shape[1], terrain.shape[0]))  # Resize the image to match the terrain size
             photo_image = ImageTk.PhotoImage(image)
 
             # Clear the canvas
             self.canvas.delete('all')
 
+            # Resize the canvas to match the size of the terrain
+            self.canvas.config(width=terrain.shape[1], height=terrain.shape[0])
+            self.canvas.update()
+
             # Draw the PhotoImage on the canvas
-            self.canvas.create_image(0, 0, image=photo_image, anchor='nw')
+            with tqdm(total=1, desc='Drawing PhotoImage') as pbar:
+                self.canvas.create_image(0, 0, image=photo_image, anchor='nw')
+                pbar.update()
 
             # Keep a reference to the PhotoImage to prevent it from being garbage collected
             self.photo_image = photo_image
@@ -214,7 +251,9 @@ class PlanetSim:
         except Exception as e:
             print(f"An error occurred: {e}")
 
-    def classify_ocean(self, elevation_matrix, ocean_level=394.66, neighbor_threshold=4):
+
+    @staticmethod
+    def classify_ocean(elevation_matrix, ocean_level=394.66, neighbor_threshold=4):
         # Initialize the ocean map
         ocean_map = np.zeros_like(elevation_matrix, dtype=bool)
 
@@ -302,19 +341,14 @@ class PlanetSim:
             print("Error: generate_craters returned None")
             return
 
-        # Calculate the latitude for each row in the terrain
-        latitudes = np.linspace(-90, 90, self.current_terrain.shape[0])
-
-        # Calculate the temperature
-        self.temperatures = calculate_temperature(self.current_terrain, latitudes[:, np.newaxis])
-        if self.temperatures is None:
-            print("Error: calculate_temperature returned None")
-            return
+        # Ensure self.current_terrain is a 2D array
+        if len(self.current_terrain.shape) != 2:
+            # Reshape self.current_terrain into a 2D array
+            self.current_terrain = self.current_terrain.reshape(
+                (self.current_terrain.shape[0], self.current_terrain.shape[1]))
 
         # Update the terrain display
         self.update_terrain_display(self.current_terrain)
-
-        return self.temperatures
 
     def create_image(self, terrain):
         terrain_scaled = scale_to_grayscale(terrain).astype('uint8')
@@ -329,14 +363,21 @@ class PlanetSim:
             print("Settings file not found. Using default settings.")
             settings = {}
 
+        # List of all keys that should be present in the settings
+        keys = ['width', 'height', 'scale', 'octaves', 'persistence', 'lacunarity', 'num_small_craters',
+                'num_large_craters', 'max_small_radius', 'max_large_radius', 'max_depth']
+
+        # Default values for the keys
+        default_values = [500, 500, 1.0, 1, 0.7, 2.0, 15, 3, 10, 40, 0.3]
+
         # Ensure all necessary keys are present in settings
-        for param, entry in self.entries.items():
-            if param not in settings:
-                print(f"Key '{param}' not found in settings. Using default value.")
-                settings[param] = float(entry.get())
-            elif entry.winfo_exists():
-                entry.delete(0, tk.END)
-                entry.insert(0, str(settings[param]))
+        for i, key in enumerate(keys):
+            if key not in settings:
+                print(f"Key '{key}' not found in settings. Using default value.")
+                settings[key] = default_values[i]
+            elif self.entries[key].winfo_exists():
+                self.entries[key].delete(0, tk.END)
+                self.entries[key].insert(0, str(settings[key]))
 
         return settings
 
@@ -347,41 +388,57 @@ class PlanetSim:
         else:
             print("No terrain map available.")
 
-    def view_temperature(self, window, canvas):
-        # Ensure self.temperatures is not None
-        if self.temperatures is None:
-            self.temperatures = self.update_frame(self.params)
-            if self.temperatures is None:
-                print("Error: Failed to generate temperatures")
-                return
+    def view_temperature(self):
+        # Ensure self.temperatures is not None and not a scalar
+        if self.temperatures is None or self.temperatures.size == 1:
+            print("Error: No valid temperature data available.")
+            return
+
+        # Calculate min_temp and max_temp
+        min_temp = np.min(self.temperatures)
+        max_temp = np.max(self.temperatures)
+
+        # Ensure min_temp and max_temp are not None
+        if min_temp is None or max_temp is None:
+            print("Error: Could not calculate min_temp or max_temp.")
+            return
+
+        epsilon = 1e-7
+        # Normalize the temperatures to the range [0, 1]
+        normalized_temperatures = (self.temperatures - min_temp) / (max_temp - min_temp + epsilon)
+
+        # Downsample the normalized_temperatures array
+        downsample_factor = 0.5  # Adjust this value to change the resolution
+        normalized_temperatures = zoom(normalized_temperatures, downsample_factor)
 
         # Create a color map from blue (cooler) to red (hotter)
         cmap = plt.get_cmap('coolwarm')
 
+        # Apply the colormap to the normalized temperatures
+        img_data = cmap(normalized_temperatures)
+
+        # Convert the data to 8-bit RGBA values
+        img_data = (img_data * 255).astype(np.uint8)
+
+        # Create a PIL image from the data
+        img = Image.fromarray(img_data, 'RGBA')
+
+        # Resize the image to fill the canvas
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        img = img.resize((canvas_width, canvas_height), Image.LANCZOS)
+
+        # Convert the PIL image to a Tkinter PhotoImage
+        photo = ImageTk.PhotoImage(img)
+
         # Clear the canvas
-        canvas.delete('all')
+        self.canvas.delete('all')
 
-        # Normalize the temperatures to the range [0, 1]
-        normalized_temperatures = (self.temperatures - self.temperatures.min()) / (
-                self.temperatures.max() - self.temperatures.min())
+        # Draw the PhotoImage onto the canvas
+        self.canvas.create_image(0, 0, image=photo, anchor='nw')
 
-        # Convert the normalized temperatures to colors
-        rgba_colors = cmap(normalized_temperatures)
-
-        # Flatten the rgba_colors array
-        flattened_rgba_colors = rgba_colors.reshape(-1, rgba_colors.shape[-1])
-
-        # Convert the RGBA colors to hexadecimal color strings
-        hex_colors = ['#%02x%02x%02x' % (int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)) for color in
-                      flattened_rgba_colors]
-
-        # Reshape hex_colors to match the original shape of rgba_colors
-        hex_colors = np.array(hex_colors).reshape(rgba_colors.shape[0], rgba_colors.shape[1])
-
-        # Draw the tiles on the canvas
-        for i in tqdm(range(self.current_terrain.shape[0]), desc='Drawing tiles'):
-            for j in range(self.current_terrain.shape[1]):
-                canvas.create_rectangle(j, i, j + 1, i + 1, fill=hex_colors[i][j], outline="")
+        # Keep a reference to the PhotoImage to prevent it from being garbage collected
+        self.photo_image = photo
 
     def on_mouse_move(self, event):
         # Check if self.current_terrain is None
@@ -405,19 +462,34 @@ class PlanetSim:
         longitude = round(tile_x / self.current_terrain.shape[1] * 360 - 180, 2)
 
         # Retrieve the grayscale pixel value
-        grayscale_pixel_value = self.original_image[tile_y][tile_x]
+        if self.original_image is not None:
+            grayscale_pixel_value = self.original_image[tile_y][tile_x]
+        else:
+            grayscale_pixel_value = "N/A"
 
         # Calculate the altitude and truncate to 1 decimal place
-        altitude = np.around(max(0, (grayscale_pixel_value - 8068) / (self.original_image.max() - 8068) * 8848), 1)
-
+        if grayscale_pixel_value != "N/A":
+            altitude = np.around(max(0, (grayscale_pixel_value - 8068) / (self.original_image.max() - 8068) * 8848), 1)
+        else:
+            altitude = "N/A"
         # If the altitude is greater than 0 and less than 1, round it up to 1
         if 0 < altitude < 1:
             altitude = 1
 
+        # Convert self.temperatures to a 2D array
+        self.temperatures = np.squeeze(self.temperatures)
+
+        # Retrieve the tile's temperature and truncate to 1 decimal place
+        if self.temperatures is not None and len(self.temperatures.shape) > 1 and tile_y < self.temperatures.shape[
+            0] and tile_x < self.temperatures.shape[1]:
+            temperature = "{:.1f}".format(self.temperatures[tile_y][tile_x])
+        else:
+            temperature = "N/A"
+
         # Update the window title with the tile's information
         self.window.title(
             f"Elevation: {elevation}, Altitude: {altitude}, Latitude: {latitude}, Longitude: {longitude}, "
-            f"Grayscale Pixel Value: {grayscale_pixel_value}")
+            f"Grayscale Pixel Value: {grayscale_pixel_value}, Temperature: {temperature}")
 
     def save_settings(self, entries):
         settings = {param: float(entry.get()) for param, entry in entries.items() if entry.winfo_exists()}
@@ -434,29 +506,38 @@ class PlanetSim:
     def main(self):
         self.canvas.bind("<Motion>", self.on_mouse_move)
         self.canvas.pack(side='right', expand=True)
-        # Create a menu bar
         menubar = Menu(self.window)
-        # Create a view menu
         view_menu = Menu(menubar, tearoff=0)
         view_menu.add_command(label="Terrain", command=self.show_terrain_entries)
         view_menu.add_command(label="New Terrain", command=self.generate_terrain_from_menu)
-        view_menu.add_command(label="Temperature", command=lambda: self.view_temperature(self.window, self.canvas))
-        # Add the view menu to the menu bar
+        view_menu.add_command(label="Temperature",
+                              command=lambda: self.view_temperature() if self.temperatures is not None else print(
+                                  "Temperature data not available"))
         menubar.add_cascade(label="View", menu=view_menu)
-        # Add the menu bar to the window
         self.window.config(menu=menubar)
-        self.sidebar, self.entries = self.create_sidebar(self.update_frame)  # Initialize self.entries and self.sidebar
-        self.params = self.load_settings()  # Load settings from the JSON file
+        self.sidebar, self.entries = self.create_sidebar(self.update_frame)
+        self.params = self.load_settings()
+
         self.elevation_matrix = self.load_terrain(
             r"D:\dev\planetsim\images\16_bit_dem_small_1280.tif", -420, 8848)
-        self.current_terrain = self.elevation_matrix  # Set self.current_terrain to the result of load_terrain
-        self.ocean_map = self.classify_ocean(self.elevation_matrix)
+        self.current_terrain = self.elevation_matrix
+        self.latitude = np.linspace(-90, 90, self.current_terrain.shape[0])
+
+        self.ocean_map = PlanetSim.classify_ocean(self.current_terrain)
         self.ocean_map = self.remove_inland_oceans(self.ocean_map)
         self.ocean_map = self.load_water_mask("D:\dev\planetsim\images\water_8k.png")
-        # Call the update_terrain_display function
-        self.update_terrain_display(self.current_terrain, self.ocean_map)
-        # Display the terrain map
-        self.view_terrain()
+
+        # Replace multiprocessing with a list comprehension
+        latitudes = calculate_latitudes(self.current_terrain)
+        args = [(self.current_terrain, self.current_terrain.shape, lat) for lat in latitudes]
+        self.temperatures = np.array([calculate_temperature(arg) for arg in args])
+
+        # Call the update_terrain_display function with the loaded terrain image
+        self.update_terrain_display(self.elevation_matrix, self.ocean_map)
+
+        print(f"Loaded terrain shape: {self.elevation_matrix.shape}")
+        print(f"Loaded ocean_map shape: {self.ocean_map.shape}")
+
         self.window.mainloop()
 
 
