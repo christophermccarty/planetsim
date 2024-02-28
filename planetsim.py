@@ -407,10 +407,6 @@ class PlanetSim:
         # Normalize the temperatures to the range [0, 1]
         normalized_temperatures = (self.temperatures - min_temp) / (max_temp - min_temp + epsilon)
 
-        # Downsample the normalized_temperatures array
-        downsample_factor = 0.5  # Adjust this value to change the resolution
-        normalized_temperatures = zoom(normalized_temperatures, downsample_factor)
-
         # Create a color map from blue (cooler) to red (hotter)
         cmap = plt.get_cmap('coolwarm')
 
@@ -419,20 +415,29 @@ class PlanetSim:
 
         # Convert the data to 8-bit RGBA values
         img_data = (img_data * 255).astype(np.uint8)
-
         # Create a PIL image from the data
-        img = Image.fromarray(img_data, 'RGBA')
+        temp_img = Image.fromarray(img_data, 'RGBA')
 
-        # Resize the image to fill the canvas
-        canvas_width = self.canvas.winfo_width()
-        canvas_height = self.canvas.winfo_height()
-        img = img.resize((canvas_width, canvas_height), Image.LANCZOS)
+        # Create a PIL image from the terrain colors
+        terrain_img = Image.fromarray((self.terrain_colors * 255).astype(np.uint8), 'RGBA')
+
+        # Adjust the alpha channel of the temperature image to control its transparency
+        temp_img = temp_img.convert("RGBA")
+        datas = temp_img.getdata()
+
+        newData = []
+        for item in datas:
+            # change all white (also shades of whites)
+            # pixels to yellow
+            newData.append((item[0], item[1], item[2], 128))
+
+        temp_img.putdata(newData)
+
+        # Paste the temperature image onto the terrain image using the alpha channel of the temperature image as the mask
+        terrain_img.paste(temp_img, (0, 0), temp_img)
 
         # Convert the PIL image to a Tkinter PhotoImage
-        photo = ImageTk.PhotoImage(img)
-
-        # Clear the canvas
-        self.canvas.delete('all')
+        photo = ImageTk.PhotoImage(terrain_img)
 
         # Draw the PhotoImage onto the canvas
         self.canvas.create_image(0, 0, image=photo, anchor='nw')
