@@ -53,6 +53,9 @@ class PlanetSim:
             "octaves": 1,
             "persistence": 0.7,
             "lacunarity": 2.0,
+            "max_amp": 0,
+            "amp": 1,
+            "freq": 3,
             "num_small_craters": 15,
             "num_large_craters": 3,
             "max_small_radius": 10,
@@ -81,7 +84,7 @@ class PlanetSim:
             label = tk.Label(frame, text=param.capitalize(), bg='gray')
             label.pack(side='left')
             entry = tk.Entry(frame)
-            entry.pack(side='right', expand=True)
+            entry.pack(side='right', expand=True, anchor='e')  # Right justify the entry field
             entry.insert(0, str(value))
             entries[param] = entry
 
@@ -99,7 +102,7 @@ class PlanetSim:
 
         def on_generate_clicked(self):
             self.save_settings(entries)
-            self.params = self.load_settings(entries)  # Load the updated settings
+            self.params = self.load_settings()  # Load the updated settings
             frame_update_function(self.params)
 
         generate_button = tk.Button(sidebar, text="Generate Terrain", command=lambda: on_generate_clicked(self))
@@ -109,24 +112,13 @@ class PlanetSim:
 
         return sidebar, entries
 
-    def show_terrain_entries(self):
-        self.sidebar.pack(fill='y', side='left', padx=5, pady=5)  # Pack the sidebar here
-        for frame in self.terrain_entries.values():
-            frame.pack()  # Show the terrain entries
-
-        # Display the terrain map on the canvas
-        if self.current_terrain is not None:
-            ocean_map = self.classify_ocean(self.current_terrain)
-            self.update_terrain_display(self.current_terrain, ocean_map)
-        else:
-            print("No terrain map available.")
-
-    def generate_terrain_from_menu(self):
+    def generate_random_terrain(self):
         # Generate the terrain
         print("Generating terrain...")
         self.current_terrain = generate_terrain(
             int(self.params['width']), int(self.params['height']), scale=self.params['scale'],
-            octaves=int(self.params['octaves']), persistence=self.params['persistence'], lacunarity=self.params['lacunarity']
+            octaves=int(self.params['octaves']), persistence=self.params['persistence'],
+            lacunarity=self.params['lacunarity']
         )
         if self.current_terrain is None:
             print("Error: generate_terrain returned None")
@@ -143,6 +135,10 @@ class PlanetSim:
         if self.current_terrain is None:
             print("Error: generate_craters returned None")
             return
+
+        self.sidebar.pack(fill='y', side='left', padx=5, pady=5)  # Pack the sidebar here
+        for frame in self.terrain_entries.values():
+            frame.pack()  # Show the terrain entries
 
         # Update the terrain display
         self.update_terrain_display(self.current_terrain)
@@ -194,8 +190,13 @@ class PlanetSim:
                 terrain_cmap(np.linspace(0.25, 1, 256))
             )
 
-            # Normalize the terrain values to the range of the colormap
-            norm = plt.Normalize(vmin=self.min_elevation, vmax=self.max_elevation)
+            # Check if the program is using the random_terrain or elevation_matrix
+            if np.array_equal(terrain, self.current_terrain):
+                # Use the min and max values of self.current_terrain
+                norm = plt.Normalize(vmin=terrain.min(), vmax=terrain.max())
+            else:
+                # Normalize the terrain values to the range of the colormap
+                norm = plt.Normalize(vmin=self.min_elevation, vmax=self.max_elevation)
 
             # Calculate the colors for the terrain using vectorized operations
             terrain_colors = terrain_cmap(norm(terrain))
@@ -511,21 +512,7 @@ class PlanetSim:
         print("Settings saved")  # Debug print
         window.destroy()
 
-    def main(self):
-        self.canvas.bind("<Motion>", self.on_mouse_move)
-        self.canvas.pack(side='right', expand=True)
-        menubar = Menu(self.window)
-        view_menu = Menu(menubar, tearoff=0)
-        view_menu.add_command(label="Terrain", command=self.show_terrain_entries)
-        view_menu.add_command(label="New Terrain", command=self.generate_terrain_from_menu)
-        view_menu.add_command(label="Temperature",
-                              command=lambda: self.view_temperature() if self.temperatures is not None else print(
-                                  "Temperature data not available"))
-        menubar.add_cascade(label="View", menu=view_menu)
-        self.window.config(menu=menubar)
-        self.sidebar, self.entries = self.create_sidebar(self.update_frame)
-        self.params = self.load_settings()
-
+    def display_loaded_image(self):
         self.elevation_matrix = self.load_terrain(
             r"D:\dev\planetsim\images\16_bit_dem_small_1280.tif", -420, 8848)
         self.current_terrain = self.elevation_matrix
@@ -543,9 +530,24 @@ class PlanetSim:
         # Call the update_terrain_display function with the loaded terrain image
         self.update_terrain_display(self.elevation_matrix, self.ocean_map)
 
-        print(f"Loaded terrain shape: {self.elevation_matrix.shape}")
-        print(f"Loaded ocean_map shape: {self.ocean_map.shape}")
+        # Unpack the sidebar if it's packed
+        if self.sidebar.winfo_ismapped():
+            self.sidebar.pack_forget()
 
+    def main(self):
+        self.canvas.bind("<Motion>", self.on_mouse_move)
+        self.canvas.pack(side='right', expand=True)
+        menubar = Menu(self.window)
+        view_menu = Menu(menubar, tearoff=0)
+        view_menu.add_command(label="Load Terrain Image", command=self.display_loaded_image)
+        view_menu.add_command(label="Random Terrain Generation", command=self.generate_random_terrain)
+        view_menu.add_command(label="Temperature Map",
+                              command=lambda: self.view_temperature() if self.temperatures is not None else print(
+                                  "Temperature data not available"))
+        menubar.add_cascade(label="View", menu=view_menu)
+        self.window.config(menu=menubar)
+        self.sidebar, self.entries = self.create_sidebar(self.update_frame)
+        self.params = self.load_settings()
         self.window.mainloop()
 
 

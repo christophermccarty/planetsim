@@ -2,8 +2,8 @@ import numpy as np
 from opensimplex import OpenSimplex
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
-from scipy.optimize import fsolve
 from scipy.interpolate import interp1d
+import multiprocessing
 
 
 # Constants for atmospheric composition
@@ -35,31 +35,49 @@ ALBEDO_LAND = 0.3  # Albedo of land
 ALBEDO_WATER = 0.06  # Albedo of water
 
 
-def generate_terrain(width, height, seed=None, scale=400.0, octaves=1, persistence=0.7, lacunarity=2.0):
-    if seed is None:
-        seed = np.random.randint(0, 100)
-    simplex = OpenSimplex(seed)
+def generate_noise_for_chunk(args):
+    simplex, scale, octaves, persistence, lacunarity, chunk, start_i, start_j = args
+    for i in range(chunk.shape[0]):
+        for j in range(chunk.shape[1]):
+            x = (i + start_i) * scale
+            y = (j + start_j) * scale
+            noise = 0
+            amplitude = 1
+            frequency = 1
+            for _ in range(octaves):
+                noise += amplitude * simplex.noise2(frequency * x, frequency * y)
+                amplitude *= persistence
+                frequency *= lacunarity
+            chunk[i, j] = noise
+    return chunk
 
-    max_amp = 0
-    amp = 1
-    freq = 3
+def generate_terrain(width, height, scale, octaves, persistence, lacunarity):
+    # Initialize an OpenSimplex noise generator with a seed
+    simplex1 = OpenSimplex(seed=0)
 
+    # Create an empty array for the terrain
     terrain = np.zeros((height, width))
 
-    # Wrap the outer loop with tqdm for a progress bar
-    for o in tqdm(range(octaves), desc='Generating terrain'):
-        for i in range(height):
-            for j in range(width):
-                terrain[i][j] += simplex.noise2(i / scale * freq, j / scale * freq) * amp
-        max_amp += amp
-        amp *= persistence
-        freq *= lacunarity
+    # Determine the number of CPU cores
+    num_cores = multiprocessing.cpu_count() - 1
 
-    # Normalizing the terrain
-    terrain = (terrain + max_amp) / (2 * max_amp)
+    # Split the terrain array into chunks
+    chunks = np.array_split(terrain, num_cores)
 
-    # Scale the normalized terrain values to the range [0, 20000]
-    terrain *= 20000
+    # Create a multiprocessing pool
+    pool = multiprocessing.Pool(num_cores)
+
+    # Generate the Perlin noise for each chunk
+    results = pool.map(generate_noise_for_chunk, [(simplex1, scale, octaves, persistence, lacunarity, chunk, i*chunk.shape[0], 0) for i, chunk in enumerate(chunks)])
+
+    # Combine the chunks back into a single terrain array
+    terrain = np.concatenate(results)
+
+    # Normalize the terrain data to a range of 0 to 1
+    terrain = (terrain - np.min(terrain)) / (np.max(terrain) - np.min(terrain))
+
+    # Scale the terrain data to the desired range of 0 to 10000
+    terrain = terrain * 10000
 
     return terrain
 
@@ -78,7 +96,7 @@ def overlay_large_features(terrain, seed=None, strength=0.5, scale_factor=4):
     return terrain
 
 
-def add_crater_optimized(terrain, cx, cy, radius, depth):
+def add_crater_optimized(terrain, cx, cy, radius, depth, angle):
     height, width = terrain.shape
     y, x = np.ogrid[-cx:height-cx, -cy:width-cy]
     mask = x**2 + y**2 <= radius**2
@@ -86,32 +104,38 @@ def add_crater_optimized(terrain, cx, cy, radius, depth):
     # Apply crater effect within the masked area
     distance_from_center = np.sqrt(x**2 + y**2)[mask]
     delta = depth * (1 - distance_from_center / radius)
+
+    # Adjust the shape of the crater based on the angle of impact
+    delta *= np.cos(np.radians(angle))  # Adjust the depth based on the angle
+
     terrain[mask] -= delta
     terrain[terrain < 0] = 0  # Ensure terrain height doesn't go below 0
 
 
 def generate_craters(terrain, num_small_craters=15, num_large_craters=3, max_small_radius=10, max_large_radius=40,
-                     max_depth=0.1):
+                     max_depth=0.1, angle_range=(20, 90)):
     total_craters = num_small_craters + num_large_craters
     with tqdm(total=total_craters, desc='Adding craters') as pbar:
         # Add small craters
         for _ in range(num_small_craters):
             height, width = terrain.shape
-            # Random center, radius, and depth for each crater
+            # Random center, radius, depth, and angle for each crater
             cx, cy = np.random.randint(0, height), np.random.randint(0, width)
             radius = np.random.uniform(0, max_small_radius)
             depth = np.random.uniform(0, max_depth)
-            add_crater_optimized(terrain, cx, cy, radius, depth)
+            angle = np.random.uniform(*angle_range)  # Select a random angle from the range
+            add_crater_optimized(terrain, cx, cy, radius, depth, angle)
             pbar.update()
 
         # Add large craters
         for _ in range(num_large_craters):
             height, width = terrain.shape
-            # Random center, radius, and depth for each crater
+            # Random center, radius, depth, and angle for each crater
             cx, cy = np.random.randint(0, height), np.random.randint(0, width)
             radius = np.random.uniform(0, max_large_radius)
             depth = np.random.uniform(0, max_depth)
-            add_crater_optimized(terrain, cx, cy, radius, depth)
+            angle = np.random.uniform(*angle_range)  # Select a random angle from the range
+            add_crater_optimized(terrain, cx, cy, radius, depth, angle)
             pbar.update()
 
     return terrain

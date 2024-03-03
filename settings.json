@@ -1,13 +1,16 @@
 {
     "width": 500.0,
     "height": 500.0,
-    "scale": 1.0,
-    "octaves": 1.0,
+    "scale": 0.015,
+    "octaves": 5.0,
     "persistence": 0.7,
-    "lacunarity": 2.0,
-    "num_small_craters": 15.0,
-    "num_large_craters": 3.0,
-    "max_small_radius": 10.0,
-    "max_large_radius": 40.0,
-    "max_depth": 0.3
+    "lacunarity": 1.9,
+    "max_amp": 0.0,
+    "amp": 1.0,
+    "freq": 3.0,
+    "num_small_craters": 1000.0,
+    "num_large_craters": 5.0,
+    "max_small_radius": 30.0,
+    "max_large_radius": 160.0,
+    "max_depth": 2000.0
 }
