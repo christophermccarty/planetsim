@@ -42,6 +42,16 @@ class PlanetSim:
         self.ALBEDO_WATER = 0.06
         self.ALBEDO_LAND = 0.3
 
+        # Create the zoom canvas
+        self.zoom_canvas = tk.Canvas(self.window, width=200, height=200)  # Change the size to the desired size
+        self.zoom_canvas.place(x=0, y=0)  # Initial position
+        self.canvas.bind("<Button-1>", self.on_mouse_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_move)
+        self.zoom_canvas.bind("<B1-Motion>", self.on_mouse_move)
+
+        # Initialize the zoom photo image
+        self.zoom_photo_image = None
+
 
     def create_sidebar(self, frame_update_function):
         sidebar = tk.Frame(self.window, width=200, bg='gray')
@@ -163,6 +173,7 @@ class PlanetSim:
             image_data = src.read(1)
 
         self.original_image = image_data
+        print("Loading terrain...")
 
         num_cores = multiprocessing.cpu_count()
         num_cores = num_cores - 1 if num_cores > 1 else 1
@@ -495,10 +506,81 @@ class PlanetSim:
         else:
             temperature = "N/A"
 
+        # Convert the temperature from kelvin to celsius
+        if temperature != "N/A":
+            temperature = round(float(temperature) - 273.15, 2)
+
         # Update the window title with the tile's information
         self.window.title(
             f"Elevation: {elevation}, Altitude: {altitude}, Latitude: {latitude}, Longitude: {longitude}, "
             f"Grayscale Pixel Value: {grayscale_pixel_value}, Temperature: {temperature}")
+
+    def on_mouse_press(self, event):
+        # Check if the zoom checkbox is selected
+        if self.zoom_var.get() == 1:
+            # Update the zoom canvas
+            self.update_zoom_canvas(event.x, event.y)
+
+            # Calculate the position of zoom_canvas such that its center is at the mouse position
+            zoom_canvas_x = event.x - self.zoom_canvas.winfo_width() / 2
+            zoom_canvas_y = event.y - self.zoom_canvas.winfo_height() / 2
+
+            # Set the position of zoom_canvas
+            self.zoom_canvas.place(x=(zoom_canvas_x + 250), y=(zoom_canvas_y + 25))
+
+            # Print the coordinates
+            print(f"Zoom canvas center: ({event.x - self.zoom_canvas.winfo_width() / 2}, {event.y - self.zoom_canvas.winfo_height() / 2})")
+            print(f"Mouse position: ({event.x}, {event.y})")
+        else:
+            # Hide the zoom canvas
+            self.zoom_canvas.place_forget()
+
+    def on_mouse_release(self, event):
+        # Hide the zoom canvas
+        self.zoom_canvas.place_forget()
+
+    def update_zoom_canvas(self, x, y):
+        # Define the size of the zoomed view
+        zoom_size = 200  # Change this to the desired size
+
+        # Define the zoom factor (how much closer the zoomed view should be)
+        zoom_factor = 2
+
+        # Calculate the size of the extracted part of the terrain
+        extract_size = zoom_size // zoom_factor
+
+        # Calculate the coordinates of the top-left corner of the extracted part
+        extract_x = max(0, x - extract_size // 2)
+        extract_y = max(0, y - extract_size // 2)
+
+        # Ensure the extracted part does not exceed the size of the terrain
+        extract_x = min(extract_x, self.current_terrain.shape[1] - extract_size)
+        extract_y = min(extract_y, self.current_terrain.shape[0] - extract_size)
+
+        # Extract the part of the terrain colors that should be displayed in the zoomed view
+        extracted_terrain_colors = self.terrain_colors[extract_y:extract_y + extract_size,
+                                   extract_x:extract_x + extract_size]
+
+        # Convert the colors from RGBA to RGB and scale to [0, 255]
+        colors = (extracted_terrain_colors[:, :, :3] * 255).astype(np.uint8)
+
+        # Create an image from the colors array
+        extracted_image = Image.fromarray(colors)
+
+        # Resize the image to the size of the zoom box
+        zoomed_image = extracted_image.resize((zoom_size, zoom_size), Image.NEAREST)
+
+        # Convert the PIL image to a Tkinter PhotoImage
+        photo_image = ImageTk.PhotoImage(zoomed_image)
+
+        # Clear the zoom canvas
+        self.zoom_canvas.delete('all')
+
+        # Draw the PhotoImage on the zoom canvas
+        self.zoom_canvas.create_image(0, 0, image=photo_image, anchor='nw')
+
+        # Keep a reference to the PhotoImage to prevent it from being garbage collected
+        self.zoom_photo_image = photo_image
 
     def save_settings(self, entries):
         settings = {param: float(entry.get()) for param, entry in entries.items() if entry.winfo_exists()}
@@ -530,12 +612,27 @@ class PlanetSim:
         # Call the update_terrain_display function with the loaded terrain image
         self.update_terrain_display(self.elevation_matrix, self.ocean_map)
 
-        # Unpack the sidebar if it's packed
-        if self.sidebar.winfo_ismapped():
-            self.sidebar.pack_forget()
+        # Create a sidebar with checkboxes if it's not already displayed
+        if not self.sidebar.winfo_ismapped():
+            self.sidebar.pack(fill='y', side='left', padx=5, pady=5)
+
+            # Create variables for the checkboxes
+            self.ocean_var = tk.IntVar()
+            self.zoom_var = tk.IntVar()
+
+            # Create the checkboxes
+            ocean_check = tk.Checkbutton(self.sidebar, text="Ocean", variable=self.ocean_var)
+            zoom_check = tk.Checkbutton(self.sidebar, text="Zoom", variable=self.zoom_var)
+
+            # Pack the checkboxes
+            ocean_check.pack()
+            zoom_check.pack()
 
     def main(self):
         self.canvas.bind("<Motion>", self.on_mouse_move)
+        self.zoom_canvas.bind("<Motion>", self.on_mouse_move)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_release)
+        self.zoom_canvas.bind("<ButtonRelease-1>", self.on_mouse_release)
         self.canvas.pack(side='right', expand=True)
         menubar = Menu(self.window)
         view_menu = Menu(menubar, tearoff=0)
