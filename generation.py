@@ -68,7 +68,8 @@ def generate_terrain(width, height, scale, octaves, persistence, lacunarity):
     pool = multiprocessing.Pool(num_cores)
 
     # Generate the Perlin noise for each chunk
-    results = pool.map(generate_noise_for_chunk, [(simplex1, scale, octaves, persistence, lacunarity, chunk, i*chunk.shape[0], 0) for i, chunk in enumerate(chunks)])
+    results = pool.map(generate_noise_for_chunk, [(simplex1, scale, octaves, persistence, lacunarity, chunk,
+                                                   i*chunk.shape[0], 0) for i, chunk in enumerate(chunks)])
 
     # Combine the chunks back into a single terrain array
     terrain = np.concatenate(results)
@@ -180,6 +181,7 @@ def calculate_temperature(args):
     G = 0.85  # Greenhouse factor
     epsilon = 0.8  # Atmospheric emissivity
     f = 0.7  # Factor to relate Tatm to Ts
+    lapse_rate = 0.0065  # Lapse rate (K/m)
 
     # Create a 2D array of latitudes
     latitudes_2d = np.tile(lat, (resized_shape[1], 1)).T
@@ -187,4 +189,44 @@ def calculate_temperature(args):
     # Linear model for temperature based on latitude
     Ts_solutions = 288 - 0.5 * np.abs(latitudes_2d)  # 288 is the average global temperature in K, 0.5 is a scaling factor
 
+    # Adjust temperature based on elevation
+    elevation = terrain.reshape(resized_shape)  # Reshape terrain to match the shape of Ts_solutions
+    elevation_resized = np.resize(elevation, Ts_solutions.shape)  # Resize elevation to match the shape of Ts_solutions
+    Ts_solutions -= lapse_rate * elevation_resized
+
     return Ts_solutions
+
+
+def model_wind(terrain, latitudes):
+    # Constants
+    omega = 7.292e-5  # Earth's rotation rate (rad/s)
+    wind_speed_at_ref = np.full_like(terrain, 10)  # Arbitrary wind speed at reference height
+    ref_height = 100  # Reference height in meters
+    roughness_length = 0.1  # Roughness length in meters (can be adjusted based on terrain)
+
+    # Reshape latitudes to match the shape of terrain
+    latitudes_2d = np.tile(latitudes, (terrain.shape[1], 1)).T
+
+    # Calculate Coriolis force
+    coriolis_force = 2 * omega * np.sin(np.radians(latitudes_2d))
+
+    # Add a small constant to terrain to avoid division by zero or logarithm of zero
+    terrain = np.abs(terrain) + 1e-7
+
+    # Adjust wind speed based on Coriolis force and elevation
+    wind_speed = (wind_speed_at_ref * (1 + coriolis_force) * np.log((terrain + terrain) / (roughness_length + terrain))
+                  / np.log((ref_height + terrain) / (roughness_length + terrain)))
+
+    # Adjust wind direction based on latitude to model Hadley, Ferrel, and Polar cells
+    latitude_adjustment = np.zeros_like(latitudes_2d)
+    latitude_adjustment[(latitudes_2d >= 0) & (latitudes_2d < 30)] = np.pi / 4  # Trade winds (Hadley Cell)
+    latitude_adjustment[(latitudes_2d >= 30) & (latitudes_2d < 60)] = -np.pi / 4  # Westerlies (Ferrel Cell)
+    latitude_adjustment[(latitudes_2d >= 60) & (latitudes_2d <= 90)] = np.pi / 4  # Polar easterlies (Polar Cell)
+    latitude_adjustment[(latitudes_2d < 0) & (latitudes_2d > -30)] = -np.pi / 4  # Trade winds (Hadley Cell)
+    latitude_adjustment[(latitudes_2d <= -30) & (latitudes_2d > -60)] = np.pi / 4  # Westerlies (Ferrel Cell)
+    latitude_adjustment[(latitudes_2d <= -60) & (latitudes_2d >= -90)] = -np.pi / 4  # Polar easterlies (Polar Cell)
+
+    # Ensure wind direction is within the range [-pi, pi]
+    adjusted_wind_direction = (latitude_adjustment + np.pi) % (2 * np.pi) - np.pi
+
+    return wind_speed, adjusted_wind_direction
