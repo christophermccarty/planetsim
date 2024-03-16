@@ -471,8 +471,8 @@ class PlanetSim:
         # Call the model_wind function to get wind_speed and wind_direction
         wind_speed, wind_direction = model_wind(self.current_terrain, self.latitudes)
 
-        # Create a grid of x and y coordinates with a step size of 10
-        step_size = 25
+        # Create a grid of x and y coordinates with a step size
+        step_size = 35
         y, x = np.mgrid[0:wind_speed.shape[0]:step_size, 0:wind_speed.shape[1]:step_size]
 
         # Calculate the u and v components of the wind speed at the sampled points
@@ -480,7 +480,7 @@ class PlanetSim:
         v = wind_speed[::step_size, ::step_size] * np.sin(wind_direction[::step_size, ::step_size])
 
         # Convert the u and v components to canvas coordinates
-        scale_factor = 0.1  # Adjust this factor to control the size of wind vectors
+        scale_factor = 0.02  # Adjust this factor to control the size of wind vectors
         u_canvas = u * scale_factor
         v_canvas = v * scale_factor
 
@@ -490,17 +490,37 @@ class PlanetSim:
         end_x = start_x + u_canvas
         end_y = start_y + v_canvas
 
+        # Calculate the logarithm of the wind speed
+        wind_speed_log = np.log(wind_speed[::step_size, ::step_size])
+
+        # Normalize the logarithmic wind speed to a range of [0, 1]
+        wind_speed_log_norm = (wind_speed_log - wind_speed_log.min()) / (wind_speed_log.max() - wind_speed_log.min())
+
+        # Define the minimum and maximum arrow sizes
+        min_arrow_size = 1
+        max_arrow_size = 15
+
+        # Calculate the arrow sizes based on the normalized logarithmic wind speed
+        arrow_sizes = min_arrow_size + (max_arrow_size - min_arrow_size) * wind_speed_log_norm
+
+        # Define the minimum and maximum tail widths
+        min_tail_width = 1
+        max_tail_width = 3
+
+        # Calculate the tail widths based on the normalized logarithmic wind speed
+        tail_widths = min_tail_width + (max_tail_width - min_tail_width) * wind_speed_log_norm
+
         # Draw the wind vectors as arrows on the canvas
-        for sx, sy, ex, ey in zip(start_x.flatten(), start_y.flatten(), end_x.flatten(), end_y.flatten()):
-            self.canvas.create_line(sx, sy, ex, ey, fill='white', arrow=tk.LAST)
-            arrow_size = 5
+        for sx, sy, ex, ey, arrow_size, tail_width in zip(start_x.flatten(), start_y.flatten(), end_x.flatten(),
+                                                          end_y.flatten(), arrow_sizes.flatten(),
+                                                          tail_widths.flatten()):
+            self.canvas.create_line(sx, sy, ex, ey, fill='white', width=tail_width, arrow=tk.LAST)
             angle = np.arctan2(ey - sy, ex - sx)
             arrow_coords = [
                 (ex, ey),
                 (ex - arrow_size * np.cos(angle - np.pi / 6), ey - arrow_size * np.sin(angle - np.pi / 6)),
                 (ex - arrow_size * np.cos(angle + np.pi / 6), ey - arrow_size * np.sin(angle + np.pi / 6))
             ]
-            draw.polygon(arrow_coords, fill=(255, 255, 255, 128))
 
         # Convert the PIL image to a tkinter PhotoImage
         wind_photo_image = ImageTk.PhotoImage(wind_image)

@@ -201,7 +201,7 @@ def model_wind(terrain, latitudes):
     # Constants
     omega = 7.292e-5  # Earth's rotation rate (rad/s)
     wind_speed_at_ref = np.full_like(terrain, 10)  # Arbitrary wind speed at reference height
-    ref_height = 100  # Reference height in meters
+    ref_height = 30  # Reference height in meters
     roughness_length = 0.1  # Roughness length in meters (can be adjusted based on terrain)
 
     # Reshape latitudes to match the shape of terrain
@@ -217,16 +217,35 @@ def model_wind(terrain, latitudes):
     wind_speed = (wind_speed_at_ref * (1 + coriolis_force) * np.log((terrain + terrain) / (roughness_length + terrain))
                   / np.log((ref_height + terrain) / (roughness_length + terrain)))
 
+    # Pressure Gradient
+    pressure_gradient = np.sin(np.radians(latitudes_2d))
+    pressure_gradient_force = 0.1 * pressure_gradient
+
     # Adjust wind direction based on latitude to model Hadley, Ferrel, and Polar cells
     latitude_adjustment = np.zeros_like(latitudes_2d)
-    latitude_adjustment[(latitudes_2d >= 0) & (latitudes_2d < 30)] = np.pi / 4  # Trade winds (Hadley Cell)
-    latitude_adjustment[(latitudes_2d >= 30) & (latitudes_2d < 60)] = -np.pi / 4  # Westerlies (Ferrel Cell)
-    latitude_adjustment[(latitudes_2d >= 60) & (latitudes_2d <= 90)] = np.pi / 4  # Polar easterlies (Polar Cell)
-    latitude_adjustment[(latitudes_2d < 0) & (latitudes_2d > -30)] = -np.pi / 4  # Trade winds (Hadley Cell)
-    latitude_adjustment[(latitudes_2d <= -30) & (latitudes_2d > -60)] = np.pi / 4  # Westerlies (Ferrel Cell)
-    latitude_adjustment[(latitudes_2d <= -60) & (latitudes_2d >= -90)] = -np.pi / 4  # Polar easterlies (Polar Cell)
+    latitude_adjustment[(latitudes_2d >= 0) & (latitudes_2d < 30)] = np.pi / 4 + pressure_gradient_force[(latitudes_2d >= 0) & (latitudes_2d < 30)]  # Trade winds (Hadley Cell)
+    latitude_adjustment[(latitudes_2d >= 30) & (latitudes_2d < 60)] = -np.pi / 4 + pressure_gradient_force[(latitudes_2d >= 30) & (latitudes_2d < 60)]  # Westerlies (Ferrel Cell)
+    latitude_adjustment[(latitudes_2d >= 60) & (latitudes_2d <= 90)] = np.pi / 4 + pressure_gradient_force[(latitudes_2d >= 60) & (latitudes_2d <= 90)]  # Polar easterlies (Polar Cell)
+    latitude_adjustment[(latitudes_2d < 0) & (latitudes_2d > -30)] = -np.pi / 4 + pressure_gradient_force[(latitudes_2d < 0) & (latitudes_2d > -30)]  # Trade winds (Hadley Cell)
+    latitude_adjustment[(latitudes_2d <= -30) & (latitudes_2d > -60)] = np.pi / 4 + pressure_gradient_force[(latitudes_2d <= -30) & (latitudes_2d > -60)]  # Westerlies (Ferrel Cell)
+    latitude_adjustment[(latitudes_2d <= -60) & (latitudes_2d >= -90)] = -np.pi / 4 + pressure_gradient_force[(latitudes_2d <= -60) & (latitudes_2d >= -90)]  # Polar easterlies (Polar Cell)
+
+    # Interaction between Cells
+    cell_interaction = np.zeros_like(latitudes_2d)
+    cell_interaction[(latitudes_2d >= 25) & (latitudes_2d <= 35)] = np.pi / 8  # Deflection at Hadley-Ferrel boundary
+    cell_interaction[(latitudes_2d >= 55) & (latitudes_2d <= 65)] = -np.pi / 8  # Deflection at Ferrel-Polar boundary
+    cell_interaction[(latitudes_2d <= -25) & (latitudes_2d >= -35)] = -np.pi / 8  # Deflection at Hadley-Ferrel boundary (Southern Hemisphere)
+    cell_interaction[(latitudes_2d <= -55) & (latitudes_2d >= -65)] = np.pi / 8  # Deflection at Ferrel-Polar boundary (Southern Hemisphere)
+
+    # Influence of Terrain
+    terrain_gradient = np.gradient(terrain)
+    terrain_deflection = np.arctan2(terrain_gradient[1], terrain_gradient[0])
+    terrain_influence = 0.2 * terrain_deflection
+
+    # Combine adjustments
+    adjusted_wind_direction = latitude_adjustment + cell_interaction + terrain_influence
 
     # Ensure wind direction is within the range [-pi, pi]
-    adjusted_wind_direction = (latitude_adjustment + np.pi) % (2 * np.pi) - np.pi
+    adjusted_wind_direction = (adjusted_wind_direction + np.pi) % (2 * np.pi) - np.pi
 
     return wind_speed, adjusted_wind_direction
