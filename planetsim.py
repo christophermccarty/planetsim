@@ -557,7 +557,7 @@ class PlanetSim:
 
         # Retrieve the grayscale pixel value
         grayscale_terrain = scale_to_grayscale(self.current_terrain)
-        grayscale_pixel_value = grayscale_terrain[tile_y, tile_x]
+        grayscale_pixel_value = "{:.1f}".format(grayscale_terrain[tile_y, tile_x])
 
         # Convert self.temperatures to a 2D array
         self.temperatures = np.squeeze(self.temperatures)
