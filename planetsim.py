@@ -3,16 +3,13 @@ import numpy as np
 import rasterio
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import tkinter as tk
 from tqdm import tqdm
-from PIL import Image, ImageTk, ImageGrab
+from PIL import Image, ImageTk, ImageDraw
 from tkinter import Menu
 import multiprocessing
-from scipy.ndimage import zoom
 from generation import (generate_terrain, generate_craters, scale_to_grayscale, calculate_temperature,
-                        calculate_latitudes)
+                        calculate_latitudes, model_wind)
 
 
 class PlanetSim:
@@ -30,6 +27,7 @@ class PlanetSim:
         self.info_label.pack()
         self.current_ocean_map = None
         self.original_image = None
+        self.latitudes = None
 
         self.min_elevation = -420
         self.max_elevation = 8848
@@ -154,11 +152,9 @@ class PlanetSim:
         self.update_terrain_display(self.current_terrain)
 
     @staticmethod
-    def load_terrain_chunk(args):
-        image_data, min_elevation, max_elevation, start_row, end_row = args
-        total_pixels = (end_row - start_row) * image_data.shape[1]
-        scale_factor = (max_elevation - min_elevation) / (image_data.max() - image_data.min() + 1)
+    def load_terrain_chunk(image_data, min_elevation, max_elevation, start_row, end_row):
         elevation_matrix = np.zeros((end_row - start_row, image_data.shape[1]), dtype=np.float32)
+        scale_factor = (max_elevation - min_elevation) / (image_data.max() - image_data.min() + 1)
         for i in range(start_row, end_row):
             for j in range(image_data.shape[1]):
                 elevation = (image_data[i][j] - image_data.min()) * scale_factor + min_elevation
@@ -172,21 +168,24 @@ class PlanetSim:
         with rasterio.open(image_path) as src:
             image_data = src.read(1)
 
-        self.original_image = image_data
-        print("Loading terrain...")
+        # Define the chunk size for multiprocessing
+        chunk_size = image_data.shape[0] // multiprocessing.cpu_count()
 
-        num_cores = multiprocessing.cpu_count()
-        num_cores = num_cores - 1 if num_cores > 1 else 1
-        pool = multiprocessing.Pool(num_cores)
+        # Get the number of cores for multiprocessing
+        num_cores = multiprocessing.cpu_count() - 1
 
-        chunk_size = image_data.shape[0] // num_cores
-        args = [(image_data, min_elevation, max_elevation, i * chunk_size, (i + 1) * chunk_size) for i in
-                range(num_cores)]
-        args[-1] = (image_data, min_elevation, max_elevation, (num_cores - 1) * chunk_size,
-                    image_data.shape[0])  # Make sure the last chunk goes to the end of the image
+        # Create arguments for the worker processes
+        args = [
+            (image_data, min_elevation, max_elevation, i * chunk_size, (i + 1) * chunk_size)
+            for i in range(num_cores)]
 
-        results = pool.map(self.load_terrain_chunk, args)
-        elevation_matrix = np.concatenate(results, axis=0)
+        with multiprocessing.Pool(num_cores) as pool:
+            with tqdm(total=len(args), desc='Loading terrain') as pbar:
+                results = pool.starmap(self.load_terrain_chunk, args)
+                pbar.update(len(args))
+
+        # Combine the chunks back into a single terrain array
+        elevation_matrix = np.concatenate(results)
 
         return elevation_matrix
 
@@ -217,6 +216,9 @@ class PlanetSim:
             # Store the terrain colors
             self.terrain_colors = terrain_colors
 
+            # Store the grayscale version of the terrain
+            self.original_image = (terrain_colors[:, :, :3] * 255).astype(np.uint8)
+
             # If ocean_map is provided, set the color of ocean tiles to blue
             if ocean_map is not None:
                 # Resize ocean_map to match terrain_colors using PIL.Image.resize
@@ -224,7 +226,6 @@ class PlanetSim:
                 ocean_map_resized = ocean_map_image.resize((terrain_colors.shape[1], terrain_colors.shape[0]),
                                                            Image.NEAREST)
                 ocean_map = np.array(ocean_map_resized)
-                print(ocean_map.shape)
 
                 # Only update the colors of the tiles that are classified as ocean tiles
                 terrain_colors[np.where(ocean_map)] = [0, 0, 1, 1]  # Blue color for ocean tiles
@@ -273,7 +274,7 @@ class PlanetSim:
         ocean_map = np.zeros_like(elevation_matrix, dtype=bool)
 
         # Classify ocean tiles
-        for i in tqdm(range(elevation_matrix.shape[0]), desc='Classifying ocean tiles'):
+        for i in range(elevation_matrix.shape[0]):
             for j in range(elevation_matrix.shape[1]):
                 # Mark tiles as ocean if their elevation is at or below the ocean level
                 ocean_map[i][j] = elevation_matrix[i][j] < ocean_level
@@ -460,6 +461,76 @@ class PlanetSim:
         # Keep a reference to the PhotoImage to prevent it from being garbage collected
         self.photo_image = photo
 
+    def visualize_wind_model(self):
+        # Create a new image with the same dimensions as the terrain
+        wind_image = Image.new('RGBA', (self.current_terrain.shape[1], self.current_terrain.shape[0]))
+
+        # Create a Draw object
+        draw = ImageDraw.Draw(wind_image)
+
+        # Call the model_wind function to get wind_speed and wind_direction
+        wind_speed, wind_direction = model_wind(self.current_terrain, self.latitudes)
+
+        # Create a grid of x and y coordinates with a step size
+        step_size = 35
+        y, x = np.mgrid[0:wind_speed.shape[0]:step_size, 0:wind_speed.shape[1]:step_size]
+
+        # Calculate the u and v components of the wind speed at the sampled points
+        u = wind_speed[::step_size, ::step_size] * np.cos(wind_direction[::step_size, ::step_size])
+        v = wind_speed[::step_size, ::step_size] * np.sin(wind_direction[::step_size, ::step_size])
+
+        # Convert the u and v components to canvas coordinates
+        scale_factor = 0.02  # Adjust this factor to control the size of wind vectors
+        u_canvas = u * scale_factor
+        v_canvas = v * scale_factor
+
+        # Calculate the start and end points for the arrows
+        start_x = x
+        start_y = y
+        end_x = start_x + u_canvas
+        end_y = start_y + v_canvas
+
+        # Calculate the logarithm of the wind speed
+        wind_speed_log = np.log(wind_speed[::step_size, ::step_size])
+
+        # Normalize the logarithmic wind speed to a range of [0, 1]
+        wind_speed_log_norm = (wind_speed_log - wind_speed_log.min()) / (wind_speed_log.max() - wind_speed_log.min())
+
+        # Define the minimum and maximum arrow sizes
+        min_arrow_size = 1
+        max_arrow_size = 15
+
+        # Calculate the arrow sizes based on the normalized logarithmic wind speed
+        arrow_sizes = min_arrow_size + (max_arrow_size - min_arrow_size) * wind_speed_log_norm
+
+        # Define the minimum and maximum tail widths
+        min_tail_width = 1
+        max_tail_width = 3
+
+        # Calculate the tail widths based on the normalized logarithmic wind speed
+        tail_widths = min_tail_width + (max_tail_width - min_tail_width) * wind_speed_log_norm
+
+        # Draw the wind vectors as arrows on the canvas
+        for sx, sy, ex, ey, arrow_size, tail_width in zip(start_x.flatten(), start_y.flatten(), end_x.flatten(),
+                                                          end_y.flatten(), arrow_sizes.flatten(),
+                                                          tail_widths.flatten()):
+            self.canvas.create_line(sx, sy, ex, ey, fill='white', width=tail_width, arrow=tk.LAST)
+            angle = np.arctan2(ey - sy, ex - sx)
+            arrow_coords = [
+                (ex, ey),
+                (ex - arrow_size * np.cos(angle - np.pi / 6), ey - arrow_size * np.sin(angle - np.pi / 6)),
+                (ex - arrow_size * np.cos(angle + np.pi / 6), ey - arrow_size * np.sin(angle + np.pi / 6))
+            ]
+
+        # Convert the PIL image to a tkinter PhotoImage
+        wind_photo_image = ImageTk.PhotoImage(wind_image)
+
+        # Overlay the wind vectors image on the canvas
+        self.canvas.create_image(0, 0, image=wind_photo_image, anchor='nw')
+
+        # Keep a reference to the PhotoImage to prevent it from being garbage collected
+        self.wind_photo_image = wind_photo_image
+
     def on_mouse_move(self, event):
         # Check if self.current_terrain is None
         if self.current_terrain is None:
@@ -481,20 +552,12 @@ class PlanetSim:
         latitude = round(90 - tile_y / self.current_terrain.shape[0] * 180, 2)  # Adjusted latitude calculation
         longitude = round(tile_x / self.current_terrain.shape[1] * 360 - 180, 2)
 
-        # Retrieve the grayscale pixel value
-        if self.original_image is not None:
-            grayscale_pixel_value = self.original_image[tile_y][tile_x]
-        else:
-            grayscale_pixel_value = "N/A"
-
         # Calculate the altitude and truncate to 1 decimal place
-        if grayscale_pixel_value != "N/A":
-            altitude = np.around(max(0, (grayscale_pixel_value - 8068) / (self.original_image.max() - 8068) * 8848), 1)
-        else:
-            altitude = "N/A"
-        # Convert altitude to float before comparison if it's not 'N/A'
-        if altitude != 'N/A' and 0 < float(altitude) < 1:
-            altitude = 1
+        altitude = np.around(max(0, float(elevation) - 394.66), 1)
+
+        # Retrieve the grayscale pixel value
+        grayscale_terrain = scale_to_grayscale(self.current_terrain)
+        grayscale_pixel_value = "{:.1f}".format(grayscale_terrain[tile_y, tile_x])
 
         # Convert self.temperatures to a 2D array
         self.temperatures = np.squeeze(self.temperatures)
@@ -605,8 +668,8 @@ class PlanetSim:
         self.ocean_map = self.load_water_mask("D:\dev\planetsim\images\water_8k.png")
 
         # Replace multiprocessing with a list comprehension
-        latitudes = calculate_latitudes(self.current_terrain)
-        args = [(self.current_terrain, self.current_terrain.shape, lat) for lat in latitudes]
+        self.latitudes = calculate_latitudes(self.current_terrain)
+        args = [(self.current_terrain, self.current_terrain.shape, lat) for lat in self.latitudes]
         self.temperatures = np.array([calculate_temperature(arg) for arg in args])
 
         # Call the update_terrain_display function with the loaded terrain image
@@ -641,10 +704,13 @@ class PlanetSim:
         view_menu.add_command(label="Temperature Map",
                               command=lambda: self.view_temperature() if self.temperatures is not None else print(
                                   "Temperature data not available"))
+        view_menu.add_command(label="Wind Map", command=self.visualize_wind_model)
         menubar.add_cascade(label="View", menu=view_menu)
         self.window.config(menu=menubar)
         self.sidebar, self.entries = self.create_sidebar(self.update_frame)
         self.params = self.load_settings()
+        self.display_loaded_image()
+        self.visualize_wind_model()
         self.window.mainloop()
 
 
