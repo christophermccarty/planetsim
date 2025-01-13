@@ -5,6 +5,7 @@ from PIL import Image, ImageTk
 import time
 import json
 import multiprocessing
+import threading
 from scipy.ndimage import gaussian_filter
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -21,76 +22,155 @@ num_processes = 8  # Number of processes for multiprocessing
 
 class SimulationApp:
     def __init__(self):
-        # Initialize all variables
-        self.map_size = 512
-        self.map_width = None  # Will be set when image is loaded
-        self.map_height = None # Will be set when image is loaded
-        
-        # Time and simulation variables
-        self.time_step = 0
-        self.time_step_seconds = 360
-        self.Omega = 7.2921159e-5
-        self.P0 = 101325
-        
-        # Mouse tracking
-        self.last_mouse_x = 0
-        self.last_mouse_y = 0
-        
-        # Seeds
-        self.seed = 4200
-        self.elevation_seed = self.seed
-        
-        # Simulation parameters
-        self.global_octaves = 5
-        self.global_frequency = 2.0
-        self.global_lacunarity = 2.0
-        self.global_persistence = 0.5
-        
-        # Initialize arrays
-        self.altitude = None
-        self.elevation = None
-        self.elevation_normalized = None
-        self.temperature_celsius = None
-        self.previous_temperature_celsius = 0
-        self.temperature_normalized = None
-        self.pressure = None
-        self.pressure_normalized = None
-        self.wind_speed_normalized = None
-        self.u = None
-        self.v = None
-        self.ocean_u = None
-        self.ocean_v = None
-        
-        # Multiprocessing setup
-        self.num_processes = multiprocessing.cpu_count() - 16
-        if self.num_processes < 1:
-            self.num_processes = 1
-        print(f'Number of CPU cores available: {self.num_processes}')
-        
-        # Create Tkinter window
-        self.root = tk.Tk()
-        self.root.title("Map Layers")
-        
-        # Variable to track the selected layer
-        self.selected_layer = tk.StringVar(value='Wind')
-        
-        # Load initial data (this will set map dimensions)
-        self.on_load("D:\\dev\\planetsim\\images\\1024x512_earth_8bit.png")
-        
-        # Setup GUI components (after we know the map dimensions)
-        self.setup_gui()
+        """Initialize the simulation"""
+        try:
+            # Initialize all variables
+            self.map_size = 512
+            self.map_width = None  # Will be set when image is loaded
+            self.map_height = None # Will be set when image is loaded
+            
+            # Time and simulation variables
+            self.time_step = 0
+            self.time_step_seconds = 360
+            self.Omega = 7.2921159e-5
+            self.P0 = 101325
+            self.desired_simulation_step_time = 0.1  # 0.1 seconds between simulation steps
 
-        # Initialize temperature field
-        self.initialize_temperature()
+            # Add energy budget tracking
+            self.energy_budget = {
+                'solar_in': 0.0,
+                'greenhouse_effect': 0.0,
+                'longwave_out': 0.0,
+                'net_flux': 0.0,
+                'temperature_history': []
+            }
 
-        # Initialize wind field
-        self.initialize_wind()
+            # Adjustable climate parameters
+            self.climate_params = {
+                'solar_constant': 1361.1,    # Solar constant (W/m²)
+                'albedo_land': 0.3,          # Increased back to standard value
+                'albedo_ocean': 0.06,        # Ocean albedo
+                'emissivity': 0.9,          # Increased to allow more heat escape
+                'climate_sensitivity': 2.0,   # Reduced for more stable response
+                'greenhouse_strength': 2.5,   # Reduced greenhouse effect
+                'heat_capacity_land': 2e6,    # Doubled land heat capacity for stability
+                'heat_capacity_ocean': 4.2e6,   # Doubled ocean heat capacity for stability
+                'ocean_heat_transfer': 0.3,   # Ocean heat transfer
+                'atmospheric_heat_transfer': 0.5,  # Atmospheric heat transfer
+                'baseline_land_temp': 13.9,   # Baseline land temperature
+                'max_ocean_temp': 30.0,       # Maximum ocean temperature
+                'min_ocean_temp': -2.0        # Minimum ocean temperature
+            }
+            
+            # Mouse tracking
+            self.last_mouse_x = 0
+            self.last_mouse_y = 0
+            
+            # Seeds
+            self.seed = 4200
+            self.elevation_seed = self.seed
+            
+            # Simulation parameters
+            self.global_octaves = 5
+            self.global_frequency = 2.0
+            self.global_lacunarity = 2.0
+            self.global_persistence = 0.5
+            
+            # Initialize arrays
+            self.altitude = None
+            self.elevation = None
+            self.elevation_normalized = None
+            self.temperature_celsius = None
+            self.previous_temperature_celsius = 0
+            self.temperature_normalized = None
+            self.pressure = None
+            self.pressure_normalized = None
+            self.wind_speed_normalized = None
+            self.u = None
+            self.v = None
+            self.ocean_u = None
+            self.ocean_v = None
 
-        # Initialize ocean currents
-        self.initialize_ocean_currents()
+            # Atmospheric parameters
+            # Greenhouse gas concentrations
+            # Values based on approximate current atmospheric concentrations
+            self.co2_concentration = 420  # ppm
+            self.ch4_concentration = 1900  # ppb
+            self.n2o_concentration = 330  # ppb
 
-        # Start simulation after initialization
-        self.simulate()
+            # Radiative forcing coefficients (W/m² per ppm or ppb)
+            self.radiative_forcing_co2 = 5.35 * np.log(self.co2_concentration / 280)  # Reference CO2 is 280 ppm
+            self.radiative_forcing_ch4 = 0.036 * (self.ch4_concentration - 1750) / 1000  # Approximation
+            self.radiative_forcing_n2o = 0.12 * (self.n2o_concentration - 270) / 1000  # Approximation
+
+            # Total Radiative Forcing from Greenhouse Gases
+            self.total_radiative_forcing = self.radiative_forcing_co2 + self.radiative_forcing_ch4 + self.radiative_forcing_n2o
+            
+            # Multiprocessing setup
+            self.num_processes = multiprocessing.cpu_count() - 16
+            if self.num_processes < 1:
+                self.num_processes = 1
+            print(f'Number of CPU cores available: {self.num_processes}')
+            
+            # Create Tkinter window
+            self.root = tk.Tk()
+            self.root.title("Map Layers")
+            
+            # Variable to track the selected layer
+            self.selected_layer = tk.StringVar(value="Wind")
+            
+            # Load initial data (this will set map dimensions)
+            # self.on_load("D:\\dev\\planetsim\\images\\1024x512_earth_8bit.png")
+            self.on_load("D:\dev\planetsim\images\GRAY_HR_SR_W_stretched.tif")
+            
+            # Setup GUI components (after we know the map dimensions)
+            self.setup_gui()
+
+            # Initialize coordinate arrays first
+            latitudes = np.linspace(90, -90, self.map_height)
+            longitudes = np.linspace(-180, 180, self.map_width)
+            self.latitude, self.longitude = np.meshgrid(latitudes, longitudes, indexing='ij')
+            self.latitudes_rad = np.deg2rad(self.latitude)
+
+            # Initialize basic humidity field (will be updated later)
+            self.humidity = np.full((self.map_height, self.map_width), 0.5, dtype=np.float32)
+
+            # Initialize temperature field
+            self.initialize_temperature()
+
+            # Initialize humidity
+            self.initialize_humidity()
+
+            # Initialize other attributes
+            self.humidity_effect_coefficient = 0.1
+
+            # Initialize global circulation
+            self.initialize_global_circulation()
+
+            # Initialize wind field
+            self.initialize_wind()
+
+            # Initialize ocean currents
+            self.initialize_ocean_currents()
+
+            # Start simulation thread
+            simulation_thread = threading.Thread(target=self.simulate)
+            simulation_thread.daemon = True
+            simulation_thread.start()
+
+            # Start visualization loop
+            self.update_visualization()
+
+            self.water_vapor = np.zeros_like(self.temperature_celsius)  # Water vapor mixing ratio
+            self.heat_capacity = 1e7  # Heat capacity (J/m²/K)
+            self.stefan_boltzmann = 5.67e-8  # Stefan-Boltzmann constant
+            self.solar_input = 340.0  # Mean solar input (W/m²)
+
+            # Trigger initial map update
+            self.update_map()
+            
+        except Exception as e:
+            print(f"Error in initialization: {e}")
 
     def setup_gui(self):
         # Configure the root window to prevent resizing
@@ -183,6 +263,15 @@ class SimulationApp:
         # Bind the mouse motion event to the canvas
         self.canvas.bind("<Motion>", self.update_mouse_over)
 
+        # Initialize zoom dialog
+        self.zoom_dialog = ZoomDialog(self.root)
+        self.zoom_dialog.withdraw()  # Hide initially
+        
+        # Bind mouse events
+        self.canvas.bind("<Motion>", self.update_zoom_view)
+        self.canvas.bind("<Leave>", lambda e: self.zoom_dialog.withdraw())
+        self.canvas.bind("<Enter>", lambda e: self.zoom_dialog.deiconify())
+
     def save_slider_values(self):
         # [Implement as in the original code...]
         settings = {
@@ -221,108 +310,76 @@ class SimulationApp:
             try:
                 elevation_image = Image.open(file_path)
                 self.map_width, self.map_height = elevation_image.size
-                print(f"Loaded image size: {self.map_width}x{self.map_height}")
-                print(f"Image mode: {elevation_image.mode}")
-
-                # Initialize grid spacing based on map dimensions
+                
+                # Calculate grid spacing
                 earth_circumference = 40075000  # meters
-                self.grid_spacing_x = earth_circumference / self.map_width
                 self.grid_spacing_y = earth_circumference / self.map_height
+                self.grid_spacing_x = earth_circumference / self.map_width
 
                 # Convert image to numpy array
                 img_array = np.array(elevation_image)
                 img_array = img_array.astype(int)
-                if len(img_array.shape) > 2:  # If image is RGB/RGBA
-                    img_array = img_array[:, :, 0]  # Take first channel
+                if len(img_array.shape) > 2:
+                    img_array = img_array[:, :, 0]
 
-                # Initialize altitude array from image data
+                # Store raw pixel values
                 self.altitude = img_array.copy()
-
-                # Get actual grayscale range
-                min_gray = int(img_array.min())
-                max_gray = img_array.max()
-                print(f"Grayscale range: {min_gray} to {max_gray}")
-
-                # Define sea level grayscale value
-                sea_level = 114
-                print(f"Using sea_level grayscale value: {sea_level}")
 
                 # Initialize elevation array
                 self.elevation = np.zeros_like(img_array, dtype=float)
 
-                # Create masks for ocean and land
-                land_mask = img_array > sea_level
-                print(f"Land mask shape: {land_mask.shape}")
-                ocean_mask = img_array < sea_level
-                print(f"Ocean mask shape: {ocean_mask.shape}")
-                sea_level_mask = img_array == sea_level
-                print(f"Sea level mask shape: {sea_level_mask.shape}")
+                # Create masks using pixel value 68 as sea level
+                water_mask = img_array <= 68
+                land_mask = img_array > 68
 
-                # Calculate number of steps
-                ocean_steps = sea_level - min_gray
-                print(f"Ocean steps: {ocean_steps}")
-                land_steps = max_gray - sea_level
-                print(f"Land steps: {land_steps}")
-
-                # Avoid division by zero
-                if ocean_steps == 0:
-                    ocean_steps = 1
-                if land_steps == 0:
-                    land_steps = 1
-
-                # Calculate meters per step
-                meters_per_step_ocean = 10984 / ocean_steps
-                meters_per_step_land = 8848 / land_steps
-
-                # Debugging prints
-                print(f"Ocean steps: {ocean_steps}, Meters per ocean step: {meters_per_step_ocean}")
-                print(f"Number of ocean pixels: {np.sum(ocean_mask)}")
-
-                # Map ocean depths
-                if np.any(ocean_mask):
-                    depth_grayscale = sea_level - img_array[ocean_mask]
-                    print(f"Sample depth grayscale values: {depth_grayscale[:5]}")
-                    self.elevation[ocean_mask] = -depth_grayscale * meters_per_step_ocean
-                    print(f"Sample ocean elevations: {self.elevation[ocean_mask][:5]}")
-
-                # Map land elevations
+                # Calculate land elevations using modified logarithmic scale
                 if np.any(land_mask):
-                    # Adjust grayscale values to start from 0 for the first land level
-                    min_land_gray = sea_level + 1  # First grayscale value above sea level
-                    height_grayscale = img_array[land_mask] - min_land_gray
-                    # Now normalize from 0 to max possible height
-                    normalized_heights = height_grayscale / (max_gray - min_land_gray)
-                    # Map normalized heights to elevation range 0m to 8848m
-                    self.elevation[land_mask] = normalized_heights * 8848
+                    max_elevation = 8848  # meters (Mount Everest)
+                    land_pixels = img_array[land_mask]
+                    
+                    # Convert pixel values to 0-1 range for land (68 to 254)
+                    normalized_pixels = (land_pixels - 68) / (254 - 68)
+                    
+                    # Apply combined logarithmic and power scaling for elevation distribution
+                    log_factor = 0.5  # reduced for even gentler curve
+                    power_factor = 2.5  # increased for more emphasis on lower elevations
+                    
+                    elevation_values = max_elevation * (
+                        (np.log(1 + normalized_pixels * log_factor) / np.log(1 + log_factor)) ** power_factor
+                    )
+                    
+                    self.elevation[land_mask] = elevation_values
 
-                # Set sea level points to exactly 0
-                self.elevation[sea_level_mask] = 0
+                    # Debug output
+                    print("\nElevation distribution:")
+                    print("Sample elevation steps:")
+                    test_pixels = [68, 69, 70, 75, 80, 85, 86, 90, 95, 100, 125, 150, 175, 200, 225, 254]
+                    for pixel in test_pixels:
+                        if pixel > 68:
+                            norm_val = (pixel - 68) / (254 - 68)
+                            elev = max_elevation * (
+                                (np.log(1 + norm_val * log_factor) / np.log(1 + log_factor)) ** power_factor
+                            )
+                            print(f"Pixel {pixel}: {elev:.1f}m")
+                    
+                    print("\nPercentile distribution:")
+                    elev_samples = self.elevation[land_mask]
+                    percentiles = [0, 10, 25, 50, 75, 90, 100]
+                    for p in percentiles:
+                        print(f"{p}th percentile: {np.percentile(elev_samples, p):.2f}m")
 
-                # Validation checks
-                land_max = np.max(self.elevation[land_mask]) if np.any(land_mask) else 0
-                land_min = np.min(self.elevation[land_mask]) if np.any(land_mask) else 0
-                ocean_max = np.max(self.elevation[ocean_mask]) if np.any(ocean_mask) else 0
-                ocean_min = np.min(self.elevation[ocean_mask]) if np.any(ocean_mask) else 0
+                # Water tiles are 0m elevation
+                self.elevation[water_mask] = 0.0
 
-                print("\nElevation Range Validation:")
-                print(f"Land elevation range: {land_min:.2f}m to {land_max:.2f}m")
-                print(f"Ocean elevation range: {ocean_min:.2f}m to {ocean_max:.2f}m")
-
-                if land_max > 8848:
-                    print(f"WARNING: Land elevation exceeds Mount Everest ({land_max:.2f}m > 8848m)")
-                if ocean_min < -10984:
-                    print(f"WARNING: Ocean depth exceeds Mariana Trench ({ocean_min:.2f}m < -10984m)")
-
-                # Calculate normalized elevation (0-1 range)
-                self.elevation_normalized = (self.elevation - self.elevation.min()) / (self.elevation.max() - self.elevation.min())
-
-                # Initialize grid spacing
-                earth_circumference = 40075000  # meters
-                self.grid_spacing_x = earth_circumference / self.map_width
-                self.grid_spacing_y = earth_circumference / (2 * self.map_height)  # Divide by 2 because latitude only covers -90 to 90
-
+                # Normalize elevation for display
+                elevation_min = self.elevation.min()
+                elevation_max = self.elevation.max()
+                if elevation_max > elevation_min:
+                    self.elevation_normalized = (self.elevation - elevation_min) / (elevation_max - elevation_min)
+                else:
+                    self.elevation_normalized = np.zeros_like(self.elevation)
             except Exception as e:
-                print(f"Error loading image: {e}")
+                print(f"Error with on_load: {e}")
                 raise e
 
     def on_generate(self, elevation_data=None):
@@ -340,11 +397,6 @@ class SimulationApp:
         x = np.linspace(0, 1, self.map_width, endpoint=False)
         y = np.linspace(0, 1, self.map_height, endpoint=False)
         x_coords, y_coords = np.meshgrid(x, y)
-
-        # Latitude and Longitude arrays
-        latitudes = np.linspace(90, -90, self.map_height)
-        longitudes = np.linspace(-180, 180, self.map_width)
-        self.latitude, self.longitude = np.meshgrid(latitudes, longitudes, indexing='ij')
 
         # Grid spacing in meters
         earth_circumference = 40075000
@@ -378,15 +430,24 @@ class SimulationApp:
             self.update_temperature_land_ocean()
             self.update_pressure()
             self.update_wind()
+            
+            # Update the map display with new values
             self.update_map()
+            
+            # Update displayed values for current mouse position
             self.update_mouse_over()
             
             elapsed_time = time.time() - start_time
-            print(f"Cycle {self.time_step} completed in {elapsed_time:.4f} seconds")
+            # print(f"Cycle {self.time_step} completed in {elapsed_time:.4f} seconds")
             
-            # Schedule next simulation step with a minimum delay
-            min_delay = 100  # milliseconds
+            # Schedule next simulation step with a reduced or zero delay
+            # Option 1: Set a smaller minimum delay
+            min_delay = 1  # milliseconds
             delay = max(min_delay, int(elapsed_time * 1000))
+            
+            # Option 2: Remove min_delay to run as fast as possible
+            # delay = max(0, int(elapsed_time * 1000))
+            
             self.simulation_after_id = self.root.after(delay, self.simulate)
             
         except Exception as e:
@@ -405,6 +466,10 @@ class SimulationApp:
             pressure_value = self.pressure[y, x]
             temperature_value = self.temperature_celsius[y, x]
             wind_speed_value = np.sqrt(self.u[y, x] ** 2 + self.v[y, x] ** 2)
+            elevation_value = self.elevation[y, x]
+            latitude_value = self.latitude[y, x]
+            longitude_value = self.longitude[y, x]
+            grayscale_value = self.altitude[y, x]
             
             # Calculate wind direction in degrees and adjust to 1-360 range
             wind_direction_rad = np.arctan2(-self.u[y, x], -self.v[y, x])  # Swap u and v, and negate for compass direction
@@ -415,14 +480,6 @@ class SimulationApp:
             if wind_direction == 0:
                 wind_direction = 360
 
-            # Retrieve latitude, longitude, and elevation
-            latitude_value = self.latitude[y, x]
-            longitude_value = self.longitude[y, x]
-            elevation_value = self.elevation[y, x]
-            
-            # Calculate grayscale value (0-255)
-            grayscale_value = int(self.elevation_normalized[y, x] * 255)
-
             # Update label text
             self.mouse_over_label.config(text=(
                 f"Pressure: {pressure_value:.2f} Pa, "
@@ -430,8 +487,8 @@ class SimulationApp:
                 f"Wind Speed: {wind_speed_value:.2f} m/s, "
                 f"Wind Direction: {wind_direction:.2f}°\n"
                 f"Latitude: {latitude_value:.2f}°, Longitude: {longitude_value:.2f}°, "
-                f"Elevation: {elevation_value:.2f} m, Grayscale: {grayscale_value}"
-                f"Altitude: {self.altitude[y, x]:.2f} m, "
+                f"Elevation: {elevation_value:.2f} m, "
+                f"Grayscale: {grayscale_value}, "
                 f"Y: {y}, X: {x}"
             ))
 
@@ -441,7 +498,9 @@ class SimulationApp:
         """Normalize data to range [0,1]"""
         min_val = np.min(data)
         max_val = np.max(data)
-        return (data - min_val) / (max_val - min_val) if max_val > min_val else data
+        if max_val > min_val:
+            return (data - min_val) / (max_val - min_val)
+        return np.zeros_like(data)
 
     def calculate_laplacian(self, field):
         """Calculate the Laplacian of a field using finite difference method."""
@@ -471,13 +530,7 @@ class SimulationApp:
         print("Initialized wind fields with small random perturbations.")
 
     def update_wind(self):
-        """Update wind components dynamically based on atmospheric physics."""
-        print("\nWind Update Debug:")
-        
-        # Calculate initial wind speed for debugging
-        initial_wind_speed = np.sqrt(self.u**2 + self.v**2)
-        print(f"Initial Wind Speed Range: {np.min(initial_wind_speed):.2f} to {np.max(initial_wind_speed):.2f} m/s")
-        
+        """Update wind components dynamically based on atmospheric physics."""     
         # 1. Pressure Gradient Force (PGF)
         pressure_gradient_y = np.gradient(self.pressure, axis=0) / self.grid_spacing_y
         pressure_gradient_x = np.gradient(self.pressure, axis=1) / self.grid_spacing_x
@@ -524,9 +577,6 @@ class SimulationApp:
         self.u = gaussian_filter(self.u, sigma=1.0)
         self.v = gaussian_filter(self.v, sigma=1.0)
 
-        # Final wind speed for debugging
-        final_wind_speed = np.sqrt(self.u**2 + self.v**2)
-        print(f"Final Wind Speed Range: {np.min(final_wind_speed):.2f} to {np.max(final_wind_speed):.2f} m/s")
 
     def initialize_ocean_currents(self):
         """Initialize ocean current components"""
@@ -630,57 +680,56 @@ class SimulationApp:
 
 
     def update_temperature_land_ocean(self):
-        """Update temperature fields for both land and ocean using energy balance."""
-        print(f"Starting temperature update at step {self.time_step}")
-
-        # Constants
-        sigma = 5.670374419e-8  # Stefan-Boltzmann constant
-        albedo_land = 0.3
-        albedo_ocean = 0.06
-        emissivity = 0.9
-        heat_capacity_land = 1e6  # J/m²/K
-        heat_capacity_ocean = 4e6  # J/m²/K
-
-        # Solar radiation calculation
-        S0 = 1361  # Solar constant in W/m²
-        S_avg = S0 / 4
-        solar_factor = 0.5 * (1 + np.cos(self.latitudes_rad))
-        S_lat = S_avg * np.clip(solar_factor, 0, None)
-
-        # Incoming radiation
-        incoming_radiation = np.zeros_like(self.temperature_celsius)
+        """Update temperature fields with improved greenhouse effect."""
+        params = self.climate_params
+        
+        # Solar input calculation
+        S0 = params['solar_constant']
+        S_avg = S0 / 4  # Average over sphere
+        cos_phi = np.clip(np.cos(self.latitudes_rad), 0.1, None)
+        S_lat = S_avg * cos_phi
+        
+        # Calculate albedo based on surface type
         is_land = self.elevation > 0
-        is_ocean = ~is_land
-
-        incoming_radiation[is_land] = (1 - albedo_land) * S_lat[is_land]
-        incoming_radiation[is_ocean] = (1 - albedo_ocean) * S_lat[is_ocean]
-
+        albedo = np.where(is_land, params['albedo_land'], params['albedo_ocean'])
+        
+        # Incoming solar radiation
+        solar_in = (1 - albedo) * S_lat
+        self.energy_budget['solar_in'] = np.mean(solar_in)
+        
+        # Calculate greenhouse effect
+        greenhouse_forcing = self.calculate_greenhouse_effect(params)
+        self.energy_budget['greenhouse_effect'] = greenhouse_forcing
+        
         # Outgoing longwave radiation
+        sigma = 5.670374419e-8  # Stefan-Boltzmann constant
         T_kelvin = self.temperature_celsius + 273.15
-        outgoing_radiation = emissivity * sigma * T_kelvin ** 4
+        longwave_out = params['emissivity'] * sigma * T_kelvin**4
+        self.energy_budget['longwave_out'] = np.mean(longwave_out)
+        
+        # Net energy flux
+        net_flux = solar_in + greenhouse_forcing - longwave_out
+        self.energy_budget['net_flux'] = np.mean(net_flux)
+        
+        # Temperature change based on heat capacity
+        heat_capacity = np.where(is_land, 
+                               params['heat_capacity_land'], 
+                               params['heat_capacity_ocean'])
+        
+        delta_T = (net_flux / heat_capacity) * self.time_step_seconds
+        
+        # Apply temperature change
+        self.temperature_celsius += delta_T
+        
+        # Apply heat transfer between cells
+        self.temperature_celsius = gaussian_filter(
+            self.temperature_celsius, 
+            sigma=params['atmospheric_heat_transfer']
+        )
+        
+        # Track temperature history
+        self.energy_budget['temperature_history'].append(np.mean(self.temperature_celsius))
 
-        # Net radiation balance
-        net_radiation = incoming_radiation - outgoing_radiation
-
-        # Update temperature
-        delta_temp_land = (net_radiation / heat_capacity_land) * self.time_step_seconds
-        delta_temp_ocean = (net_radiation / heat_capacity_ocean) * self.time_step_seconds
-
-        self.temperature_celsius[is_land] += delta_temp_land[is_land]
-        self.temperature_celsius[is_ocean] += delta_temp_ocean[is_ocean]
-
-        # Smooth temperature field for numerical stability
-        self.temperature_celsius = gaussian_filter(self.temperature_celsius, sigma=1.0)
-
-        # Normalize temperature for visualization
-        self.temperature_normalized = self.normalize_data(self.temperature_celsius)
-
-        print(f"\nTemperature Update Debug:")
-        print(f"  - Land Cells Updated: {np.sum(is_land)}")
-        print(f"  - Ocean Cells Updated: {np.sum(is_ocean)}")
-        print(f"  - Temperature Change Range (Land): {np.min(delta_temp_land[is_land]):.4f} to {np.max(delta_temp_land[is_land]):.4f} °C")
-        print(f"  - Temperature Change Range (Ocean): {np.min(delta_temp_ocean[is_ocean]):.4f} to {np.max(delta_temp_ocean[is_ocean]):.4f} °C")
-        print(f"  - Temperature Range After Update: Min: {np.min(self.temperature_celsius):.2f} °C, Max: {np.max(self.temperature_celsius):.2f} °C")
 
     def map_to_grayscale(self, data):
         """Convert data to grayscale values"""
@@ -688,6 +737,7 @@ class SimulationApp:
         grayscale = (grayscale * 255).astype(np.uint8)
         rgb_array = np.stack((grayscale,)*3, axis=-1)
         return rgb_array
+
 
     def debug_elevation_point(self, x, y):
         """Debug elevation and color assignment at a specific point"""
@@ -700,21 +750,20 @@ class SimulationApp:
         print(f"Should be land (grayscale > 113): {grayscale > 113}")
         return grayscale, elev
 
+
     def map_altitude_to_color(self, elevation):
         """Map elevation data to RGB colors using standard elevation palette"""
         # Create RGB array
         rgb = np.zeros((self.map_height, self.map_width, 3), dtype=np.uint8)
         
         # Get the actual grayscale range from the image
-        min_gray = self.altitude.min()  # Should be around 72
-        min_gray = -1098
-        max_gray = self.altitude.max()  # Should be around 232
-        #sea_level = (max_gray + min_gray) // 2  # Should be around 152
-        sea_level = 113
+        min_gray = self.altitude.min()  # Should be 0
+        max_gray = self.altitude.max()  # Should be 510
+        sea_level = 3  # First land pixel value
         
         # Create masks based on raw grayscale values
-        ocean = self.altitude <= sea_level
-        land = self.altitude > sea_level
+        ocean = self.altitude <= 2
+        land = self.altitude > 2
         
         # Ocean (blue)
         rgb[ocean] = [0, 0, 255]
@@ -722,13 +771,13 @@ class SimulationApp:
         # Land areas
         if np.any(land):
             land_colors = np.array([
-                [4, 97, 2],    # Dark Green (lowest elevation)
+                [4, 97, 2],      # Dark Green (lowest elevation)
                 [43, 128, 42],   # Light Green
                 [94, 168, 93],   # Light yellow
-                [235, 227, 87],   # Yellow
-                [171, 143, 67],   # Brown
-                [107, 80, 0],   # Dark Brown
-                [227, 227, 227]     # Gray (highest elevation)
+                [235, 227, 87],  # Yellow
+                [171, 143, 67],  # Brown
+                [107, 80, 0],    # Dark Brown
+                [227, 227, 227]  # Gray (highest elevation)
             ])
             
             # Get grayscale values for land only
@@ -751,32 +800,41 @@ class SimulationApp:
             # Apply interpolated colors to land areas
             rgb[land] = (start_colors * (1 - ratios[:, np.newaxis]) + 
                         end_colors * ratios[:, np.newaxis]).astype(np.uint8)
-             
+                 
         return rgb
 
-    def map_temperature_to_color(self, data_normalized):
-        """Map temperature to color gradient"""
-        breakpoints = [
-            (0.0, (0, 0, 128)),      # Deep blue (very cold)
-            (0.15, (0, 128, 255)),   # Light blue
-            (0.30, (128, 255, 255)), # Cyan
-            (0.45, (255, 255, 128)), # Light yellow
-            (0.60, (255, 200, 0)),   # Yellow-orange
-            (0.75, (255, 128, 0)),   # Orange
-            (1.0, (128, 0, 0))       # Deep red (very hot)
-        ]
 
-        rgb_array = np.zeros((data_normalized.shape[0], data_normalized.shape[1], 3), dtype=np.uint8)
+    def map_temperature_to_color(self, temperature_data):
+        """
+        Map temperature to a color gradient.
+        Blue for cold, red for hot, with proper normalization.
+        """
+        # Create RGBA array
+        rgba_array = np.zeros((self.map_height, self.map_width, 4), dtype=np.uint8)
+        
+        # Set fixed temperature range for consistent coloring
+        min_temp = -50.0  # Coldest expected temperature
+        max_temp = 50.0   # Hottest expected temperature
+        
+        # Normalize temperature to [0,1] using fixed range
+        temp_normalized = np.clip((temperature_data - min_temp) / (max_temp - min_temp), 0, 1)
+        
+        # Create temperature color gradient
+        rgba_array[..., 0] = (temp_normalized * 255).astype(np.uint8)  # Red
+        rgba_array[..., 2] = ((1 - temp_normalized) * 255).astype(np.uint8)  # Blue
+        
+        # Add green component for better visualization
+        rgba_array[..., 1] = (np.minimum(temp_normalized, 1 - temp_normalized) * 255).astype(np.uint8)
+        
+        # Set alpha channel
+        rgba_array[..., 3] = 255  # Full opacity
+        
+        # Make water areas more transparent
+        is_water = self.elevation <= 0
+        rgba_array[is_water, 3] = 128  # 50% transparency for water
+        
+        return rgba_array
 
-        for i in range(len(breakpoints) - 1):
-            val0, color0 = breakpoints[i]
-            val1, color1 = breakpoints[i + 1]
-            mask = (data_normalized >= val0) & (data_normalized <= val1)
-            data_segment = (data_normalized[mask] - val0) / (val1 - val0)
-            for c in range(3):
-                rgb_array[mask, c] = (data_segment * (color1[c] - color0[c]) + color0[c]).astype(np.uint8)
-
-        return rgb_array
 
     def map_ocean_temperature_to_color(self, data_normalized):
         """Map ocean temperature to color gradient"""
@@ -819,76 +877,86 @@ class SimulationApp:
         
         return rgb_array
 
+
     def update_pressure(self):
-        """Update atmospheric pressure based on physical processes."""
-        # Constants
-        R = 287.05  # Specific gas constant for dry air (J/(kg·K))
-        g = 9.81    # Gravitational acceleration (m/s²)
+        """Update pressure field over time"""
+        try:
+            # Ensure pressure is float type
+            self.pressure = self.pressure.astype(np.float64)
+            
+            # Get pressure gradients
+            dy, dx = np.gradient(self.pressure)
+            
+            # Calculate pressure tendency
+            tendency = np.zeros_like(self.pressure, dtype=np.float64)
+            
+            # Add small-scale variations based on temperature
+            temp_effect = 0.1 * (self.temperature_celsius - np.mean(self.temperature_celsius))
+            tendency += gaussian_filter(temp_effect, sigma=2.0)
+            
+            # Add terrain effects
+            terrain_effect = -0.05 * self.elevation.astype(np.float64)
+            tendency += gaussian_filter(terrain_effect, sigma=2.0)
+            
+            # Apply tendency with small time step
+            dt = 0.1
+            self.pressure += tendency * dt
+            
+            # Maintain reasonable pressure bounds
+            self.pressure = np.clip(self.pressure, 95000.0, 105000.0)
+            
+            # Smooth the field
+            self.pressure = gaussian_filter(self.pressure, sigma=1.0)
+            
+            # Update normalized version
+            self.pressure_normalized = self.normalize_data(self.pressure)
+            
+        except Exception as e:
+            print(f"Error updating pressure: {e}")
 
-        print("\nPressure Update Debug:")
-
-        # 1. Calculate Air Density
-        T_kelvin = self.temperature_celsius + 273.15
-        air_density = self.pressure / (R * T_kelvin)
-
-        # 2. Pressure Tendency due to Wind Divergence (Continuity Equation)
-        div_u = np.gradient(self.u, axis=1) / self.grid_spacing_x
-        div_v = np.gradient(self.v, axis=0) / self.grid_spacing_y
-        divergence = div_u + div_v
-
-        # 3. Limit Divergence to Prevent Excessive Pressure Changes
-        divergence = np.clip(divergence, -1e-3, 1e-3)  # Adjust as needed
-
-        # 4. Pressure Tendency Calculation
-        pressure_tendency = -air_density * R * T_kelvin * divergence
-
-        # 5. Pressure Tendency due to Temperature Changes (Thermal Effects)
-        temp_change = self.temperature_celsius - self.previous_temperature_celsius
-        thermal_pressure_tendency = air_density * R * temp_change / self.time_step_seconds
-
-        # 6. Update Pressure with Limited Gradients
-        total_pressure_tendency = pressure_tendency + thermal_pressure_tendency
-        self.pressure += total_pressure_tendency * self.time_step_seconds
-
-        # 7. Apply Periodic Boundary Conditions for X (longitude) and Reflective for Y (latitude)
-        self.pressure = gaussian_filter(self.pressure, sigma=2.0)  # Enhanced smoothing
-
-        # 8. Advect Pressure with Correct Boundary Conditions
-        self.pressure = self.advect_field(self.pressure, self.u, self.v)
-
-        # 9. Store Current Temperature for Next Iteration
-        self.previous_temperature_celsius = self.temperature_celsius.copy()
-
-        # 10. Ensure Pressure Remains within Realistic Bounds
-        self.pressure = np.clip(self.pressure, 50000, 110000)
-
-        # 11. Update Normalized Pressure for Visualization
-        self.pressure_normalized = self.normalize_data(self.pressure)
-
-        # Debug Output
-        print(f"Pressure Range: {np.min(self.pressure):.2f} to {np.max(self.pressure):.2f} Pa")
-        print(f"Max Pressure Gradient: {np.max(np.abs(np.gradient(self.pressure))):.2f} Pa/m")
 
     def draw_wind_vectors(self):
-        """Draw wind vectors on canvas."""
-        step = max(self.map_width, self.map_height) // 40
-        scale = 0.3  # Adjust scale for better visualization
+        """Simplified wind vector drawing"""
+        try:
+            # Increase spacing between vectors
+            step = max(self.map_width, self.map_height) // 30
+            
+            # Create coordinate grids
+            x_indices = np.arange(0, self.map_width, step)
+            y_indices = np.arange(0, self.map_height, step)
+            X, Y = np.meshgrid(x_indices, y_indices)
+            
+            # Sample wind components
+            u_sampled = self.u[Y, X]
+            v_sampled = self.v[Y, X]
+            
+            # Calculate magnitudes for scaling
+            magnitudes = np.sqrt(u_sampled**2 + v_sampled**2)
+            max_magnitude = np.max(magnitudes) if magnitudes.size > 0 else 1.0
+            
+            # Scale factor for arrow length
+            scale = step * 0.5 / max_magnitude if max_magnitude > 0 else step * 0.5
+            
+            # Draw vectors
+            for i in range(len(y_indices)):
+                for j in range(len(x_indices)):
+                    x = X[i, j]
+                    y = Y[i, j]
+                    dx = u_sampled[i, j] * scale
+                    dy = v_sampled[i, j] * scale
+                    
+                    if np.isfinite(dx) and np.isfinite(dy):
+                        self.canvas.create_line(
+                            x, y, x + dx, y + dy,
+                            arrow=tk.LAST,
+                            fill='white',
+                            width=2,
+                            arrowshape=(8, 10, 3)
+                        )
+                        
+        except Exception as e:
+            print(f"Error drawing wind vectors: {e}")
 
-        x_indices, y_indices = np.meshgrid(
-            np.arange(0, self.map_width, step),
-            np.arange(0, self.map_height, step)
-        )
-
-        u_sampled = self.u[y_indices, x_indices]
-        v_sampled = self.v[y_indices, x_indices]
-
-        x_coords = x_indices.flatten()
-        y_coords = y_indices.flatten()
-        dx = u_sampled.flatten() * scale
-        dy = -v_sampled.flatten() * scale  # Negative due to GUI coordinate system
-
-        for x, y, delta_x, delta_y in zip(x_coords, y_coords, dx, dy):
-            self.canvas.create_line(x, y, x + delta_x, y + delta_y, arrow=tk.LAST, fill='white')
 
     def draw_current_arrows(self):
         """Draw ocean current arrows"""
@@ -934,21 +1002,16 @@ class SimulationApp:
                         self.canvas.create_line(x2, y2, x_head1, y_head1, fill='blue', width=1)
                         self.canvas.create_line(x2, y2, x_head2, y_head2, fill='blue', width=1)
 
+
     def update_map(self):
         """Update the map display based on selected layer"""
         try:
             if self.selected_layer.get() == "Pressure":
                 # Create pressure visualization
-                pressure_rgba = self.map_pressure_to_color(self.pressure)
-                
-                # Create altitude overlay
-                altitude_rgba = self.map_altitude_to_overlay(self.elevation)
-                
-                # Blend the two RGBA arrays
-                display_data = self.blend_rgba_arrays(pressure_rgba, altitude_rgba)
+                display_data = self.map_pressure_to_color(self.pressure)
                 
                 # Convert to PIL Image and display
-                image = Image.fromarray(display_data)
+                image = Image.fromarray(display_data.astype('uint8'))  # Ensure uint8 type
                 photo = ImageTk.PhotoImage(image)
                 self.current_image = photo
                 
@@ -958,6 +1021,7 @@ class SimulationApp:
                 
                 # Create image on canvas
                 self.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+                
                 return
             
             elif self.selected_layer.get() == "Elevation":
@@ -965,7 +1029,7 @@ class SimulationApp:
             elif self.selected_layer.get() == "Altitude":
                 display_data = self.map_altitude_to_color(self.elevation)
             elif self.selected_layer.get() == "Temperature":
-                display_data = self.map_temperature_to_color(self.temperature_normalized)
+                display_data = self.map_temperature_to_color(self.temperature_celsius)
             elif self.selected_layer.get() == "Wind":
                 display_data = self.map_altitude_to_color(self.elevation)
                 image = Image.fromarray(display_data.astype('uint8'))
@@ -979,7 +1043,7 @@ class SimulationApp:
                 # Create image on canvas
                 self.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
 
-                # Draw additional elements if needed (wind vectors, etc.)
+                # Draw wind vectors
                 self.draw_wind_vectors()
                 
                 return
@@ -1021,193 +1085,165 @@ class SimulationApp:
             print(f"Error updating map: {e}")
             raise e
 
-    def blend_rgba_arrays(self, base_rgba, overlay_rgba):
-        """Blend two RGBA arrays using alpha compositing."""
-        # Convert to float for calculations
-        base = base_rgba.astype(float) / 255
-        overlay = overlay_rgba.astype(float) / 255
-        
-        # Extract alpha channels
-        base_alpha = base[..., 3]
-        overlay_alpha = overlay[..., 3]
-        
-        # Calculate resulting alpha
-        out_alpha = overlay_alpha + base_alpha * (1 - overlay_alpha)
-        
-        # Calculate resulting colors
-        out_colors = np.zeros_like(base)
-        for i in range(3):  # For RGB channels
-            out_colors[..., i] = (overlay[..., i] * overlay_alpha + 
-                                 base[..., i] * base_alpha * (1 - overlay_alpha)) / np.maximum(out_alpha, 1e-8)
-        
-        # Set alpha channel
-        out_colors[..., 3] = out_alpha
-        
-        # Convert back to uint8
-        return (out_colors * 255).astype(np.uint8)
+    
+    def initialize_humidity(self):
+        """Initialize spatial humidity map."""
+        # Base humidity values
+        equator_humidity = 0.8  # High humidity near the equator
+        pole_humidity = 0.4     # Lower humidity near the poles
+
+        # Create a latitude-based gradient for humidity
+        # Higher humidity near the equator, decreasing towards the poles
+        latitude_humidity_gradient = pole_humidity + (equator_humidity - pole_humidity) * np.cos(np.deg2rad(self.latitude))
+
+        # Enhance humidity near oceans
+        is_ocean = self.elevation <= 0
+        ocean_humidity = 0.9  # Higher humidity over oceans
+        land_humidity = 0.6   # Moderate humidity over land
+
+        # Initialize humidity map based on land and ocean
+        self.humidity = np.where(is_ocean, ocean_humidity, land_humidity)
+
+        # Blend with latitude gradient for more realism
+        blend_factor = 0.3  # Determines the influence of latitude on land humidity
+        self.humidity = self.humidity * (1 - blend_factor) + latitude_humidity_gradient * blend_factor
+
+        # Clip humidity values to ensure they remain within [0.0, 1.0]
+        self.humidity = np.clip(self.humidity, 0.0, 1.0)
+
+        # Optional: Add random variability for more natural distribution
+        # noise = np.random.normal(loc=0.0, scale=0.05, size=self.humidity.shape)
+        # self.humidity += noise
+        # self.humidity = np.clip(self.humidity, 0.0, 1.0)
+
+        print("Humidity map initialized.")
+
 
     def initialize_temperature(self):
-        """Initialize temperature field with improved baseline for real-world values."""
+        """Initialize temperature field with improved baseline for real-world values, including greenhouse effect."""
         # Constants
         S0 = 1361  # Solar constant in W/m²
         albedo = 0.3  # Earth's average albedo
         sigma = 5.670374419e-8  # Stefan-Boltzmann constant
         lapse_rate = 6.5  # K per km
-        greenhouse_effect = 33  # K, consider making this dynamic
-        humidity_effect = 5  # Additional warming due to water vapor, adjust as needed
+        humidity_effect_coefficient = 0.1  # K per unit humidity
 
-        # Generate coordinate arrays if not already done
-        if not hasattr(self, 'latitudes_rad'):
-            latitudes = np.linspace(90, -90, self.map_height)
-            longitudes = np.linspace(-180, 180, self.map_width)
-            self.latitude, self.longitude = np.meshgrid(latitudes, longitudes, indexing='ij')
-            self.latitudes_rad = np.deg2rad(self.latitude)
-
+        # Calculate effective temperature
         S_avg = S0 / 4
         cos_phi = np.clip(np.cos(self.latitudes_rad), 0, None)
         S_lat = S_avg * cos_phi
         T_eff = (((1 - albedo) * S_lat) / sigma) ** 0.25
 
-        # Adjust the baseline temperature to better match real-world values
-        baseline_adjustment = 40  # Increase this value to raise the overall temperature
-        T_surface = T_eff + greenhouse_effect + humidity_effect + baseline_adjustment
+        # Calculate greenhouse temperature adjustment
+        climate_sensitivity = 2.0  # K per W/m²
+        greenhouse_temperature_adjustment = climate_sensitivity * self.total_radiative_forcing
 
-        # Calculate base temperature without elevation effects
-        self.temperature_celsius = T_surface - 273.15  # Convert to Celsius
+        # Calculate humidity adjustment
+        humidity_effect_adjustment = humidity_effect_coefficient * self.humidity  # Ensure `self.humidity` is defined appropriately
 
-        # Apply elevation effects using lapse rate
+        # Total surface temperature
+        T_surface = T_eff + greenhouse_temperature_adjustment + humidity_effect_adjustment
+
+        # Convert to Celsius
+        self.temperature_celsius = T_surface - 273.15  # Convert Kelvin to Celsius
+
+        # Define baseline land temperature
+        baseline_land_temperature = 15.0  # °C at sea level
+
+        # Apply lapse rate relative to baseline
+        is_land = self.elevation > 0
         altitude_km = np.maximum(self.elevation, 0) / 1000.0
         delta_T_altitude = -lapse_rate * altitude_km
-        self.temperature_celsius += delta_T_altitude
-        self.temperature_celsius = np.clip(self.temperature_celsius, -80.0, 50.0)
+        self.temperature_celsius[is_land] = baseline_land_temperature + delta_T_altitude[is_land]
 
-        # Normalize temperature for display
-        self.temperature_normalized = self.normalize_data(self.temperature_celsius)
-
-        # Initialize ocean temperatures separately
+        # Initialize ocean temperatures with latitude-based gradient
         is_ocean = self.elevation <= 0
         self.temperature_celsius[is_ocean] = np.clip(
             20 - (np.abs(self.latitude[is_ocean]) / 90) * 40,  # Temperature decreases with latitude
             -2,  # Minimum ocean temperature
             30   # Maximum ocean temperature
         )
-        
+
+        # Clip temperatures to realistic bounds
+        self.temperature_celsius = np.clip(self.temperature_celsius, -50.0, 50.0)
+
+        # Normalize temperature for visualization
         self.temperature_normalized = self.normalize_data(self.temperature_celsius)
 
         # Initialize pressure after temperature
         self.initialize_pressure()
 
-        # Print initial temperature values
-        print(f"Initial Temperature Min: {np.min(self.temperature_celsius)}, Max: {np.max(self.temperature_celsius)}")
 
     def initialize_pressure(self):
-        """Initialize pressure field using temperature gradients and altitude."""
-        # Constants
-        R = 287.05  # Gas constant for dry air (J/(kg·K))
-        g = 9.81    # Gravitational acceleration (m/s²)
+        """Initialize realistic global pressure patterns"""
+        try:
+            # Standard sea-level pressure in Pa (explicitly as float)
+            P0 = 101325.0
+            
+            # Create latitude and longitude grids
+            lats = np.linspace(90, -90, self.map_height)
+            lons = np.linspace(-180, 180, self.map_width)
+            lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')
+            lat_rad = np.deg2rad(lat_grid)
+            
+            # Base pressure field (explicitly as float)
+            self.pressure = np.full((self.map_height, self.map_width), P0, dtype=np.float64)
+            
+            # Add major pressure systems
+            self.pressure += 1500.0 * np.exp(-((lat_rad - np.deg2rad(30))**2) / (2 * (np.pi/15)**2))
+            self.pressure += 1500.0 * np.exp(-((lat_rad + np.deg2rad(30))**2) / (2 * (np.pi/15)**2))
+            
+            # Subpolar lows
+            self.pressure -= 2000.0 * np.exp(-((lat_rad - np.deg2rad(60))**2) / (2 * (np.pi/15)**2))
+            self.pressure -= 2000.0 * np.exp(-((lat_rad + np.deg2rad(60))**2) / (2 * (np.pi/15)**2))
+            
+            # ITCZ (Equatorial low)
+            self.pressure -= 500.0 * np.exp(-(lat_rad**2) / (2 * (np.pi/20)**2))
+            
+            # Apply elevation effects
+            self.pressure *= np.exp(-self.elevation.astype(np.float64) / 7400.0)
+            
+            # Smooth the field
+            self.pressure = gaussian_filter(self.pressure, sigma=3.0)
+            
+            # Store normalized version for visualization
+            self.pressure_normalized = self.normalize_data(self.pressure)
+            
+        except Exception as e:
+            print(f"Error initializing pressure: {e}")
 
-        # Convert temperature to Kelvin
-        T = self.temperature_celsius + 273.15
-
-        # Use elevation above sea level
-        elevation_above_sea_level = np.maximum(self.elevation, 0)
-
-        # Apply the hypsometric equation: P = P0 * exp(-g*h/(R*T))
-        self.pressure = self.P0 * np.exp(-g * elevation_above_sea_level / (R * T))
-
-        # Smooth pressure to simulate horizontal mixing
-        self.pressure = gaussian_filter(self.pressure, sigma=2.0)
-
-        # Normalize pressure for visualization
-        self.pressure_normalized = self.normalize_data(self.pressure)
-
-        print(f"Initialized pressure. Min: {np.min(self.pressure):.2f}, Max: {np.max(self.pressure):.2f} Pa")
 
     def map_pressure_to_color(self, pressure_data):
         """
-        Map pressure to a red-blue color gradient with altitude overlay.
+        Map pressure to a red-blue color gradient.
         Red indicates low pressure, blue indicates high pressure.
         """
-        # Create RGBA array (including alpha channel for transparency)
+        # Create RGBA array
         rgba_array = np.zeros((self.map_height, self.map_width, 4), dtype=np.uint8)
         
-        # Normalize pressure data to [0, 1]
-        pressure_normalized = self.normalize_data(pressure_data)
+        # Set fixed pressure range for consistent coloring (in Pa)
+        min_pressure = 95000.0  # Typical low pressure
+        max_pressure = 105000.0 # Typical high pressure
         
-        # Create pressure color gradient (red to blue)
+        # Normalize pressure to [0,1] using fixed range
+        pressure_normalized = np.clip((pressure_data - min_pressure) / (max_pressure - min_pressure), 0, 1)
+        
+        # Create pressure color gradient (red=low, blue=high)
         rgba_array[..., 0] = ((1 - pressure_normalized) * 255).astype(np.uint8)  # Red
         rgba_array[..., 2] = (pressure_normalized * 255).astype(np.uint8)        # Blue
         
         # Add green component for better visualization
         rgba_array[..., 1] = (np.minimum(pressure_normalized, 1 - pressure_normalized) * 255).astype(np.uint8)
         
-        # Calculate alpha channel based on elevation
-        elevation_normalized = self.normalize_data(self.elevation)
+        # Set alpha channel
+        rgba_array[..., 3] = 192  # 75% opacity
         
         # Make water areas more transparent
         is_water = self.elevation <= 0
-        alpha = np.ones_like(elevation_normalized) * 255  # Start with full opacity
-        alpha[is_water] = 128  # 50% transparency for water
-        
-        # Add elevation-based transparency for land
-        land_alpha = (elevation_normalized * 127 + 128)  # Scale from 128-255
-        alpha[~is_water] = land_alpha[~is_water]
-        
-        rgba_array[..., 3] = alpha.astype(np.uint8)
+        rgba_array[is_water, 3] = 128  # 50% transparency for water
         
         return rgba_array
 
-    def map_altitude_to_overlay(self, elevation):
-        """Create a semi-transparent altitude overlay."""
-        # Create RGBA array
-        rgba = np.zeros((self.map_height, self.map_width, 4), dtype=np.uint8)
-        
-        # Get the actual grayscale range from the image
-        min_gray = -1098
-        sea_level = 113
-        max_gray = self.altitude.max()
-        
-        # Create masks based on raw grayscale values
-        ocean = self.altitude <= sea_level
-        land = self.altitude > sea_level
-        
-        # Ocean (transparent blue)
-        rgba[ocean] = [0, 0, 255, 64]  # Light blue with 25% opacity
-        
-        # Land areas with varying colors and transparency
-        if np.any(land):
-            land_colors = np.array([
-                [4, 97, 2, 128],      # Dark Green (lowest elevation)
-                [43, 128, 42, 128],   # Light Green
-                [94, 168, 93, 128],   # Light yellow
-                [235, 227, 87, 128],  # Yellow
-                [171, 143, 67, 128],  # Brown
-                [107, 80, 0, 128],    # Dark Brown
-                [227, 227, 227, 128]  # Gray (highest elevation)
-            ])
-            
-            # Get grayscale values for land only
-            land_grayscale = self.altitude[land]
-            
-            # Normalize land heights to [0,1] range
-            normalized_heights = (land_grayscale - sea_level) / (max_gray - sea_level)
-            
-            # Calculate indices for color interpolation
-            color_indices = (normalized_heights * (len(land_colors) - 1)).astype(int)
-            color_indices = np.clip(color_indices, 0, len(land_colors) - 2)
-            
-            # Calculate interpolation ratios
-            ratios = (normalized_heights * (len(land_colors) - 1)) % 1
-            
-            # Interpolate colors
-            start_colors = land_colors[color_indices]
-            end_colors = land_colors[color_indices + 1]
-            
-            # Apply interpolated colors to land areas
-            rgba[land] = (start_colors * (1 - ratios[:, np.newaxis]) + 
-                         end_colors * ratios[:, np.newaxis]).astype(np.uint8)
-        
-        return rgba
 
     def advect_field(self, field, u, v):
         """Advect a scalar field using the velocities u and v with a semi-Lagrangian scheme."""
@@ -1236,6 +1272,426 @@ class SimulationApp:
         field_advected = interpolator(points).reshape((ny, nx))
 
         return field_advected
+
+
+    def update_visualization(self):
+        """Update the map display with current data"""
+        try:
+            # Clear previous layers
+            self.canvas.delete("data_layer")
+            
+            if self.selected_layer.get() == "Temperature":
+                # Update temperature colors
+                colors = self.map_temperature_to_color(self.temperature_celsius)
+            elif self.selected_layer.get() == "Pressure":
+                # Update pressure colors
+                colors = self.map_pressure_to_color(self.pressure)
+            else:
+                return
+            
+            # Convert to PhotoImage format
+            image = Image.fromarray(colors)
+            self.current_photo = ImageTk.PhotoImage(image)
+            
+            # Update canvas
+            self.canvas.create_image(
+                0, 0, 
+                image=self.current_photo, 
+                anchor="nw",
+                tags="data_layer"
+            )
+            
+            # Update other visualization elements
+            self.update_mouse_over()
+            
+        except Exception as e:
+            print(f"Error updating visualization: {e}")
+            print(f"Current mode: {self.selected_layer.get()}")
+            print(f"Pressure shape: {self.pressure.shape if hasattr(self, 'pressure') else 'No pressure data'}")
+        
+        # Schedule next update
+        self.root.after(30, self.update_visualization)
+
+
+    def calculate_greenhouse_effect(self, params):
+        """
+        Calculate greenhouse effect with more physically-based parameters.
+        Returns forcing in W/m²
+        """
+        # Constants
+        stefan_boltzmann = 5.67e-8  # Stefan-Boltzmann constant W/m²/K⁴
+        expected_total = 150  # Earth's total greenhouse effect is about 150 W/m²
+        
+        # Base greenhouse gases forcing (W/m²)
+        # Values based on IPCC AR6 estimates
+        base_forcings = {
+            'co2': 5.35 * np.log(self.co2_concentration / 278),  # Pre-industrial CO2 was 278 ppm
+            'ch4': 0.036 * (np.sqrt(self.ch4_concentration) - np.sqrt(722)),  # Pre-industrial CH4 was 722 ppb
+            'n2o': 0.12 * (np.sqrt(self.n2o_concentration) - np.sqrt(270))   # Pre-industrial N2O was 270 ppb
+        }
+        
+        # Calculate water vapor contribution
+        # Water vapor accounts for about 60% of Earth's greenhouse effect
+        T_kelvin = self.temperature_celsius + 273.15
+        reference_temp = 288.15  # 15°C in Kelvin
+        
+        # Base water vapor effect (should be ~90 W/m² at 15°C)
+        base_water_vapor = 90.0
+        
+        # Calculate water vapor forcing with temperature dependence
+        # Avoid negative values by using exponential relationship
+        temp_factor = np.exp(0.07 * (np.mean(T_kelvin) - reference_temp))
+        water_vapor_forcing = base_water_vapor * temp_factor
+        
+        # Other greenhouse gases (ozone, CFCs, etc.)
+        other_ghg = 25.0
+        
+        # Total greenhouse forcing
+        ghg_forcing = sum(base_forcings.values())  # CO2, CH4, N2O
+        total_forcing = (ghg_forcing + water_vapor_forcing + other_ghg) * params['greenhouse_strength']
+        
+        # Store individual components for debugging
+        self.energy_budget.update({
+            'co2_forcing': base_forcings['co2'],
+            'ch4_forcing': base_forcings['ch4'],
+            'n2o_forcing': base_forcings['n2o'],
+            'water_vapor_forcing': water_vapor_forcing,
+            'other_ghg_forcing': other_ghg,
+            'total_greenhouse_forcing': total_forcing
+        })
+        
+        # Print diagnostics every cycle
+        # if self.time_step == 1:
+            # First time, clear the console
+            # print("\033[2J\033[H", end='')
+        
+        # Move cursor to the top of the console each cycle
+        # print("\033[H", end='')
+        
+        # Print all values
+        # print(f"Energy Budget Statistics:")
+        # print(f"Solar Input: {float(np.mean(self.energy_budget['solar_in'])):.2f} W/m²")
+        # print(f"Greenhouse Effect: {float(np.mean(self.energy_budget['greenhouse_effect'])):.2f} W/m²")
+        # print(f"Longwave Output: {float(np.mean(self.energy_budget['longwave_out'])):.2f} W/m²")
+        # print(f"Net Flux: {float(np.mean(self.energy_budget['net_flux'])):.2f} W/m²")
+        # print(f"Current Average Temperature: {float(np.mean(self.temperature_celsius)):.2f} °C")
+        # print(f"Cycle: {self.time_step}")
+        # print(f"CO2 ({self.co2_concentration} ppm): {float(base_forcings['co2']):.2f} W/m²")
+        # print(f"CH4 ({self.ch4_concentration} ppb): {float(base_forcings['ch4']):.2f} W/m²")
+        # print(f"N2O ({self.n2o_concentration} ppb): {float(base_forcings['n2o']):.2f} W/m²")
+        # print(f"Water Vapor: {float(water_vapor_forcing):.2f} W/m²")
+        # print(f"Other GHGs: {float(other_ghg):.2f} W/m²")
+        # print(f"Total Forcing: {float(total_forcing):.2f} W/m²")
+        # print(f"Temperature Factor: {float(temp_factor):.3f}")
+        # print(f"Difference from Earth's typical greenhouse effect: {float(total_forcing - expected_total):.2f} W/m²")
+        # print(f"Pressure statistics:")
+        # print(f"Global Min Pressure: {np.min(self.pressure):.2f} Pa")
+        # print(f"Global Max Pressure: {np.max(self.pressure):.2f} Pa")
+        # print(f"Average Pressure: {np.mean(self.pressure):.2f} Pa")
+        
+
+        return total_forcing
+
+
+    def calculate_water_vapor_saturation(self, T):
+        """
+        Calculate water vapor saturation pressure using the Clausius-Clapeyron equation
+        T: Temperature in Celsius
+        Returns: Saturation vapor pressure in Pa
+        """
+        T_kelvin = T + 273.15
+        # Constants for water vapor
+        L = 2.5e6  # Latent heat of vaporization (J/kg)
+        Rv = 461.5  # Gas constant for water vapor (J/(kg·K))
+        T0 = 273.15  # Reference temperature (K)
+        e0 = 611.0  # Reference vapor pressure (Pa)
+        
+        return e0 * np.exp((L/Rv) * (1/T0 - 1/T_kelvin))
+
+
+    def calculate_relative_humidity(self, vapor_pressure, T):
+        """Calculate relative humidity from vapor pressure and temperature"""
+        saturation_pressure = self.calculate_water_vapor_saturation(T)
+        return np.clip(vapor_pressure / saturation_pressure, 0, 1)
+
+
+    def calculate_cloud_albedo(self, relative_humidity):
+        """Reduce cloud cooling effect"""
+        base_cloud_albedo = 0.15  # Reduced from 0.2
+        max_cloud_albedo = 0.45   # Reduced from 0.55
+        cloud_threshold = 0.8     # Increased from 0.75
+        
+        cloud_cover = np.clip((relative_humidity - cloud_threshold) / (1 - cloud_threshold), 0, 1)
+        return base_cloud_albedo + (max_cloud_albedo - base_cloud_albedo) * cloud_cover
+
+
+    def calculate_surface_albedo(self, T):
+        """Soften ice-albedo feedback"""
+        ice_albedo = 0.65        # Reduced from 0.7
+        land_albedo = 0.3
+        ocean_albedo = 0.07      # Slightly increased from 0.06
+        
+        # Widen temperature range for ice formation
+        ice_threshold = -2.0     # Lowered from 0
+        transition_range = 15.0  # Increased from 10
+        
+        ice_coverage = np.clip((ice_threshold - T) / transition_range, 0, 1)
+        
+        is_ocean = self.elevation <= 0
+        base_albedo = np.where(is_ocean, ocean_albedo, land_albedo)
+        
+        return np.where(T < ice_threshold, 
+                       base_albedo * (1 - ice_coverage) + ice_albedo * ice_coverage,
+                       base_albedo)
+
+
+    def calculate_lapse_rate_feedback(self, T):
+        standard_lapse_rate = 6.5
+        min_lapse_rate = 5.5     # Increase minimum
+        max_lapse_rate = 7.5     # Decrease maximum
+        # Adjust temperature range for variation
+        return standard_lapse_rate + (max_lapse_rate - standard_lapse_rate) * \
+               np.clip((15 - T) / 25, -1, 1)  # Reduced range from 30 to 25
+
+
+    def initialize_global_circulation(self):
+        """Initialize wind patterns with lower speeds"""
+        try:
+            # Create latitude array (90 at top to -90 at bottom)
+            latitudes = np.linspace(90, -90, self.map_height)
+            
+            # Initialize wind components
+            self.u = np.zeros((self.map_height, self.map_width))
+            self.v = np.zeros((self.map_height, self.map_width))
+            
+            # For each row (latitude band)
+            for y in range(self.map_height):
+                lat = latitudes[y]
+                lat_rad = np.deg2rad(lat)
+                
+                # Reduced latitude-dependent speed scaling
+                speed_scale = 0.5 + 0.2 * np.cos(4 * lat_rad)  # Reduced from 0.65 + 0.35
+                
+                # Northern Hemisphere
+                if lat > 60:  # Polar easterlies
+                    self.u[y, :] = 1.5 * speed_scale  # Reduced from 3.0
+                    self.v[y, :] = -0.2 * speed_scale  # Reduced from -0.5
+                elif lat > 30:  # Westerlies
+                    self.u[y, :] = -3.5 * speed_scale  # Reduced from -7.0
+                    self.v[y, :] = 0.5 * speed_scale  # Reduced from 1.0
+                elif lat > 0:  # Trade winds
+                    self.u[y, :] = 2.5 * speed_scale  # Reduced from 5.0
+                    self.v[y, :] = -0.5 * speed_scale  # Reduced from -1.0
+                # Southern Hemisphere (mirror of northern)
+                elif lat > -30:  # Trade winds
+                    self.u[y, :] = 2.5 * speed_scale  # Reduced from 5.0
+                    self.v[y, :] = 0.5 * speed_scale  # Reduced from 1.0
+                elif lat > -60:  # Westerlies
+                    self.u[y, :] = -3.5 * speed_scale  # Reduced from -7.0
+                    self.v[y, :] = -0.5 * speed_scale  # Reduced from -1.0
+                else:  # Polar easterlies
+                    self.u[y, :] = 1.5 * speed_scale  # Reduced from 3.0
+                    self.v[y, :] = 0.2 * speed_scale  # Reduced from 0.5
+                
+                # Reduced longitude-dependent variations
+                wave_pattern = 0.1 * np.sin(3 * np.pi * np.linspace(0, 1, self.map_width))  # Reduced from 0.15
+                self.u[y, :] *= (1 + wave_pattern)
+                
+                # Terrain effects
+                terrain_factor = np.exp(-np.maximum(0, self.elevation[y, :]) / 5000)
+                self.u[y, :] *= terrain_factor
+                self.v[y, :] *= terrain_factor
+            
+            # Apply cosine latitude scaling
+            cos_lat = np.cos(np.deg2rad(latitudes))
+            cos_lat = cos_lat.reshape(-1, 1)
+            self.u *= cos_lat
+            self.v *= cos_lat
+            
+            # Smooth transitions
+            self.u = gaussian_filter(self.u, sigma=1.5)
+            self.v = gaussian_filter(self.v, sigma=1.5)
+            
+            # Minimal random variations
+            random_variation = 0.02  # Reduced from 0.05
+            self.u += random_variation * np.random.randn(*self.u.shape)
+            self.v += random_variation * np.random.randn(*self.v.shape)
+            
+        except Exception as e:
+            print(f"Error in global circulation initialization: {e}")
+
+
+
+    def calculate_wind(self):
+        """Calculate wind modifications based on pressure and temperature"""
+        try:
+            # Start with base circulation
+            if not hasattr(self, 'u') or not hasattr(self, 'v'):
+                self.initialize_global_circulation()
+            
+            # Get pressure gradients
+            dy, dx = np.gradient(self.pressure)
+            dpdy = dy / self.grid_spacing_y
+            dpdx = dx / self.grid_spacing_x
+            
+            # Get temperature gradients
+            dTdy, dTdx = np.gradient(self.temperature_celsius)
+            dTdy = dTdy / self.grid_spacing_y
+            dTdx = dTdx / self.grid_spacing_x
+            
+            # Calculate thermal wind contribution
+            thermal_factor = 0.1
+            u_thermal = -thermal_factor * dTdy
+            v_thermal = thermal_factor * dTdx
+            
+            # Calculate pressure gradient contribution
+            pressure_factor = 1e-5
+            u_pressure = -pressure_factor * dpdy
+            v_pressure = pressure_factor * dpdx
+            
+            # Add modifications to base circulation
+            self.u += u_thermal + u_pressure
+            self.v += v_thermal + v_pressure
+            
+            # Apply friction over land
+            is_land = self.elevation > 0
+            friction_factor = np.where(is_land, 0.5, 0.9)
+            self.u *= friction_factor
+            self.v *= friction_factor
+            
+            # Smooth the wind field
+            self.u = gaussian_filter(self.u, sigma=1.0)
+            self.v = gaussian_filter(self.v, sigma=1.0)
+            
+            # Limit maximum wind speeds
+            max_speed = 30.0  # m/s
+            speed = np.sqrt(self.u**2 + self.v**2)
+            speed_factor = np.where(speed > max_speed, max_speed/speed, 1.0)
+            self.u *= speed_factor
+            self.v *= speed_factor
+            
+        except Exception as e:
+            print(f"Error in wind calculation: {e}")
+
+
+    def update_zoom_view(self, event):
+        """Update zoom dialog with magnified view around mouse cursor"""
+        try:
+            # Get current mouse position
+            x, y = event.x, event.y
+            
+            # Calculate zoom view boundaries
+            half_view = self.zoom_dialog.view_size // 2
+            x_start = max(0, x - half_view)
+            y_start = max(0, y - half_view)
+            x_end = min(self.map_width, x + half_view + 1)
+            y_end = min(self.map_height, y + half_view + 1)
+            
+            # Get current layer data
+            if self.selected_layer.get() == "Elevation":
+                view_data = self.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
+            elif self.selected_layer.get() == "Temperature":
+                view_data = self.map_temperature_to_color(self.temperature_celsius)[y_start:y_end, x_start:x_end]
+            elif self.selected_layer.get() == "Pressure":
+                view_data = self.map_pressure_to_color(self.pressure)[y_start:y_end, x_start:x_end]
+            elif self.selected_layer.get() == "Wind":
+                view_data = self.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
+            elif self.selected_layer.get() == "Ocean Temperature":
+                is_ocean = self.elevation <= 0
+                ocean_temp = np.copy(self.temperature_celsius)
+                ocean_temp[~is_ocean] = np.nan
+                ocean_temp_normalized = np.zeros_like(ocean_temp)
+                ocean_mask = ~np.isnan(ocean_temp)
+                if ocean_mask.any():
+                    ocean_temp_normalized[ocean_mask] = self.normalize_data(ocean_temp[ocean_mask])
+                view_data = self.map_ocean_temperature_to_color(ocean_temp_normalized)[y_start:y_end, x_start:x_end]
+            else:
+                view_data = self.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
+            
+            # Create zoomed image
+            img = Image.fromarray(view_data)
+            img = img.resize((self.zoom_dialog.view_size * self.zoom_dialog.zoom_factor,) * 2, 
+                            Image.Resampling.NEAREST)
+            
+            # Convert to PhotoImage
+            photo = ImageTk.PhotoImage(img)
+            self.zoom_dialog.canvas.delete("image")  # Only delete image, keep crosshair
+            self.zoom_dialog.canvas.create_image(0, 0, anchor="nw", image=photo, tags="image")
+            self.zoom_dialog.canvas.tag_raise('crosshair')  # Ensure crosshair stays on top
+            self.zoom_dialog.image = photo  # Keep reference
+            
+            # Position dialog near cursor but not under it
+            dialog_x = self.root.winfo_rootx() + event.x + 20
+            dialog_y = self.root.winfo_rooty() + event.y + 20
+            
+            # Ensure dialog stays within screen bounds
+            screen_width = self.root.winfo_screenwidth()
+            screen_height = self.root.winfo_screenheight()
+            dialog_width = self.zoom_dialog.view_size * self.zoom_dialog.zoom_factor
+            dialog_height = dialog_width
+            
+            if dialog_x + dialog_width > screen_width:
+                dialog_x = event.x - dialog_width - 20
+            if dialog_y + dialog_height > screen_height:
+                dialog_y = event.y - dialog_height - 20
+            
+            self.zoom_dialog.geometry(f"+{dialog_x}+{dialog_y}")
+            
+            # Update mouse over info
+            self.update_mouse_over(event)
+            
+        except Exception as e:
+            print(f"Error updating zoom view: {e}")
+            print(f"Current layer: {self.selected_layer.get()}")
+
+
+class ZoomDialog(tk.Toplevel):
+    def __init__(self, parent, zoom_factor=4):
+        super().__init__(parent)
+        
+        # Remove window decorations and make it stay on top
+        self.overrideredirect(True)
+        self.attributes('-topmost', True)
+        
+        # Set size for zoomed view (odd numbers ensure center pixel)
+        self.view_size = 51  # Reduced from 101 to 51 pixels
+        self.zoom_factor = zoom_factor
+        
+        # Calculate canvas size
+        canvas_size = self.view_size * self.zoom_factor
+        
+        # Create canvas for zoomed view
+        self.canvas = tk.Canvas(self, width=canvas_size, height=canvas_size)
+        self.canvas.pack()
+        
+        # Create crosshair in the center
+        self.crosshair_size = 10  # Increased size for better visibility
+        center = canvas_size // 2
+        
+        # Create crosshair with multiple components for better visibility
+        # Main crosshair in red
+        self.canvas.create_line(center - self.crosshair_size, center, 
+                              center + self.crosshair_size, center, 
+                              fill='red', width=2, tags='crosshair')
+        self.canvas.create_line(center, center - self.crosshair_size, 
+                              center, center + self.crosshair_size, 
+                              fill='red', width=2, tags='crosshair')
+        
+        # White outline for contrast
+        outline_offset = 1
+        self.canvas.create_line(center - self.crosshair_size, center - outline_offset, 
+                              center + self.crosshair_size, center - outline_offset, 
+                              fill='white', width=1, tags='crosshair')
+        self.canvas.create_line(center - self.crosshair_size, center + outline_offset, 
+                              center + self.crosshair_size, center + outline_offset, 
+                              fill='white', width=1, tags='crosshair')
+        self.canvas.create_line(center - outline_offset, center - self.crosshair_size, 
+                              center - outline_offset, center + self.crosshair_size, 
+                              fill='white', width=1, tags='crosshair')
+        self.canvas.create_line(center + outline_offset, center - self.crosshair_size, 
+                              center + outline_offset, center + self.crosshair_size, 
+                              fill='white', width=1, tags='crosshair')
+
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn")
