@@ -350,24 +350,6 @@ class SimulationApp:
                     
                     self.elevation[land_mask] = elevation_values
 
-                    # Debug output
-                    print("\nElevation distribution:")
-                    print("Sample elevation steps:")
-                    test_pixels = [68, 69, 70, 75, 80, 85, 86, 90, 95, 100, 125, 150, 175, 200, 225, 254]
-                    for pixel in test_pixels:
-                        if pixel > 68:
-                            norm_val = (pixel - 68) / (254 - 68)
-                            elev = max_elevation * (
-                                (np.log(1 + norm_val * log_factor) / np.log(1 + log_factor)) ** power_factor
-                            )
-                            print(f"Pixel {pixel}: {elev:.1f}m")
-                    
-                    print("\nPercentile distribution:")
-                    elev_samples = self.elevation[land_mask]
-                    percentiles = [0, 10, 25, 50, 75, 90, 100]
-                    for p in percentiles:
-                        print(f"{p}th percentile: {np.percentile(elev_samples, p):.2f}m")
-
                 # Water tiles are 0m elevation
                 self.elevation[water_mask] = 0.0
 
@@ -433,6 +415,9 @@ class SimulationApp:
             
             # Update the map display with new values
             self.update_map()
+
+            # Print system statistics
+            self.print_system_stats()
             
             # Update displayed values for current mouse position
             self.update_mouse_over()
@@ -640,8 +625,7 @@ class SimulationApp:
         is_ocean = self.elevation <= 0
         
         try:
-            # Ocean current advection
-            # Calculate gradients separately for y and x directions
+            # Existing ocean current advection
             dT_dy = np.gradient(self.temperature_celsius, axis=0) / self.grid_spacing_y
             dT_dx = np.gradient(self.temperature_celsius, axis=1) / self.grid_spacing_x
             temperature_advection = -(self.ocean_u * dT_dx + self.ocean_v * dT_dy)
@@ -653,15 +637,37 @@ class SimulationApp:
             vertical_mixing = 0.1 * density_gradient_y
             
             # Heat transport parameters
-            heat_capacity_water = 4186
+            heat_capacity_water = 4186  # J/(kg·K)
             horizontal_diffusivity = 1e3
             vertical_diffusivity = 1e-4
             
-            # Calculate temperature changes
+            # NEW: Air-sea heat exchange (maintaining array shapes)
+            temp_difference = np.zeros_like(self.temperature_celsius)
+            temp_difference[is_ocean] = (
+                self.temperature_celsius[is_ocean] - np.mean(self.temperature_celsius[is_ocean])
+            )
+            heat_exchange_coefficient = 40  # W/(m²·K)
+            air_sea_heat_exchange = heat_exchange_coefficient * temp_difference
+            
+            # NEW: Latent heat from evaporation (maintaining array shapes)
+            relative_humidity = 0.7  # assumed average
+            latent_heat_flux = np.zeros_like(self.temperature_celsius)
+            ocean_temp = self.temperature_celsius[is_ocean]
+            
+            # Calculate saturation vapor pressure only for ocean cells
+            saturation_vapor_pressure = 610.7 * np.exp(17.27 * ocean_temp / (ocean_temp + 237.3))
+            actual_vapor_pressure = relative_humidity * saturation_vapor_pressure
+            evap_flux = -2.5e6 * 1e-3 * (saturation_vapor_pressure - actual_vapor_pressure)
+            
+            # Assign calculated flux to ocean cells
+            latent_heat_flux[is_ocean] = evap_flux
+            
+            # Calculate temperature changes (all arrays now same shape)
             temperature_change = (
                 temperature_advection + 
                 horizontal_diffusivity * self.calculate_laplacian(self.temperature_celsius) +
-                vertical_diffusivity * vertical_mixing
+                vertical_diffusivity * vertical_mixing +
+                (air_sea_heat_exchange + latent_heat_flux) / (heat_capacity_water * 1000)  # density of water ≈ 1000 kg/m³
             ) * self.time_step_seconds / heat_capacity_water
             
             # Apply changes only to ocean cells
@@ -806,32 +812,36 @@ class SimulationApp:
 
     def map_temperature_to_color(self, temperature_data):
         """
-        Map temperature to a color gradient.
-        Blue for cold, red for hot, with proper normalization.
+        Map temperature to a blue-red color gradient with more distinct transitions.
+        Blue indicates cold, red indicates hot.
         """
         # Create RGBA array
         rgba_array = np.zeros((self.map_height, self.map_width, 4), dtype=np.uint8)
         
         # Set fixed temperature range for consistent coloring
-        min_temp = -50.0  # Coldest expected temperature
-        max_temp = 50.0   # Hottest expected temperature
+        min_temp = -50.0  # Minimum expected temperature
+        max_temp = 50.0   # Maximum expected temperature
         
         # Normalize temperature to [0,1] using fixed range
         temp_normalized = np.clip((temperature_data - min_temp) / (max_temp - min_temp), 0, 1)
         
-        # Create temperature color gradient
-        rgba_array[..., 0] = (temp_normalized * 255).astype(np.uint8)  # Red
-        rgba_array[..., 2] = ((1 - temp_normalized) * 255).astype(np.uint8)  # Blue
+        # Create more distinct temperature gradient
+        # Red component (increases with temperature)
+        rgba_array[..., 0] = (np.power(temp_normalized, 1.2) * 255).astype(np.uint8)
         
-        # Add green component for better visualization
-        rgba_array[..., 1] = (np.minimum(temp_normalized, 1 - temp_normalized) * 255).astype(np.uint8)
+        # Green component (peaks in middle temperatures)
+        green = np.minimum(2 * temp_normalized, 2 * (1 - temp_normalized))
+        rgba_array[..., 1] = (green * 180).astype(np.uint8)  # Reduced max green for more vibrant colors
+        
+        # Blue component (decreases with temperature)
+        rgba_array[..., 2] = (np.power(1 - temp_normalized, 1.2) * 255).astype(np.uint8)
         
         # Set alpha channel
         rgba_array[..., 3] = 255  # Full opacity
         
-        # Make water areas more transparent
+        # Make water areas slightly transparent
         is_water = self.elevation <= 0
-        rgba_array[is_water, 3] = 128  # 50% transparency for water
+        rgba_array[is_water, 3] = 192  # 75% opacity for water
         
         return rgba_array
 
@@ -1318,10 +1328,6 @@ class SimulationApp:
         Calculate greenhouse effect with more physically-based parameters.
         Returns forcing in W/m²
         """
-        # Constants
-        stefan_boltzmann = 5.67e-8  # Stefan-Boltzmann constant W/m²/K⁴
-        expected_total = 150  # Earth's total greenhouse effect is about 150 W/m²
-        
         # Base greenhouse gases forcing (W/m²)
         # Values based on IPCC AR6 estimates
         base_forcings = {
@@ -1346,9 +1352,14 @@ class SimulationApp:
         # Other greenhouse gases (ozone, CFCs, etc.)
         other_ghg = 25.0
         
-        # Total greenhouse forcing
+        # Calculate ocean absorption modifier
+        ocean_absorption = self.calculate_ocean_co2_absorption()
+        
+        # Total greenhouse forcing with ocean absorption
         ghg_forcing = sum(base_forcings.values())  # CO2, CH4, N2O
-        total_forcing = (ghg_forcing + water_vapor_forcing + other_ghg) * params['greenhouse_strength']
+        total_forcing = ((ghg_forcing + water_vapor_forcing + other_ghg) * 
+                        params['greenhouse_strength'] * 
+                        (1.0 + ocean_absorption))  # Apply ocean absorption modifier
         
         # Store individual components for debugging
         self.energy_budget.update({
@@ -1357,38 +1368,9 @@ class SimulationApp:
             'n2o_forcing': base_forcings['n2o'],
             'water_vapor_forcing': water_vapor_forcing,
             'other_ghg_forcing': other_ghg,
+            'ocean_absorption': ocean_absorption,
             'total_greenhouse_forcing': total_forcing
         })
-        
-        # Print diagnostics every cycle
-        # if self.time_step == 1:
-            # First time, clear the console
-            # print("\033[2J\033[H", end='')
-        
-        # Move cursor to the top of the console each cycle
-        # print("\033[H", end='')
-        
-        # Print all values
-        # print(f"Energy Budget Statistics:")
-        # print(f"Solar Input: {float(np.mean(self.energy_budget['solar_in'])):.2f} W/m²")
-        # print(f"Greenhouse Effect: {float(np.mean(self.energy_budget['greenhouse_effect'])):.2f} W/m²")
-        # print(f"Longwave Output: {float(np.mean(self.energy_budget['longwave_out'])):.2f} W/m²")
-        # print(f"Net Flux: {float(np.mean(self.energy_budget['net_flux'])):.2f} W/m²")
-        # print(f"Current Average Temperature: {float(np.mean(self.temperature_celsius)):.2f} °C")
-        # print(f"Cycle: {self.time_step}")
-        # print(f"CO2 ({self.co2_concentration} ppm): {float(base_forcings['co2']):.2f} W/m²")
-        # print(f"CH4 ({self.ch4_concentration} ppb): {float(base_forcings['ch4']):.2f} W/m²")
-        # print(f"N2O ({self.n2o_concentration} ppb): {float(base_forcings['n2o']):.2f} W/m²")
-        # print(f"Water Vapor: {float(water_vapor_forcing):.2f} W/m²")
-        # print(f"Other GHGs: {float(other_ghg):.2f} W/m²")
-        # print(f"Total Forcing: {float(total_forcing):.2f} W/m²")
-        # print(f"Temperature Factor: {float(temp_factor):.3f}")
-        # print(f"Difference from Earth's typical greenhouse effect: {float(total_forcing - expected_total):.2f} W/m²")
-        # print(f"Pressure statistics:")
-        # print(f"Global Min Pressure: {np.min(self.pressure):.2f} Pa")
-        # print(f"Global Max Pressure: {np.max(self.pressure):.2f} Pa")
-        # print(f"Average Pressure: {np.mean(self.pressure):.2f} Pa")
-        
 
         return total_forcing
 
@@ -1643,6 +1625,113 @@ class SimulationApp:
         except Exception as e:
             print(f"Error updating zoom view: {e}")
             print(f"Current layer: {self.selected_layer.get()}")
+
+
+    def print_system_stats(self):
+        """Print system statistics with live updates on the same lines"""
+        # Get average/min/max values
+        avg_temp = np.mean(self.temperature_celsius)
+        min_temp = np.min(self.temperature_celsius)
+        max_temp = np.max(self.temperature_celsius)
+        
+        avg_pressure = np.mean(self.pressure)
+        min_pressure = np.min(self.pressure)
+        max_pressure = np.max(self.pressure)
+        
+        wind_speed = np.sqrt(self.u**2 + self.v**2)
+        avg_wind = np.mean(wind_speed)
+        max_wind = np.max(wind_speed)
+        
+        # Get energy budget values
+        solar_in = self.energy_budget.get('solar_in', 0)
+        greenhouse = self.energy_budget.get('greenhouse_effect', 0)
+        longwave_out = self.energy_budget.get('longwave_out', 0)
+        net_flux = self.energy_budget.get('net_flux', 0)
+        
+        # Calculate net changes
+        if not hasattr(self, 'last_values'):
+            self.last_values = {
+                'temp': avg_temp,
+                'pressure': avg_pressure,
+                'solar': solar_in,
+                'greenhouse': greenhouse,
+                'net_flux': net_flux
+            }
+        
+        # Calculate all deltas
+        temp_change = avg_temp - self.last_values['temp']
+        pressure_change = avg_pressure - self.last_values['pressure']
+        solar_change = solar_in - self.last_values['solar']
+        greenhouse_change = greenhouse - self.last_values['greenhouse']
+        net_flux_change = net_flux - self.last_values['net_flux']
+        
+        # Update last values
+        self.last_values.update({
+            'temp': avg_temp,
+            'pressure': avg_pressure,
+            'solar': solar_in,
+            'greenhouse': greenhouse,
+            'net_flux': net_flux
+        })
+        
+        # Create the output strings with fixed width
+        cycle_str = f"Simulation Cycle: {self.time_step:6d}"
+        temp_str = f"Temperature (°C)    | Avg: {avg_temp:6.1f} | Min: {min_temp:6.1f} | Max: {max_temp:6.1f} | Δ: {temp_change:+6.2f}"
+        pres_str = f"Pressure (Pa)      | Avg: {avg_pressure:8.0f} | Min: {min_pressure:8.0f} | Max: {max_pressure:8.0f} | Δ: {pressure_change:+6.0f}"
+        wind_str = f"Wind Speed (m/s)   | Avg: {avg_wind:6.1f} | Max: {max_wind:6.1f}"
+        
+        # Energy budget strings with net changes
+        energy_in_str = f"Energy In (W/m²)   | Solar: {solar_in:6.1f} | Δ: {solar_change:+6.2f} | Greenhouse: {greenhouse:6.1f} | Δ: {greenhouse_change:+6.2f} | Total: {solar_in + greenhouse:6.1f}"
+        energy_out_str = f"Energy Out (W/m²)  | Longwave: {longwave_out:6.1f} | Net Flux: {net_flux:6.1f} | Δ: {net_flux_change:+6.2f}"
+        
+        # Only print these lines once at the start
+        if self.time_step == 1:
+            print("\n" * 6)  # Create six blank lines
+            print("\033[6A", end='')  # Move cursor up six lines
+        
+        # Update all lines in place
+        print(f"\033[K{cycle_str}", end='\r\n')      # Clear line and move to next
+        print(f"\033[K{temp_str}", end='\r\n')       # Clear line and move to next
+        print(f"\033[K{pres_str}", end='\r\n')       # Clear line and move to next
+        print(f"\033[K{wind_str}", end='\r\n')       # Clear line and move to next
+        print(f"\033[K{energy_in_str}", end='\r\n')  # Clear line and move to next
+        print(f"\033[K{energy_out_str}", end='\r')   # Clear line and stay there
+        
+        # Move cursor back up to the start position
+        print("\033[6A", end='')
+
+
+    def calculate_ocean_co2_absorption(self):
+        """
+        Calculate ocean CO2 absorption based on temperature.
+        Returns a modifier for greenhouse effect.
+        """
+        # Identify ocean cells
+        is_ocean = self.elevation <= 0
+        
+        if not np.any(is_ocean):
+            return 0.0
+        
+        # Get ocean temperatures
+        ocean_temps = self.temperature_celsius[is_ocean]
+        
+        # CO2 solubility decreases with temperature
+        # Maximum absorption around 4°C, decreasing above and below
+        # Using a simplified solubility curve
+        optimal_temp = 4.0
+        temp_diff = np.abs(ocean_temps - optimal_temp)
+        
+        # Calculate absorption factor (1.0 at optimal temp, decreasing as temp differs)
+        absorption_factor = np.exp(-temp_diff / 10.0)  # exponential decay with temperature difference
+        
+        # Calculate mean absorption across all ocean cells
+        mean_absorption = np.mean(absorption_factor)
+        
+        # Scale the greenhouse effect modification
+        # At optimal absorption (1.0), reduce greenhouse effect by up to 25%
+        greenhouse_modifier = -0.25 * mean_absorption
+        
+        return greenhouse_modifier
 
 
 class ZoomDialog(tk.Toplevel):
