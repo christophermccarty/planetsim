@@ -10,15 +10,13 @@ from scipy.ndimage import gaussian_filter
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy.interpolate import RegularGridInterpolator
+from numba import jit, set_num_threads
+from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
+import psutil
+import traceback
 
 from map_generation import MapGenerator
 
-
-# Global variables
-map_width = 800  # Adjust value as needed
-map_height = 600  # Adjust value as needed
-selected_layer = 'elevation'  # Default layer
-num_processes = 8  # Number of processes for multiprocessing
 
 class SimulationApp:
     def __init__(self):
@@ -36,6 +34,9 @@ class SimulationApp:
             self.P0 = 101325
             self.desired_simulation_step_time = 0.1  # 0.1 seconds between simulation steps
 
+            # Master switch for print_systemn_stats
+            self.print_stats_enabled = False
+
             # Add energy budget tracking
             self.energy_budget = {
                 'solar_in': 0.0,
@@ -50,15 +51,15 @@ class SimulationApp:
                 'solar_constant': 1361.1,    # Solar constant (W/m²)
                 'albedo_land': 0.3,          # Increased back to standard value
                 'albedo_ocean': 0.06,        # Ocean albedo
-                'emissivity': 0.9,          # Increased to allow more heat escape
-                'climate_sensitivity': 2.0,   # Reduced for more stable response
+                'emissivity': 0.95,          # Increased to allow more heat escape
+                'climate_sensitivity': 3.0,   # Reduced for more stable response
                 'greenhouse_strength': 2.5,   # Reduced greenhouse effect
-                'heat_capacity_land': 2e6,    # Doubled land heat capacity for stability
+                'heat_capacity_land': 0.8e6,    # Doubled land heat capacity for stability
                 'heat_capacity_ocean': 4.2e6,   # Doubled ocean heat capacity for stability
                 'ocean_heat_transfer': 0.3,   # Ocean heat transfer
                 'atmospheric_heat_transfer': 0.5,  # Atmospheric heat transfer
-                'baseline_land_temp': 13.9,   # Baseline land temperature
-                'max_ocean_temp': 30.0,       # Maximum ocean temperature
+                'baseline_land_temp': 15,   # Baseline land temperature
+                'max_ocean_temp': 32.0,       # Maximum ocean temperature
                 'min_ocean_temp': -2.0        # Minimum ocean temperature
             }
             
@@ -85,7 +86,7 @@ class SimulationApp:
             self.temperature_normalized = None
             self.pressure = None
             self.pressure_normalized = None
-            self.wind_speed_normalized = None
+
             self.u = None
             self.v = None
             self.ocean_u = None
@@ -153,18 +154,19 @@ class SimulationApp:
             # Initialize ocean currents
             self.initialize_ocean_currents()
 
+            # Initialize threading event for visualization control
+            self.visualization_active = threading.Event()
+            self.visualization_active.set()  # Start in active state
+
+            # Start visualization in separate thread
+            self.visualization_thread = threading.Thread(target=self.update_visualization_loop)
+            self.visualization_thread.daemon = True
+            self.visualization_thread.start()
+
             # Start simulation thread
             simulation_thread = threading.Thread(target=self.simulate)
             simulation_thread.daemon = True
             simulation_thread.start()
-
-            # Start visualization loop
-            self.update_visualization()
-
-            self.water_vapor = np.zeros_like(self.temperature_celsius)  # Water vapor mixing ratio
-            self.heat_capacity = 1e7  # Heat capacity (J/m²/K)
-            self.stefan_boltzmann = 5.67e-8  # Stefan-Boltzmann constant
-            self.solar_input = 340.0  # Mean solar input (W/m²)
 
             # Trigger initial map update
             self.update_map()
@@ -271,6 +273,14 @@ class SimulationApp:
         self.canvas.bind("<Motion>", self.update_zoom_view)
         self.canvas.bind("<Leave>", lambda e: self.zoom_dialog.withdraw())
         self.canvas.bind("<Enter>", lambda e: self.zoom_dialog.deiconify())
+
+        # Add cleanup on window close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def on_closing(self):
+        """Handle window closing"""
+        self.cleanup()
+        self.root.destroy()
 
     def save_slider_values(self):
         # [Implement as in the original code...]
@@ -411,7 +421,7 @@ class SimulationApp:
             self.update_ocean_temperature()
             self.update_temperature_land_ocean()
             self.update_pressure()
-            self.update_wind()
+            self.calculate_wind()
             
             # Update the map display with new values
             self.update_map()
@@ -456,21 +466,16 @@ class SimulationApp:
             longitude_value = self.longitude[y, x]
             grayscale_value = self.altitude[y, x]
             
-            # Calculate wind direction in degrees and adjust to 1-360 range
-            wind_direction_rad = np.arctan2(-self.u[y, x], -self.v[y, x])  # Swap u and v, and negate for compass direction
-            wind_direction_deg = np.degrees(wind_direction_rad)
-            wind_direction = (wind_direction_deg + 360) % 360
-
-            # Convert to compass direction (1-360)
-            if wind_direction == 0:
-                wind_direction = 360
+            # Calculate wind direction (direction wind is blowing TO)
+            wind_direction_rad = np.arctan2(-self.u[y, x], -self.v[y, x])
+            wind_direction_deg = (90 - np.degrees(wind_direction_rad)) % 360
 
             # Update label text
             self.mouse_over_label.config(text=(
                 f"Pressure: {pressure_value:.2f} Pa, "
                 f"Temperature: {temperature_value:.2f} °C, "
                 f"Wind Speed: {wind_speed_value:.2f} m/s, "
-                f"Wind Direction: {wind_direction:.2f}°\n"
+                f"Wind Direction: {wind_direction_deg:.2f}°\n"
                 f"Latitude: {latitude_value:.2f}°, Longitude: {longitude_value:.2f}°, "
                 f"Elevation: {elevation_value:.2f} m, "
                 f"Grayscale: {grayscale_value}, "
@@ -503,65 +508,8 @@ class SimulationApp:
 
     def initialize_wind(self):
         """Initialize wind fields with small random perturbations."""
-        # Initialize wind arrays to zeros
-        self.u = np.zeros((self.map_height, self.map_width))
-        self.v = np.zeros((self.map_height, self.map_width))
+        self.initialize_global_circulation()
         
-        # Add small random perturbations to initiate dynamics
-        perturbation_scale = 0.1  # Adjust as needed
-        self.u += np.random.normal(0, perturbation_scale, self.u.shape)
-        self.v += np.random.normal(0, perturbation_scale, self.v.shape)
-        
-        print("Initialized wind fields with small random perturbations.")
-
-    def update_wind(self):
-        """Update wind components dynamically based on atmospheric physics."""     
-        # 1. Pressure Gradient Force (PGF)
-        pressure_gradient_y = np.gradient(self.pressure, axis=0) / self.grid_spacing_y
-        pressure_gradient_x = np.gradient(self.pressure, axis=1) / self.grid_spacing_x
-        
-        # Air density
-        air_density = self.pressure / (287.05 * (self.temperature_celsius + 273.15))
-        pgf_u = -pressure_gradient_x / air_density
-        pgf_v = -pressure_gradient_y / air_density
-
-        # 2. Coriolis Force (CF)
-        f = 2 * self.Omega * np.sin(self.latitudes_rad)
-        coriolis_u = f * self.v
-        coriolis_v = -f * self.u
-
-        # 3. Friction (Linear Drag)
-        friction_coefficient = 1e-5  # Adjust as needed
-        friction_u = -friction_coefficient * self.u
-        friction_v = -friction_coefficient * self.v
-
-        # 4. Update velocities
-        self.u += (pgf_u + coriolis_u + friction_u) * self.time_step_seconds
-        self.v += (pgf_v + coriolis_v + friction_v) * self.time_step_seconds
-
-        # 5. Apply Periodic Boundary Conditions for Left and Right Edges
-        self.u[:, 0] = self.u[:, -2]
-        self.u[:, -1] = self.u[:, 1]
-        self.v[:, 0] = self.v[:, -2]
-        self.v[:, -1] = self.v[:, 1]
-
-        # 6. Apply Reflective Boundary Conditions for Top and Bottom Edges
-        self.u[0, :] = self.u[1, :]       # Bottom edge
-        self.u[-1, :] = self.u[-2, :]     # Top edge
-        self.v[0, :] = -self.v[1, :]      # Bottom edge (invert v)
-        self.v[-1, :] = -self.v[-2, :]    # Top edge (invert v)
-
-        # 7. Limit maximum wind speed
-        max_wind_speed = 100.0  # m/s
-        wind_speed = np.sqrt(self.u**2 + self.v**2)
-        scaling_factor = np.minimum(1.0, max_wind_speed / (wind_speed + 1e-8))
-        self.u *= scaling_factor
-        self.v *= scaling_factor
-
-        # 8. Apply smoothing (optional)
-        self.u = gaussian_filter(self.u, sigma=1.0)
-        self.v = gaussian_filter(self.v, sigma=1.0)
-
 
     def initialize_ocean_currents(self):
         """Initialize ocean current components"""
@@ -689,18 +637,29 @@ class SimulationApp:
         """Update temperature fields with improved greenhouse effect."""
         params = self.climate_params
         
-        # Solar input calculation
-        S0 = params['solar_constant']
-        S_avg = S0 / 4  # Average over sphere
-        cos_phi = np.clip(np.cos(self.latitudes_rad), 0.1, None)
-        S_lat = S_avg * cos_phi
+        # Improved Solar input calculation
+        S0 = params['solar_constant']  # 1361.1 W/m²
         
-        # Calculate albedo based on surface type
+        # Calculate solar zenith angle effect more accurately
+        cos_phi = np.cos(self.latitudes_rad)
+        day_length_factor = np.clip(cos_phi, 0, 1)  # Day/night cycle
+        
+        # Calculate average insolation including orbital and geometric effects
+        S_avg = S0 / 4  # Spherical geometry factor
+        
+        # Calculate surface-incident solar radiation
+        S_lat = S_avg * day_length_factor
+        
+        # Apply albedo based on surface type and zenith angle
         is_land = self.elevation > 0
-        albedo = np.where(is_land, params['albedo_land'], params['albedo_ocean'])
+        base_albedo = np.where(is_land, params['albedo_land'], params['albedo_ocean'])
         
-        # Incoming solar radiation
-        solar_in = (1 - albedo) * S_lat
+        # Zenith angle dependent albedo (higher at glancing angles)
+        zenith_factor = np.clip(1.0 / (cos_phi + 0.1), 1.0, 2.0)
+        effective_albedo = np.clip(base_albedo * zenith_factor, 0.0, 0.9)
+        
+        # Calculate absorbed solar radiation
+        solar_in = S_lat * (1 - effective_albedo)
         self.energy_budget['solar_in'] = np.mean(solar_in)
         
         # Calculate greenhouse effect
@@ -889,40 +848,42 @@ class SimulationApp:
 
 
     def update_pressure(self):
-        """Update pressure field over time"""
+        """Update pressure based on wind patterns and global circulation"""
         try:
-            # Ensure pressure is float type
-            self.pressure = self.pressure.astype(np.float64)
+            print("\nPressure Update Debug:")
+            print(f"Initial pressure range: {np.min(self.pressure)/100:.1f} to {np.max(self.pressure)/100:.1f} hPa")
             
-            # Get pressure gradients
-            dy, dx = np.gradient(self.pressure)
+            dt = self.time_step_seconds
+            P0 = 101325.0  # Standard sea-level pressure
             
-            # Calculate pressure tendency
-            tendency = np.zeros_like(self.pressure, dtype=np.float64)
+            # Basic masks and elevation
+            is_land = self.elevation > 0
+            is_ocean = self.elevation <= 0
+            max_height = 1000.0
+            limited_elevation = np.clip(self.elevation, 0, max_height)
             
-            # Add small-scale variations based on temperature
-            temp_effect = 0.1 * (self.temperature_celsius - np.mean(self.temperature_celsius))
-            tendency += gaussian_filter(temp_effect, sigma=2.0)
+            # Calculate minimum pressure based on elevation
+            elevation_factor = np.exp(-limited_elevation / 7400.0)
+            min_pressure = P0 * elevation_factor
             
-            # Add terrain effects
-            terrain_effect = -0.05 * self.elevation.astype(np.float64)
-            tendency += gaussian_filter(terrain_effect, sigma=2.0)
+            # Reset pressure anomaly field
+            pressure_anomaly = np.zeros_like(self.pressure)
             
-            # Apply tendency with small time step
-            dt = 0.1
-            self.pressure += tendency * dt
+            # Apply pressure anomalies and ensure bounds
+            self.pressure += pressure_anomaly * 0.1  # Reduced impact of new anomalies
             
-            # Maintain reasonable pressure bounds
-            self.pressure = np.clip(self.pressure, 95000.0, 105000.0)
+            # Ensure pressure stays within realistic bounds
+            self.pressure[is_land] = np.maximum(self.pressure[is_land], min_pressure[is_land])
+            self.pressure = np.clip(self.pressure, 87000.0, 108600.0)
             
-            # Smooth the field
-            self.pressure = gaussian_filter(self.pressure, sigma=1.0)
+            # Light smoothing
+            self.pressure = gaussian_filter(self.pressure, sigma=0.5)
             
-            # Update normalized version
-            self.pressure_normalized = self.normalize_data(self.pressure)
+            print(f"Final pressure range: {np.min(self.pressure)/100:.1f} to {np.max(self.pressure)/100:.1f} hPa")
             
         except Exception as e:
             print(f"Error updating pressure: {e}")
+            traceback.print_exc()
 
 
     def draw_wind_vectors(self):
@@ -1014,24 +975,19 @@ class SimulationApp:
 
 
     def update_map(self):
-        """Update the map display based on selected layer"""
+        """Update the map display with improved visualization"""
         try:
             if self.selected_layer.get() == "Pressure":
-                # Create pressure visualization
+                # Get combined pressure and terrain visualization
                 display_data = self.map_pressure_to_color(self.pressure)
                 
-                # Convert to PIL Image and display
-                image = Image.fromarray(display_data.astype('uint8'))  # Ensure uint8 type
-                photo = ImageTk.PhotoImage(image)
-                self.current_image = photo
+                # Convert to PIL Image and create PhotoImage
+                image = Image.fromarray(display_data, mode='RGBA')
+                self.current_image = ImageTk.PhotoImage(image)
                 
-                # Clear canvas and update scrollregion
+                # Update canvas
                 self.canvas.delete("all")
-                self.canvas.config(scrollregion=(0, 0, self.map_width, self.map_height))
-                
-                # Create image on canvas
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-                
+                self.canvas.create_image(0, 0, anchor=tk.NW, image=self.current_image)
                 return
             
             elif self.selected_layer.get() == "Elevation":
@@ -1185,116 +1141,133 @@ class SimulationApp:
 
 
     def initialize_pressure(self):
-        """Initialize realistic global pressure patterns"""
+        """Initialize pressure field with standard pressure and elevation effects"""
         try:
-            # Standard sea-level pressure in Pa (explicitly as float)
-            P0 = 101325.0
+            # Standard sea-level pressure in hPa converted to Pa
+            P0 = 101325.0  # 1013.25 hPa in Pa
             
-            # Create latitude and longitude grids
-            lats = np.linspace(90, -90, self.map_height)
-            lons = np.linspace(-180, 180, self.map_width)
-            lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')
-            lat_rad = np.deg2rad(lat_grid)
+            print("Initializing pressure...")
             
-            # Base pressure field (explicitly as float)
+            # Initialize pressure array with standard pressure
             self.pressure = np.full((self.map_height, self.map_width), P0, dtype=np.float64)
+            print(f"Initial pressure range (before elevation): {np.min(self.pressure)/100:.1f} to {np.max(self.pressure)/100:.1f} hPa")
             
-            # Add major pressure systems
-            self.pressure += 1500.0 * np.exp(-((lat_rad - np.deg2rad(30))**2) / (2 * (np.pi/15)**2))
-            self.pressure += 1500.0 * np.exp(-((lat_rad + np.deg2rad(30))**2) / (2 * (np.pi/15)**2))
+            # Apply elevation effects with limits
+            max_height = 2000.0  # Limit effective height for pressure conversion
+            limited_elevation = np.clip(self.elevation, 0, max_height)
+            elevation_factor = np.exp(-limited_elevation / 7400.0)
+            elevation_factor = np.clip(elevation_factor, 0.85, 1.0)  # Limit minimum pressure reduction
             
-            # Subpolar lows
-            self.pressure -= 2000.0 * np.exp(-((lat_rad - np.deg2rad(60))**2) / (2 * (np.pi/15)**2))
-            self.pressure -= 2000.0 * np.exp(-((lat_rad + np.deg2rad(60))**2) / (2 * (np.pi/15)**2))
-            
-            # ITCZ (Equatorial low)
-            self.pressure -= 500.0 * np.exp(-(lat_rad**2) / (2 * (np.pi/20)**2))
-            
-            # Apply elevation effects
-            self.pressure *= np.exp(-self.elevation.astype(np.float64) / 7400.0)
-            
-            # Smooth the field
-            self.pressure = gaussian_filter(self.pressure, sigma=3.0)
+            self.pressure *= elevation_factor
+            print(f"Pressure range after elevation adjustment: {np.min(self.pressure)/100:.1f} to {np.max(self.pressure)/100:.1f} hPa")
             
             # Store normalized version for visualization
             self.pressure_normalized = self.normalize_data(self.pressure)
             
         except Exception as e:
             print(f"Error initializing pressure: {e}")
+            traceback.print_exc()
 
 
     def map_pressure_to_color(self, pressure_data):
-        """
-        Map pressure to a red-blue color gradient.
-        Red indicates low pressure, blue indicates high pressure.
-        """
-        # Create RGBA array
-        rgba_array = np.zeros((self.map_height, self.map_width, 4), dtype=np.uint8)
-        
-        # Set fixed pressure range for consistent coloring (in Pa)
-        min_pressure = 95000.0  # Typical low pressure
-        max_pressure = 105000.0 # Typical high pressure
-        
-        # Normalize pressure to [0,1] using fixed range
-        pressure_normalized = np.clip((pressure_data - min_pressure) / (max_pressure - min_pressure), 0, 1)
-        
-        # Create pressure color gradient (red=low, blue=high)
-        rgba_array[..., 0] = ((1 - pressure_normalized) * 255).astype(np.uint8)  # Red
-        rgba_array[..., 2] = (pressure_normalized * 255).astype(np.uint8)        # Blue
-        
-        # Add green component for better visualization
-        rgba_array[..., 1] = (np.minimum(pressure_normalized, 1 - pressure_normalized) * 255).astype(np.uint8)
-        
-        # Set alpha channel
-        rgba_array[..., 3] = 192  # 75% opacity
-        
-        # Make water areas more transparent
-        is_water = self.elevation <= 0
-        rgba_array[is_water, 3] = 128  # 50% transparency for water
-        
-        return rgba_array
+        """Convert pressure data to color visualization with less frequent isolines"""
+        try:
+            # Get terrain colors first
+            terrain_colors = self.map_elevation_to_color(self.elevation)
+            
+            # Create RGBA array with correct dimensions
+            rgba_array = np.zeros((*terrain_colors.shape[:2], 4), dtype=np.uint8)
+            
+            # Convert pressure to hPa for easier calculations
+            pressure_hpa = pressure_data / 100.0
+            
+            # Set fixed pressure range (870-1086 hPa)
+            p_min = 870
+            p_max = 1086
+            
+            # Normalize pressure to [-1,1] range for color mapping
+            normalized_pressure = 2 * (pressure_hpa - (p_min + p_max)/2) / (p_max - p_min)
+            
+            # Create pressure colors array
+            pressure_colors = np.zeros((*terrain_colors.shape[:2], 4), dtype=np.uint8)
+            
+            # Vectorized color calculations
+            pressure_colors[..., 0] = np.interp(normalized_pressure, 
+                                          [-1, -0.5, 0, 0.5, 1], 
+                                          [65, 150, 255, 255, 255]).astype(np.uint8)
+            pressure_colors[..., 1] = np.interp(normalized_pressure, 
+                                          [-1, -0.5, 0, 0.5, 1], 
+                                          [200, 230, 255, 230, 200]).astype(np.uint8)
+            pressure_colors[..., 2] = np.interp(normalized_pressure, 
+                                          [-1, -0.5, 0, 0.5, 1], 
+                                          [255, 255, 255, 150, 65]).astype(np.uint8)
+            pressure_colors[..., 3] = 180  # 70% opacity
+            
+            # Blend pressure colors with terrain efficiently
+            alpha = pressure_colors[..., 3:] / 255.0
+            rgba_array[..., :3] = ((pressure_colors[..., :3] * alpha) + 
+                              (terrain_colors[..., :3] * (1 - alpha))).astype(np.uint8)
+            rgba_array[..., 3] = 255
+            
+            # Add isobar lines with wider spacing
+            isobar_interval = 25  # Every 25 hPa
+            
+            # Calculate pressure levels more efficiently
+            min_level = np.floor(p_min / isobar_interval) * isobar_interval
+            max_level = np.ceil(p_max / isobar_interval) * isobar_interval
+            pressure_levels = np.arange(min_level, max_level + isobar_interval, isobar_interval)
+            
+            # Pre-calculate smoothed pressure field
+            smoothed_pressure = gaussian_filter(pressure_hpa, sigma=1.0)
+            
+            # Create combined isobar mask
+            isobar_mask = np.zeros_like(pressure_hpa, dtype=bool)
+            for level in pressure_levels:
+                # More efficient masking
+                level_mask = np.abs(smoothed_pressure - level) < 0.5
+                isobar_mask |= level_mask
+            
+            # Apply smoothing to combined mask
+            isobar_mask = gaussian_filter(isobar_mask.astype(float), sigma=0.5) > 0.3
+            
+            # Apply isobars to final image
+            rgba_array[isobar_mask, :3] = [255, 255, 255]  # White lines
+            rgba_array[isobar_mask, 3] = 180  # Slightly transparent
+            
+            return rgba_array
+                
+        except Exception as e:
+            print(f"Error in map_pressure_to_color: {e}")
+            traceback.print_exc()
+            return np.zeros((*terrain_colors.shape[:2], 4), dtype=np.uint8)
 
 
-    def advect_field(self, field, u, v):
-        """Advect a scalar field using the velocities u and v with a semi-Lagrangian scheme."""
-        ny, nx = field.shape
-        x = np.arange(nx)
-        y = np.arange(ny)
-        interpolator = RegularGridInterpolator((y, x), field, bounds_error=False, fill_value=None)
-
-        # Create a meshgrid of coordinates
-        Y, X = np.meshgrid(np.arange(ny), np.arange(nx), indexing='ij')
-
-        # Compute departure points
-        X_depart = X - (u * self.time_step_seconds) / self.grid_spacing_x
-        Y_depart = Y - (v * self.time_step_seconds) / self.grid_spacing_y
-
-        # Apply Periodic Boundary Conditions for X (longitude)
-        X_depart = X_depart % nx
-
-        # Apply Reflective Boundary Conditions for Y (latitude)
-        Y_depart = np.clip(Y_depart, 0, ny - 1)
-
-        # Prepare points for interpolation
-        points = np.stack([Y_depart.ravel(), X_depart.ravel()], axis=-1)
-
-        # Interpolate to get advected field
-        field_advected = interpolator(points).reshape((ny, nx))
-
-        return field_advected
-
+    def update_visualization_loop(self):
+        """Continuous loop for updating visualization in separate thread"""
+        try:
+            while self.visualization_active.is_set():
+                self.update_visualization()
+                time.sleep(0.033)  # ~30 FPS, adjust as needed
+        except Exception as e:
+            print(f"Error in visualization loop: {e}")
 
     def update_visualization(self):
         """Update the map display with current data"""
+        try:
+            # Use root.after to ensure GUI updates happen in main thread
+            self.root.after(0, self._update_visualization_safe)
+        except Exception as e:
+            print(f"Error scheduling visualization update: {e}")
+
+    def _update_visualization_safe(self):
+        """Perform actual visualization update in main thread"""
         try:
             # Clear previous layers
             self.canvas.delete("data_layer")
             
             if self.selected_layer.get() == "Temperature":
-                # Update temperature colors
                 colors = self.map_temperature_to_color(self.temperature_celsius)
             elif self.selected_layer.get() == "Pressure":
-                # Update pressure colors
                 colors = self.map_pressure_to_color(self.pressure)
             else:
                 return
@@ -1318,10 +1291,12 @@ class SimulationApp:
             print(f"Error updating visualization: {e}")
             print(f"Current mode: {self.selected_layer.get()}")
             print(f"Pressure shape: {self.pressure.shape if hasattr(self, 'pressure') else 'No pressure data'}")
-        
-        # Schedule next update
-        self.root.after(30, self.update_visualization)
 
+    def cleanup(self):
+        """Clean up threads before closing"""
+        self.visualization_active.clear()  # Signal threads to stop
+        if hasattr(self, 'visualization_thread'):
+            self.visualization_thread.join(timeout=1.0)
 
     def calculate_greenhouse_effect(self, params):
         """
@@ -1397,47 +1372,12 @@ class SimulationApp:
         return np.clip(vapor_pressure / saturation_pressure, 0, 1)
 
 
-    def calculate_cloud_albedo(self, relative_humidity):
-        """Reduce cloud cooling effect"""
-        base_cloud_albedo = 0.15  # Reduced from 0.2
-        max_cloud_albedo = 0.45   # Reduced from 0.55
-        cloud_threshold = 0.8     # Increased from 0.75
-        
-        cloud_cover = np.clip((relative_humidity - cloud_threshold) / (1 - cloud_threshold), 0, 1)
-        return base_cloud_albedo + (max_cloud_albedo - base_cloud_albedo) * cloud_cover
-
-
-    def calculate_surface_albedo(self, T):
-        """Soften ice-albedo feedback"""
-        ice_albedo = 0.65        # Reduced from 0.7
-        land_albedo = 0.3
-        ocean_albedo = 0.07      # Slightly increased from 0.06
-        
-        # Widen temperature range for ice formation
-        ice_threshold = -2.0     # Lowered from 0
-        transition_range = 15.0  # Increased from 10
-        
-        ice_coverage = np.clip((ice_threshold - T) / transition_range, 0, 1)
-        
-        is_ocean = self.elevation <= 0
-        base_albedo = np.where(is_ocean, ocean_albedo, land_albedo)
-        
-        return np.where(T < ice_threshold, 
-                       base_albedo * (1 - ice_coverage) + ice_albedo * ice_coverage,
-                       base_albedo)
-
-
-    def calculate_lapse_rate_feedback(self, T):
-        standard_lapse_rate = 6.5
-        min_lapse_rate = 5.5     # Increase minimum
-        max_lapse_rate = 7.5     # Decrease maximum
-        # Adjust temperature range for variation
-        return standard_lapse_rate + (max_lapse_rate - standard_lapse_rate) * \
-               np.clip((15 - T) / 25, -1, 1)  # Reduced range from 30 to 25
-
-
     def initialize_global_circulation(self):
-        """Initialize wind patterns with lower speeds"""
+        """Initialize wind patterns with realistic global circulation and wind belts"""
+        # Negative u_component: Wind is blowing TOWARDS the east
+        # Positive u_component: Wind is blowing TOWARDS the west
+        # Negative v_component: Wind is blowing TOWARDS the south
+        # Positive v_component: Wind is blowing TOWARDS the north
         try:
             # Create latitude array (90 at top to -90 at bottom)
             latitudes = np.linspace(90, -90, self.map_height)
@@ -1451,109 +1391,80 @@ class SimulationApp:
                 lat = latitudes[y]
                 lat_rad = np.deg2rad(lat)
                 
-                # Reduced latitude-dependent speed scaling
-                speed_scale = 0.5 + 0.2 * np.cos(4 * lat_rad)  # Reduced from 0.65 + 0.35
+                # Base speed scaling with latitude
+                speed_scale = np.cos(lat_rad)
                 
                 # Northern Hemisphere
-                if lat > 60:  # Polar easterlies
-                    self.u[y, :] = 1.5 * speed_scale  # Reduced from 3.0
-                    self.v[y, :] = -0.2 * speed_scale  # Reduced from -0.5
-                elif lat > 30:  # Westerlies
-                    self.u[y, :] = -3.5 * speed_scale  # Reduced from -7.0
-                    self.v[y, :] = 0.5 * speed_scale  # Reduced from 1.0
-                elif lat > 0:  # Trade winds
-                    self.u[y, :] = 2.5 * speed_scale  # Reduced from 5.0
-                    self.v[y, :] = -0.5 * speed_scale  # Reduced from -1.0
-                # Southern Hemisphere (mirror of northern)
-                elif lat > -30:  # Trade winds
-                    self.u[y, :] = 2.5 * speed_scale  # Reduced from 5.0
-                    self.v[y, :] = 0.5 * speed_scale  # Reduced from 1.0
-                elif lat > -60:  # Westerlies
-                    self.u[y, :] = -3.5 * speed_scale  # Reduced from -7.0
-                    self.v[y, :] = -0.5 * speed_scale  # Reduced from -1.0
-                else:  # Polar easterlies
-                    self.u[y, :] = 1.5 * speed_scale  # Reduced from 3.0
-                    self.v[y, :] = 0.2 * speed_scale  # Reduced from 0.5
+                if lat > 60:  # Polar cell (60°N to 90°N)
+                    angle_factor = (lat - 60) / 30  # 1 at 90°N, 0 at 60°N
+                    u_component = 15.0 * speed_scale * angle_factor
+                    v_component = -12.0 * speed_scale * (1 - angle_factor)
+                    
+                elif lat > 29.9:  # Ferrel cell (30°N to 60°N)
+                    angle_factor = (lat - 29.9) / 30.1  # 1 at 60°N, 0 at 29.9°N
+                    u_component = -25.0 * speed_scale * (1 - angle_factor)
+                    v_component = 12.0 * speed_scale * angle_factor
+                    
+                elif lat > 0:  # Hadley cell (0° to 29.9°N)
+                    angle_factor = lat / 29.9  # 1 at 29.9°N, 0 at equator
+                    u_component = 15.0 * speed_scale * (1 - angle_factor)
+                    v_component = -12.0 * speed_scale * angle_factor
+                    
+                # Southern Hemisphere (mirror of northern patterns)
+                elif lat > -29.9:  # Hadley cell (0° to 29.9°S)
+                    angle_factor = -lat / 29.9  # 1 at 29.9°S, 0 at equator
+                    u_component = 15.0 * speed_scale * (1 - angle_factor)
+                    v_component = 12.0 * speed_scale * angle_factor
+                    
+                elif lat > -60:  # Ferrel cell (29.9°S to 60°S)
+                    angle_factor = (-lat - 29.9) / 30.1  # 1 at 60°S, 0 at 29.9°S
+                    u_component = -25.0 * speed_scale * (1 - angle_factor)
+                    v_component = -12.0 * speed_scale * angle_factor
+                    
+                else:  # Polar cell (60°S to 90°S)
+                    angle_factor = (-lat - 60) / 30  # 1 at 90°S, 0 at 60°S
+                    u_component = 15.0 * speed_scale * angle_factor
+                    v_component = 12.0 * speed_scale * (1 - angle_factor)
                 
-                # Reduced longitude-dependent variations
-                wave_pattern = 0.1 * np.sin(3 * np.pi * np.linspace(0, 1, self.map_width))  # Reduced from 0.15
-                self.u[y, :] *= (1 + wave_pattern)
-                
-                # Terrain effects
-                terrain_factor = np.exp(-np.maximum(0, self.elevation[y, :]) / 5000)
-                self.u[y, :] *= terrain_factor
-                self.v[y, :] *= terrain_factor
-            
-            # Apply cosine latitude scaling
-            cos_lat = np.cos(np.deg2rad(latitudes))
-            cos_lat = cos_lat.reshape(-1, 1)
-            self.u *= cos_lat
-            self.v *= cos_lat
-            
-            # Smooth transitions
-            self.u = gaussian_filter(self.u, sigma=1.5)
-            self.v = gaussian_filter(self.v, sigma=1.5)
-            
-            # Minimal random variations
-            random_variation = 0.02  # Reduced from 0.05
-            self.u += random_variation * np.random.randn(*self.u.shape)
-            self.v += random_variation * np.random.randn(*self.v.shape)
-            
+                # Apply components to the wind field
+                self.u[y, :] = u_component
+                self.v[y, :] = v_component
+
         except Exception as e:
             print(f"Error in global circulation initialization: {e}")
-
+            traceback.print_exc()
 
 
     def calculate_wind(self):
-        """Calculate wind modifications based on pressure and temperature"""
+        """Update wind based on initial global circulation patterns"""
         try:
-            # Start with base circulation
+            # Check if wind components exist, if not initialize them
             if not hasattr(self, 'u') or not hasattr(self, 'v'):
                 self.initialize_global_circulation()
+                return
+
+            # Basic terrain effects
+            is_ocean = self.elevation <= 0
+            terrain_factor = np.ones_like(self.elevation)
+            terrain_height = np.maximum(0, self.elevation)
+            terrain_factor[~is_ocean] = np.exp(-terrain_height[~is_ocean] / 5000)
             
-            # Get pressure gradients
-            dy, dx = np.gradient(self.pressure)
-            dpdy = dy / self.grid_spacing_y
-            dpdx = dx / self.grid_spacing_x
+            # Apply terrain effects to wind components
+            self.u *= terrain_factor
+            self.v *= terrain_factor
             
-            # Get temperature gradients
-            dTdy, dTdx = np.gradient(self.temperature_celsius)
-            dTdy = dTdy / self.grid_spacing_y
-            dTdx = dTdx / self.grid_spacing_x
+            # Basic friction
+            friction = np.where(is_ocean, 0.98, 0.95)
+            self.u *= friction
+            self.v *= friction
             
-            # Calculate thermal wind contribution
-            thermal_factor = 0.1
-            u_thermal = -thermal_factor * dTdy
-            v_thermal = thermal_factor * dTdx
-            
-            # Calculate pressure gradient contribution
-            pressure_factor = 1e-5
-            u_pressure = -pressure_factor * dpdy
-            v_pressure = pressure_factor * dpdx
-            
-            # Add modifications to base circulation
-            self.u += u_thermal + u_pressure
-            self.v += v_thermal + v_pressure
-            
-            # Apply friction over land
-            is_land = self.elevation > 0
-            friction_factor = np.where(is_land, 0.5, 0.9)
-            self.u *= friction_factor
-            self.v *= friction_factor
-            
-            # Smooth the wind field
-            self.u = gaussian_filter(self.u, sigma=1.0)
-            self.v = gaussian_filter(self.v, sigma=1.0)
-            
-            # Limit maximum wind speeds
-            max_speed = 30.0  # m/s
-            speed = np.sqrt(self.u**2 + self.v**2)
-            speed_factor = np.where(speed > max_speed, max_speed/speed, 1.0)
-            self.u *= speed_factor
-            self.v *= speed_factor
-            
+            # Light smoothing to prevent sharp discontinuities
+            self.u = gaussian_filter(self.u, sigma=0.5)
+            self.v = gaussian_filter(self.v, sigma=0.5)
+
         except Exception as e:
-            print(f"Error in wind calculation: {e}")
+            print(f"Error calculating wind: {e}")
+            traceback.print_exc()
 
 
     def update_zoom_view(self, event):
@@ -1629,6 +1540,17 @@ class SimulationApp:
 
     def print_system_stats(self):
         """Print system statistics with live updates on the same lines"""
+        # Check if stats should be printed
+        if not hasattr(self, 'print_stats_enabled') or not self.print_stats_enabled:
+            return
+            
+        # Calculate cycle time
+        current_time = time.time()
+        if not hasattr(self, 'last_cycle_time'):
+            self.last_cycle_time = current_time
+        cycle_time = max(current_time - self.last_cycle_time, 0.000001)  # Prevent division by zero
+        self.last_cycle_time = current_time
+        
         # Get average/min/max values
         avg_temp = np.mean(self.temperature_celsius)
         min_temp = np.min(self.temperature_celsius)
@@ -1639,6 +1561,7 @@ class SimulationApp:
         max_pressure = np.max(self.pressure)
         
         wind_speed = np.sqrt(self.u**2 + self.v**2)
+        min_wind = np.min(wind_speed)
         avg_wind = np.mean(wind_speed)
         max_wind = np.max(wind_speed)
         
@@ -1674,11 +1597,14 @@ class SimulationApp:
             'net_flux': net_flux
         })
         
+        # Calculate FPS with safety check
+        fps = min(1/cycle_time, 999.9)  # Cap FPS display at 999.9
+        
         # Create the output strings with fixed width
-        cycle_str = f"Simulation Cycle: {self.time_step:6d}"
-        temp_str = f"Temperature (°C)    | Avg: {avg_temp:6.1f} | Min: {min_temp:6.1f} | Max: {max_temp:6.1f} | Δ: {temp_change:+6.2f}"
+        cycle_str = f"Simulation Cycle: {self.time_step:6d} | Cycle Time: {cycle_time:6.3f}s | FPS: {fps:5.1f}"
+        temp_str = f"Temperature (°C)   | Avg: {avg_temp:6.1f} | Min: {min_temp:6.1f} | Max: {max_temp:6.1f} | Δ: {temp_change:+6.2f}"
         pres_str = f"Pressure (Pa)      | Avg: {avg_pressure:8.0f} | Min: {min_pressure:8.0f} | Max: {max_pressure:8.0f} | Δ: {pressure_change:+6.0f}"
-        wind_str = f"Wind Speed (m/s)   | Avg: {avg_wind:6.1f} | Max: {max_wind:6.1f}"
+        wind_str = f"Wind Speed (m/s)   | Min: {min_wind:6.1f} | Avg: {avg_wind:6.1f} | Max: {max_wind:6.1f}"
         
         # Energy budget strings with net changes
         energy_in_str = f"Energy In (W/m²)   | Solar: {solar_in:6.1f} | Δ: {solar_change:+6.2f} | Greenhouse: {greenhouse:6.1f} | Δ: {greenhouse_change:+6.2f} | Total: {solar_in + greenhouse:6.1f}"
@@ -1696,6 +1622,9 @@ class SimulationApp:
         print(f"\033[K{wind_str}", end='\r\n')       # Clear line and move to next
         print(f"\033[K{energy_in_str}", end='\r\n')  # Clear line and move to next
         print(f"\033[K{energy_out_str}", end='\r')   # Clear line and stay there
+        
+        # Move cursor back up to the start position
+        print("\033[6A", end='')
         
         # Move cursor back up to the start position
         print("\033[6A", end='')
@@ -1732,6 +1661,50 @@ class SimulationApp:
         greenhouse_modifier = -0.25 * mean_absorption
         
         return greenhouse_modifier
+
+
+    def map_elevation_to_color(self, elevation_data):
+        """Convert elevation data to color visualization"""
+        try:
+            # Create RGB array
+            rgb_array = np.zeros((self.map_height, self.map_width, 3), dtype=np.uint8)
+            
+            # Normalize elevation data
+            normalized_elevation = (elevation_data - np.min(elevation_data)) / (np.max(elevation_data) - np.min(elevation_data))
+            
+            # Create terrain colors
+            # Below sea level (blues)
+            ocean_mask = elevation_data <= 0
+            rgb_array[ocean_mask, 0] = (50 * normalized_elevation[ocean_mask]).astype(np.uint8)  # R
+            rgb_array[ocean_mask, 1] = (100 * normalized_elevation[ocean_mask]).astype(np.uint8)  # G
+            rgb_array[ocean_mask, 2] = (150 + 105 * normalized_elevation[ocean_mask]).astype(np.uint8)  # B
+            
+            # Above sea level (greens and browns)
+            land_mask = elevation_data > 0
+            normalized_land = normalized_elevation[land_mask]
+            rgb_array[land_mask, 0] = (100 + 155 * normalized_land).astype(np.uint8)  # R
+            rgb_array[land_mask, 1] = (100 + 100 * normalized_land).astype(np.uint8)  # G
+            rgb_array[land_mask, 2] = (50 + 50 * normalized_land).astype(np.uint8)   # B
+            
+            return rgb_array
+            
+        except Exception as e:
+            print(f"Error in elevation mapping: {e}")
+            return np.zeros((self.map_height, self.map_width, 3), dtype=np.uint8)
+
+    def calculate_wind_direction(self, u, v):
+        """
+        Calculate wind direction in meteorological convention (direction wind is coming FROM)
+        Returns angle in degrees, where:
+        0/360 = North wind (wind coming FROM the north)
+        90 = East wind
+        180 = South wind
+        270 = West wind
+        """
+        # Convert u, v components to direction FROM
+        # Add 180 to reverse the direction (to get direction wind is coming FROM)
+        # Modulo 360 to keep in range 0-360
+        return (270 - np.degrees(np.arctan2(v, u))) % 360
 
 
 class ZoomDialog(tk.Toplevel):
@@ -1783,6 +1756,11 @@ class ZoomDialog(tk.Toplevel):
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn")
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        # Context already set, continue with current settings
+        pass
+        
     app = SimulationApp()
-    app.root.mainloop()  # Add this line to start the Tkinter event loop
+    app.root.mainloop()
