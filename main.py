@@ -897,14 +897,23 @@ class SimulationApp:
 
 
     def draw_wind_vectors(self):
-        """Simplified wind vector drawing"""
+        """Draw wind vectors at specific latitudes"""
         try:
-            # Increase spacing between vectors
-            step = max(self.map_width, self.map_height) // 30
+            # Define specific latitudes where we want vectors (north and south)
+            target_latitudes = [80, 70, 60, 50, 40, 30, 20, 10, 0, -10, -20, -30, -40, -50, -60, -70, -80]
+            
+            # Base step size for longitude spacing
+            x_step = self.map_width // 30
+            x_indices = np.arange(0, self.map_width, x_step)
+            
+            # Find y-coordinates for each target latitude
+            y_indices = []
+            for target_lat in target_latitudes:
+                # Find the y-coordinate where latitude is closest to target
+                y_coord = np.abs(self.latitude[:, 0] - target_lat).argmin()
+                y_indices.append(y_coord)
             
             # Create coordinate grids
-            x_indices = np.arange(0, self.map_width, step)
-            y_indices = np.arange(0, self.map_height, step)
             X, Y = np.meshgrid(x_indices, y_indices)
             
             # Sample wind components
@@ -916,15 +925,16 @@ class SimulationApp:
             max_magnitude = np.max(magnitudes) if magnitudes.size > 0 else 1.0
             
             # Scale factor for arrow length
-            scale = step * 0.5 / max_magnitude if max_magnitude > 0 else step * 0.5
+            scale = x_step * 0.5 / max_magnitude if max_magnitude > 0 else x_step * 0.5
             
             # Draw vectors
             for i in range(len(y_indices)):
                 for j in range(len(x_indices)):
                     x = X[i, j]
                     y = Y[i, j]
+                    # Invert v component to match screen coordinates (y increases downward)
                     dx = u_sampled[i, j] * scale
-                    dy = v_sampled[i, j] * scale
+                    dy = -v_sampled[i, j] * scale  # Negative to match screen coordinates
                     
                     if np.isfinite(dx) and np.isfinite(dy):
                         self.canvas.create_line(
@@ -1405,33 +1415,33 @@ class SimulationApp:
                 # Northern Hemisphere
                 if lat > 60:  # Polar cell (60°N to 90°N)
                     angle_factor = (lat - 60) / 30  # 1 at 90°N, 0 at 60°N
-                    u_component = 30.0 * speed_scale * angle_factor        # Increased from 15.0
+                    u_component = -30.0 * speed_scale * angle_factor        # Increased from 15.0
                     v_component = -24.0 * speed_scale * (1 - angle_factor) # Increased from -12.0
                     
-                elif lat > 29.9:  # Ferrel cell (30°N to 60°N)
-                    angle_factor = (lat - 29.9) / 30.1  # 1 at 60°N, 0 at 29.9°N
-                    u_component = -50.0 * speed_scale * (1 - angle_factor) # Increased from -25.0
+                elif lat > 30:  # Ferrel cell (30°N to 60°N)
+                    angle_factor = (lat - 30.01) / 30.01  # 1 at 60°N, 0 at 30°N
+                    u_component = 50.0 * speed_scale * (1 - angle_factor) # Increased from -25.0
                     v_component = 24.0 * speed_scale * angle_factor        # Increased from 12.0
                     
-                elif lat > 0:  # Hadley cell (0° to 29.9°N)
-                    angle_factor = lat / 29.9  # 1 at 29.9°N, 0 at equator
-                    u_component = 30.0 * speed_scale * (1 - angle_factor)  # Increased from 15.0
+                elif lat > 0:  # Hadley cell (0° to 30°N)
+                    angle_factor = lat / 30  # 1 at 30°N, 0 at equator
+                    u_component = -30.0 * speed_scale * (1 - angle_factor)  # Increased from 15.0
                     v_component = -24.0 * speed_scale * angle_factor       # Increased from -12.0
                     
                 # Southern Hemisphere (mirror of northern patterns)
-                elif lat > -29.9:  # Hadley cell (0° to 29.9°S)
-                    angle_factor = -lat / 29.9  # 1 at 29.9°S, 0 at equator
-                    u_component = 30.0 * speed_scale * (1 - angle_factor)  # Increased from 15.0
+                elif lat > -30:  # Hadley cell (0° to 30°S)
+                    angle_factor = -lat / 30  # 1 at 30°S, 0 at equator
+                    u_component = -30.0 * speed_scale * (1 - angle_factor)  # Increased from 15.0
                     v_component = 24.0 * speed_scale * angle_factor        # Increased from 12.0
                     
-                elif lat > -60:  # Ferrel cell (29.9°S to 60°S)
-                    angle_factor = (-lat - 29.9) / 30.1  # 1 at 60°S, 0 at 29.9°S
-                    u_component = -50.0 * speed_scale * (1 - angle_factor) # Increased from -25.0
+                elif lat > -60:  # Ferrel cell (30°S to 60°S)
+                    angle_factor = (-lat - 30) / 30  # 1 at 60°S, 0 at 30°S
+                    u_component = 50.0 * speed_scale * (1 - angle_factor) # Increased from -25.0
                     v_component = -24.0 * speed_scale * angle_factor       # Increased from -12.0
                     
                 else:  # Polar cell (60°S to 90°S)
                     angle_factor = (-lat - 60) / 30  # 1 at 90°S, 0 at 60°S
-                    u_component = 30.0 * speed_scale * angle_factor        # Increased from 15.0
+                    u_component = -30.0 * speed_scale * angle_factor        # Increased from 15.0
                     v_component = 24.0 * speed_scale * (1 - angle_factor)  # Increased from 12.0
                 
                 # Apply components to the wind field
@@ -1734,14 +1744,14 @@ class SimulationApp:
         """
         Calculate wind direction in meteorological convention (direction wind is coming FROM)
         Returns angle in degrees, where:
-        0/360 = North wind (wind coming FROM the north)
-        90 = East wind
-        180 = South wind
-        270 = West wind
+        0/360 = North wind (wind coming FROM the north, pointing down)
+        90 = East wind (wind coming FROM the east, pointing left)
+        180 = South wind (wind coming FROM the south, pointing up)
+        270 = West wind (wind coming FROM the west, pointing right)
         """
         # Convert u, v components to direction FROM
-        # Add 180 to reverse the direction (to get direction wind is coming FROM)
-        # Modulo 360 to keep in range 0-360
+        # arctan2 gives angle counter-clockwise from x-axis
+        # Subtract from 270 to get meteorological convention (clockwise from north)
         return (270 - np.degrees(np.arctan2(v, u))) % 360
 
 
