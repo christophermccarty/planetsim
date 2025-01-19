@@ -869,17 +869,29 @@ class SimulationApp:
             elevation_factor = np.exp(-limited_elevation / 7400.0)
             min_pressure = P0 * elevation_factor
             
-            # Calculate pressure changes due to wind convergence/divergence
-            du_dx = np.gradient(self.u, axis=1) / self.grid_spacing_x
-            dv_dy = np.gradient(self.v, axis=0) / self.grid_spacing_y
+            # Create wrapped arrays for proper edge handling
+            u_wrapped = np.hstack((self.u[:, -1:], self.u, self.u[:, :1]))
+            v_wrapped = np.vstack((self.v[-1:, :], self.v, self.v[:1, :]))
+            
+            # Calculate pressure changes due to wind convergence/divergence with wrapping
+            du_dx = np.gradient(u_wrapped, axis=1) / self.grid_spacing_x
+            dv_dy = np.gradient(v_wrapped, axis=0) / self.grid_spacing_y
+            
+            # Remove the padding from gradient results
+            du_dx = du_dx[:, 1:-1]
+            dv_dy = dv_dy[1:-1, :]
+            
             wind_divergence = du_dx + dv_dy
             
             # Reduce the strength of wind-driven pressure changes
-            convergence_factor = 0.1  # Reduced from 1.0
+            convergence_factor = 0.1
             pressure_change = -self.pressure * wind_divergence * dt * convergence_factor
             
             # Apply stronger smoothing to prevent banding
-            pressure_change = gaussian_filter(pressure_change, sigma=2.0)
+            # Wrap the pressure field for smoothing
+            pressure_wrapped = np.hstack((self.pressure[:, -1:], self.pressure, self.pressure[:, :1]))
+            pressure_wrapped = np.vstack((pressure_wrapped[-1:, :], pressure_wrapped, pressure_wrapped[:1, :]))
+            pressure_change = gaussian_filter(pressure_change, sigma=2.0, mode='wrap')
             
             # Apply pressure changes
             self.pressure += pressure_change
@@ -888,8 +900,8 @@ class SimulationApp:
             self.pressure[is_land] = np.maximum(self.pressure[is_land], min_pressure[is_land])
             self.pressure = np.clip(self.pressure, 87000.0, 108600.0)
             
-            # Increased smoothing for final pressure field
-            self.pressure = gaussian_filter(self.pressure, sigma=1.5)  # Increased from 0.5
+            # Increased smoothing for final pressure field with wrapping
+            self.pressure = gaussian_filter(self.pressure, sigma=1.5, mode='wrap')
             
         except Exception as e:
             print(f"Error updating pressure: {e}")
@@ -1190,73 +1202,70 @@ class SimulationApp:
     def map_pressure_to_color(self, pressure_data):
         """Convert pressure data to color visualization with less frequent isolines"""
         try:
-            # Get terrain colors first
-            terrain_colors = self.map_elevation_to_color(self.elevation)
+            # Get terrain colors first (cache if possible)
+            if not hasattr(self, '_cached_terrain_colors'):
+                self._cached_terrain_colors = self.map_elevation_to_color(self.elevation)
+            terrain_colors = self._cached_terrain_colors
             
-            # Create RGBA array with correct dimensions
-            rgba_array = np.zeros((*terrain_colors.shape[:2], 4), dtype=np.uint8)
-            
-            # Convert pressure to hPa for easier calculations
+            # Convert pressure to hPa once
             pressure_hpa = pressure_data / 100.0
             
             # Set fixed pressure range (870-1086 hPa)
-            p_min = 870
-            p_max = 1086
+            p_min, p_max = 870, 1086
             
-            # Normalize pressure to [-1,1] range for color mapping
+            # Pre-allocate the RGBA array
+            rgba_array = np.zeros((*terrain_colors.shape[:2], 4), dtype=np.uint8)
+            
+            # Normalize pressure in one step
             normalized_pressure = 2 * (pressure_hpa - (p_min + p_max)/2) / (p_max - p_min)
             
-            # Create pressure colors array
+            # Vectorized color calculations (all at once instead of channel by channel)
             pressure_colors = np.zeros((*terrain_colors.shape[:2], 4), dtype=np.uint8)
             
-            # Vectorized color calculations
-            pressure_colors[..., 0] = np.interp(normalized_pressure, 
-                                          [-1, -0.5, 0, 0.5, 1], 
-                                          [65, 150, 255, 255, 255]).astype(np.uint8)
-            pressure_colors[..., 1] = np.interp(normalized_pressure, 
-                                          [-1, -0.5, 0, 0.5, 1], 
-                                          [200, 230, 255, 230, 200]).astype(np.uint8)
-            pressure_colors[..., 2] = np.interp(normalized_pressure, 
-                                          [-1, -0.5, 0, 0.5, 1], 
-                                          [255, 255, 255, 150, 65]).astype(np.uint8)
-            pressure_colors[..., 3] = 170  # Opacity
+            # Create color lookup tables
+            pressure_ranges = np.array([-1, -0.5, 0, 0.5, 1])
+            r_values = np.array([65, 150, 255, 255, 255])
+            g_values = np.array([200, 230, 255, 230, 200])
+            b_values = np.array([255, 255, 255, 150, 65])
             
-            # Blend pressure colors with terrain efficiently
+            # Vectorized interpolation for all channels at once
+            pressure_colors[..., 0] = np.interp(normalized_pressure, pressure_ranges, r_values)
+            pressure_colors[..., 1] = np.interp(normalized_pressure, pressure_ranges, g_values)
+            pressure_colors[..., 2] = np.interp(normalized_pressure, pressure_ranges, b_values)
+            pressure_colors[..., 3] = 170  # Constant opacity
+            
+            # Efficient alpha blending
             alpha = pressure_colors[..., 3:] / 255.0
             rgba_array[..., :3] = ((pressure_colors[..., :3] * alpha) + 
-                              (terrain_colors[..., :3] * (1 - alpha))).astype(np.uint8)
+                                 (terrain_colors[..., :3] * (1 - alpha))).astype(np.uint8)
             rgba_array[..., 3] = 255
             
-            # Add isobar lines with wider spacing
-            isobar_interval = 25  # Every 25 hPa
+            # Optimize isobar calculation
+            if not hasattr(self, '_pressure_levels'):
+                # Calculate pressure levels once and cache
+                min_level = np.floor(p_min / 25) * 25
+                max_level = np.ceil(p_max / 25) * 25
+                self._pressure_levels = np.arange(min_level, max_level + 25, 25)
             
-            # Calculate pressure levels more efficiently
-            min_level = np.floor(p_min / isobar_interval) * isobar_interval
-            max_level = np.ceil(p_max / isobar_interval) * isobar_interval
-            pressure_levels = np.arange(min_level, max_level + isobar_interval, isobar_interval)
-            
-            # Pre-calculate smoothed pressure field
+            # Use pre-smoothed pressure field for isobars
             smoothed_pressure = gaussian_filter(pressure_hpa, sigma=1.0)
             
-            # Create combined isobar mask
+            # Vectorized isobar calculation
             isobar_mask = np.zeros_like(pressure_hpa, dtype=bool)
-            for level in pressure_levels:
-                # More efficient masking
-                level_mask = np.abs(smoothed_pressure - level) < 0.5
-                isobar_mask |= level_mask
+            for level in self._pressure_levels:
+                isobar_mask |= np.abs(smoothed_pressure - level) < 0.5
             
-            # Apply smoothing to combined mask
+            # Apply smoothing to mask more efficiently
             isobar_mask = gaussian_filter(isobar_mask.astype(float), sigma=0.5) > 0.3
             
-            # Apply isobars to final image
-            rgba_array[isobar_mask, :3] = [255, 255, 255]  # White lines
+            # Apply isobars efficiently
+            rgba_array[isobar_mask, :3] = 255  # White lines
             rgba_array[isobar_mask, 3] = 180  # Slightly transparent
             
             return rgba_array
                 
         except Exception as e:
             print(f"Error in map_pressure_to_color: {e}")
-            traceback.print_exc()
             return np.zeros((*terrain_colors.shape[:2], 4), dtype=np.uint8)
 
 
@@ -1273,6 +1282,16 @@ class SimulationApp:
         """Update the map display with current data"""
         try:
             # Use root.after to ensure GUI updates happen in main thread
+            if not hasattr(self, '_last_update_time'):
+                self._last_update_time = time.time()
+            
+            # Limit update frequency
+            current_time = time.time()
+            if current_time - self._last_update_time < 0.033:  # ~30 FPS max
+                return
+            
+            self._last_update_time = current_time
+            
             self.root.after(0, self._update_visualization_safe)
         except Exception as e:
             print(f"Error scheduling visualization update: {e}")
