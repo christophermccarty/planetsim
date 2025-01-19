@@ -676,12 +676,18 @@ class SimulationApp:
         net_flux = solar_in + greenhouse_forcing - longwave_out
         self.energy_budget['net_flux'] = np.mean(net_flux)
         
-        # Temperature change based on heat capacity
+        # Add heat advection by winds (new)
+        dT_dy = np.gradient(self.temperature_celsius, axis=0) / self.grid_spacing_y
+        dT_dx = np.gradient(self.temperature_celsius, axis=1) / self.grid_spacing_x
+        temperature_advection = -(self.u * dT_dx + self.v * dT_dy)
+        
+        # Temperature change based on heat capacity and advection
         heat_capacity = np.where(is_land, 
                                params['heat_capacity_land'], 
                                params['heat_capacity_ocean'])
         
         delta_T = (net_flux / heat_capacity) * self.time_step_seconds
+        delta_T += temperature_advection * self.time_step_seconds  # Add advection effect
         
         # Apply temperature change
         self.temperature_celsius += delta_T
@@ -863,18 +869,27 @@ class SimulationApp:
             elevation_factor = np.exp(-limited_elevation / 7400.0)
             min_pressure = P0 * elevation_factor
             
-            # Reset pressure anomaly field
-            pressure_anomaly = np.zeros_like(self.pressure)
+            # Calculate pressure changes due to wind convergence/divergence
+            du_dx = np.gradient(self.u, axis=1) / self.grid_spacing_x
+            dv_dy = np.gradient(self.v, axis=0) / self.grid_spacing_y
+            wind_divergence = du_dx + dv_dy
             
-            # Apply pressure anomalies and ensure bounds
-            self.pressure += pressure_anomaly * 0.1  # Reduced impact of new anomalies
+            # Reduce the strength of wind-driven pressure changes
+            convergence_factor = 0.1  # Reduced from 1.0
+            pressure_change = -self.pressure * wind_divergence * dt * convergence_factor
+            
+            # Apply stronger smoothing to prevent banding
+            pressure_change = gaussian_filter(pressure_change, sigma=2.0)
+            
+            # Apply pressure changes
+            self.pressure += pressure_change
             
             # Ensure pressure stays within realistic bounds
             self.pressure[is_land] = np.maximum(self.pressure[is_land], min_pressure[is_land])
             self.pressure = np.clip(self.pressure, 87000.0, 108600.0)
             
-            # Light smoothing
-            self.pressure = gaussian_filter(self.pressure, sigma=0.5)
+            # Increased smoothing for final pressure field
+            self.pressure = gaussian_filter(self.pressure, sigma=1.5)  # Increased from 0.5
             
         except Exception as e:
             print(f"Error updating pressure: {e}")
