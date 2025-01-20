@@ -512,61 +512,160 @@ class SimulationApp:
         
 
     def initialize_ocean_currents(self):
-        """Initialize ocean current components"""
-        self.ocean_u = np.zeros((self.map_height, self.map_width))
-        self.ocean_v = np.zeros((self.map_height, self.map_width))
-        
-        is_ocean = self.elevation <= 0
-        
-        # Calculate Coriolis parameter
-        f = 2 * self.Omega * np.sin(np.deg2rad(self.latitude))
-        
-        # Set up major ocean currents
-        for lat in range(self.map_height):
-            lat_deg = self.latitude[lat, 0]
+        """Initialize ocean current components with improved physics"""
+        try:
+            # Initialize current arrays
+            self.ocean_u = np.zeros((self.map_height, self.map_width))
+            self.ocean_v = np.zeros((self.map_height, self.map_width))
             
-            # Northern Hemisphere currents
-            if lat_deg > 45 and lat_deg < 65:
-                self.ocean_u[lat, :] = 0.4
-                self.ocean_v[lat, :] = -0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
-            elif lat_deg > 25 and lat_deg < 45:
-                self.ocean_u[lat, :] = -0.3
-                self.ocean_v[lat, :] = 0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
-            elif lat_deg > 5 and lat_deg < 25:
-                self.ocean_u[lat, :] = -0.4
-            elif lat_deg > -5 and lat_deg < 5:
-                self.ocean_u[lat, :] = 0.3
+            is_ocean = self.elevation <= 0
             
-            # Southern Hemisphere currents
-            elif lat_deg < -45 and lat_deg > -65:
-                self.ocean_u[lat, :] = 0.6
-                self.ocean_v[lat, :] = 0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
-            elif lat_deg < -25 and lat_deg > -45:
-                self.ocean_u[lat, :] = -0.3
-                self.ocean_v[lat, :] = -0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
-            elif lat_deg < -5 and lat_deg > -25:
-                self.ocean_u[lat, :] = -0.4
+            # Calculate Coriolis parameter (varies with latitude)
+            f = 2 * self.Omega * np.sin(np.deg2rad(self.latitude))
+            
+            # Wind stress contribution (Ekman transport)
+            wind_stress_factor = 0.015  # Wind stress coefficient
+            ekman_angle = np.deg2rad(45)  # 45-degree deflection
+            
+            # Apply wind forcing with Ekman spiral
+            self.ocean_u += wind_stress_factor * (self.u * np.cos(ekman_angle) - 
+                                                self.v * np.sin(ekman_angle))
+            self.ocean_v += wind_stress_factor * (self.u * np.sin(ekman_angle) + 
+                                                self.v * np.cos(ekman_angle))
+            
+            # Thermohaline circulation
+            # Calculate density from temperature and add basic salinity effect
+            density = self.calculate_water_density(self.temperature_celsius)
+            
+            # Add simplified salinity effect (higher at poles, lower at equator)
+            salinity_variation = np.cos(np.deg2rad(self.latitude)) * 2  # ±2 PSU variation
+            density += 0.8 * salinity_variation  # Density change per PSU
+            
+            # Calculate density gradients
+            dx = self.grid_spacing_x
+            dy = self.grid_spacing_y
+            
+            density_gradient_y = np.gradient(density, dy, axis=0)
+            density_gradient_x = np.gradient(density, dx, axis=1)
+            
+            # Thermohaline circulation strength
+            g = 9.81  # gravitational acceleration
+            thermal_factor = 0.1  # Scaling factor for thermohaline circulation
+            
+            # Add thermohaline-driven currents
+            self.ocean_u -= thermal_factor * g * density_gradient_x / f
+            self.ocean_v -= thermal_factor * g * density_gradient_y / f
+            
+            # Set up major ocean gyres based on latitude
+            for lat in range(self.map_height):
+                lat_deg = self.latitude[lat, 0]
+                
+                # Northern Hemisphere gyres
+                if lat_deg > 45 and lat_deg < 65:  # Subpolar gyre
+                    self.ocean_u[lat, :] += 0.4
+                    self.ocean_v[lat, :] -= 0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
+                elif lat_deg > 25 and lat_deg < 45:  # Subtropical gyre
+                    self.ocean_u[lat, :] -= 0.3
+                    self.ocean_v[lat, :] += 0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
+                elif lat_deg > 5 and lat_deg < 25:  # Trade winds region
+                    self.ocean_u[lat, :] -= 0.4
+                elif lat_deg > -5 and lat_deg < 5:  # Equatorial current
+                    self.ocean_u[lat, :] += 0.3
+                
+                # Southern Hemisphere gyres (mirror of northern)
+                elif lat_deg < -45 and lat_deg > -65:  # Subpolar gyre
+                    self.ocean_u[lat, :] += 0.4
+                    self.ocean_v[lat, :] += 0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
+                elif lat_deg < -25 and lat_deg > -45:  # Subtropical gyre
+                    self.ocean_u[lat, :] -= 0.3
+                    self.ocean_v[lat, :] -= 0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
+                elif lat_deg < -5 and lat_deg > -25:  # Trade winds region
+                    self.ocean_u[lat, :] -= 0.4
+            
+            # Apply masking and boundary conditions
+            self.ocean_u = np.where(is_ocean, self.ocean_u, 0)
+            self.ocean_v = np.where(is_ocean, self.ocean_v, 0)
+            
+            # Smooth transitions
+            self.ocean_u = gaussian_filter(self.ocean_u, sigma=1.0)
+            self.ocean_v = gaussian_filter(self.ocean_v, sigma=1.0)
+            
+        except Exception as e:
+            print(f"Error in initialize_ocean_currents: {e}")
+            traceback.print_exc()
 
-        # Apply temperature and density effects
-        T_gradient_y, T_gradient_x = np.gradient(self.temperature_celsius)
-        density_factor = 0.1
-        self.ocean_v += -density_factor * T_gradient_y * is_ocean
-        self.ocean_u += -density_factor * T_gradient_x * is_ocean
-        
-        # Modify currents near continental boundaries
-        for y in range(1, self.map_height-1):
-            for x in range(1, self.map_width-1):
-                if is_ocean[y, x]:
-                    if not is_ocean[y-1:y+2, x-1:x+2].all():
-                        boundary_factor = 1.5
-                        self.ocean_u[y, x] *= boundary_factor
-                        self.ocean_v[y, x] *= boundary_factor
-        
-        # Apply masking and smoothing
-        self.ocean_u = np.where(is_ocean, self.ocean_u, 0)
-        self.ocean_v = np.where(is_ocean, self.ocean_v, 0)
-        self.ocean_u = gaussian_filter(self.ocean_u, sigma=1.0)
-        self.ocean_v = gaussian_filter(self.ocean_v, sigma=1.0)
+    def update_ocean_temperature(self):
+        """Update ocean temperatures with improved physics"""
+        try:
+            is_ocean = self.elevation <= 0
+            dt = self.time_step_seconds
+            
+            # Solar heating (latitude-dependent)
+            solar_constant = 1361  # W/m²
+            albedo_ocean = 0.06
+            cos_lat = np.cos(np.deg2rad(self.latitude))
+            solar_heating = solar_constant * (1 - albedo_ocean) * np.maximum(0, cos_lat)
+            
+            # Ocean current advection
+            dT_dy = np.gradient(self.temperature_celsius, axis=0) / self.grid_spacing_y
+            dT_dx = np.gradient(self.temperature_celsius, axis=1) / self.grid_spacing_x
+            temperature_advection = -(self.ocean_u * dT_dx + self.ocean_v * dT_dy)
+            
+            # Vertical mixing (thermohaline circulation)
+            density = self.calculate_water_density(self.temperature_celsius)
+            density_gradient_y = np.gradient(density, axis=0)
+            density_gradient_x = np.gradient(density, axis=1)
+            vertical_mixing_strength = 0.1
+            vertical_mixing = vertical_mixing_strength * (
+                np.abs(density_gradient_x) + np.abs(density_gradient_y)
+            )
+            
+            # Heat transport parameters
+            heat_capacity_water = 4186  # J/(kg·K)
+            water_density = 1025  # kg/m³
+            mixed_layer_depth = 100  # meters
+            
+            # Air-sea heat exchange
+            air_temp = self.temperature_celsius  # Use atmospheric temperature
+            temp_difference = self.temperature_celsius - air_temp
+            heat_exchange_coefficient = 40  # W/(m²·K)
+            air_sea_heat_flux = -heat_exchange_coefficient * temp_difference
+            
+            # Latent heat from evaporation
+            relative_humidity = 0.7
+            saturation_vapor_pressure = 610.7 * np.exp(
+                17.27 * self.temperature_celsius / (self.temperature_celsius + 237.3)
+            )
+            actual_vapor_pressure = relative_humidity * saturation_vapor_pressure
+            latent_heat_flux = -2.5e6 * 1e-3 * (saturation_vapor_pressure - actual_vapor_pressure)
+            
+            # Combine all heat fluxes
+            net_heat_flux = (
+                solar_heating +
+                air_sea_heat_flux +
+                latent_heat_flux
+            )
+            
+            # Temperature change
+            dT = dt * (
+                temperature_advection +  # Current-driven transport
+                vertical_mixing +        # Vertical mixing
+                net_heat_flux / (water_density * heat_capacity_water * mixed_layer_depth)
+            )
+            
+            # Apply changes only to ocean cells
+            self.temperature_celsius[is_ocean] += dT[is_ocean]
+            
+            # Clip to realistic ocean temperatures
+            self.temperature_celsius[is_ocean] = np.clip(
+                self.temperature_celsius[is_ocean],
+                -2,   # Freezing point of seawater
+                30    # Maximum tropical ocean temperature
+            )
+            
+        except Exception as e:
+            print(f"Error in update_ocean_temperature: {e}")
+            traceback.print_exc()
 
     def update_ocean_temperature(self):
         """Update ocean temperatures"""
@@ -595,7 +694,7 @@ class SimulationApp:
                 self.temperature_celsius[is_ocean] - np.mean(self.temperature_celsius[is_ocean])
             )
             heat_exchange_coefficient = 40  # W/(m²·K)
-            air_sea_heat_exchange = heat_exchange_coefficient * temp_difference
+            air_sea_heat_exchange = heat_exchange_coefficient * temp_difference 
             
             # NEW: Latent heat from evaporation (maintaining array shapes)
             relative_humidity = 0.7  # assumed average
