@@ -17,6 +17,7 @@ import traceback
 import gc
 from temperature import Temperature
 from pressure import Pressure
+from wind import Wind
 
 from map_generation import MapGenerator
 
@@ -154,6 +155,15 @@ class SimulationApp:
 
             # Initialize temperature
             self.temperature.initialize()
+            
+            # Initialize pressure module
+            self.pressure_system = Pressure(self)
+            
+            # Initialize pressure
+            self.pressure_system.initialize()
+            
+            # Initialize wind module
+            self.wind_system = Wind(self)
 
             # Initialize humidity
             self.initialize_humidity()
@@ -161,11 +171,15 @@ class SimulationApp:
             # Initialize other attributes
             self.humidity_effect_coefficient = 0.1
 
+            # Remove explicit calls to wind methods since they're now handled by the wind_system
             # Initialize global circulation
-            self.initialize_global_circulation()
+            # self.initialize_global_circulation()
 
             # Initialize wind field
-            self.initialize_wind()
+            # self.initialize_wind()
+
+            # Initialize wind via the wind system
+            self.wind_system.initialize()
 
             # Initialize ocean currents
             self.initialize_ocean_currents()
@@ -245,12 +259,9 @@ class SimulationApp:
             
             # Flag to track if ocean data is available and calculated successfully
             self.ocean_data_available = False
-            
-            # Initialize pressure module
-            self.pressure_system = Pressure(self)
-            
-            # Initialize pressure
-            self.pressure_system.initialize()
+         
+            # Initialize wind
+            self.wind_system.initialize()
 
         except Exception as e:
             print(f"Error in initialization: {e}")
@@ -466,7 +477,7 @@ class SimulationApp:
             self.temperature.update_land_ocean()      # Update temperatures (depends on humidity)
             self.temperature.update_ocean()  # Update ocean temps (uses updated surface temps)
             self.pressure_system.update()          # Update pressure (affected by temperature)
-            self.update_wind()              # Finally update winds (affected by all others)
+            self.wind_system.update()              # Finally update winds (affected by all others)
             
             # Clear the pressure image cache after updating pressure to force redraw
             if hasattr(self, '_pressure_image'):
@@ -584,18 +595,6 @@ class SimulationApp:
         
         return self._reusable_array
 
-    def calculate_water_density(self, temperature):
-        """Delegate to temperature module"""
-        return self.temperature.calculate_water_density(temperature)
-
-    def initialize_wind(self):
-        """Initialize wind fields with small random perturbations."""
-        # Initialize u and v components
-        self.u = np.zeros((self.map_height, self.map_width))
-        self.v = np.zeros((self.map_height, self.map_width))
-        
-        # Now initialize circulation patterns
-        self.initialize_global_circulation()
 
     def initialize_ocean_currents(self):
         """Initialize ocean current components"""
@@ -1580,128 +1579,20 @@ class SimulationApp:
         return self.temperature.calculate_relative_humidity(vapor_pressure, T)
 
     def initialize_global_circulation(self):
-        """Initialize wind patterns with realistic global circulation and wind belts"""
-        # Negative u_component: Wind is blowing TOWARDS the east
-        # Positive u_component: Wind is blowing TOWARDS the west
-        # Negative v_component: Wind is blowing TOWARDS the south
-        # Positive v_component: Wind is blowing TOWARDS the north
-        try:
-            # Create latitude array (90 at top to -90 at bottom)
-            latitudes = np.linspace(90, -90, self.map_height)
-            
-            # Initialize wind components
-            self.u = np.zeros((self.map_height, self.map_width))
-            self.v = np.zeros((self.map_height, self.map_width))
-            
-            # For each row (latitude band)
-            for y in range(self.map_height):
-                lat = latitudes[y]
-                lat_rad = np.deg2rad(lat)
-                
-                # Base speed scaling with latitude
-                speed_scale = np.cos(lat_rad)
-                
-                # Northern Hemisphere
-                if lat > 60:  # Polar cell (60°N to 90°N)
-                    angle_factor = (lat - 60) / 30  # 1 at 90°N, 0 at 60°N
-                    u_component = -30.0 * speed_scale * angle_factor        # Increased from 15.0
-                    v_component = -24.0 * speed_scale * (1 - angle_factor) # Increased from -12.0
-                    
-                elif lat > 30:  # Ferrel cell (30°N to 60°N)
-                    angle_factor = (lat - 30.01) / 30.01  # 1 at 60°N, 0 at 30°N
-                    u_component = 50.0 * speed_scale * (1 - angle_factor) # Increased from -25.0
-                    v_component = 24.0 * speed_scale * angle_factor        # Increased from 12.0
-                    
-                elif lat > 0:  # Hadley cell (0° to 30°N)
-                    angle_factor = lat / 30  # 1 at 30°N, 0 at equator
-                    u_component = -30.0 * speed_scale * (1 - angle_factor)  # Increased from 15.0
-                    v_component = -24.0 * speed_scale * angle_factor       # Increased from -12.0
-                    
-                # Southern Hemisphere (mirror of northern patterns)
-                elif lat > -30:  # Hadley cell (0° to 30°S)
-                    angle_factor = -lat / 30  # 1 at 30°S, 0 at equator
-                    u_component = -30.0 * speed_scale * (1 - angle_factor)  # Increased from 15.0
-                    v_component = 24.0 * speed_scale * angle_factor        # Increased from 12.0
-                    
-                elif lat > -60:  # Ferrel cell (30°S to 60°S)
-                    angle_factor = (-lat - 30) / 30  # 1 at 60°S, 0 at 30°S
-                    u_component = 50.0 * speed_scale * (1 - angle_factor) # Increased from -25.0
-                    v_component = -24.0 * speed_scale * angle_factor       # Increased from -12.0
-                    
-                else:  # Polar cell (60°S to 90°S)
-                    angle_factor = (-lat - 60) / 30  # 1 at 90°S, 0 at 60°S
-                    u_component = -30.0 * speed_scale * angle_factor        # Increased from 15.0
-                    v_component = 24.0 * speed_scale * (1 - angle_factor)  # Increased from 12.0
-                
-                # Apply components to the wind field
-                self.u[y, :] = u_component
-                self.v[y, :] = v_component
-
-        except Exception as e:
-            print(f"Error in global circulation initialization: {e}")
-            traceback.print_exc()
-
-
+        """Delegate to wind module"""
+        self.wind_system.initialize_global_circulation()
+        
     def calculate_wind(self):
-        """Calculate wind patterns with terrain effects using vectorized operations"""
-        # Calculate terrain gradients (vectorized)
-        terrain_gradient_y, terrain_gradient_x = np.gradient(self.elevation)
+        """Delegate to wind module"""
+        self.wind_system.calculate()
         
-        # Calculate terrain slope magnitude (vectorized)
-        terrain_slope = np.sqrt(terrain_gradient_x**2 + terrain_gradient_y**2)
+    def update_wind(self):
+        """Delegate to wind module"""
+        self.wind_system.update()
         
-        # Calculate wind direction (vectorized)
-        wind_magnitude = np.sqrt(self.u**2 + self.v**2)
-        wind_direction_x = np.divide(self.u, wind_magnitude, out=np.zeros_like(self.u), where=wind_magnitude!=0)
-        wind_direction_y = np.divide(self.v, wind_magnitude, out=np.zeros_like(self.v), where=wind_magnitude!=0)
-        
-        # Calculate dot product between wind direction and terrain gradient (vectorized)
-        upslope_factor = (wind_direction_x * terrain_gradient_x + wind_direction_y * terrain_gradient_y)
-        
-        # Calculate mountain blocking effect (vectorized)
-        mountain_height_threshold = 1000  # meters
-        mountain_factor = np.clip((self.elevation - mountain_height_threshold) / 1000, 0, 1)
-        
-        # Calculate blocking strength (vectorized)
-        # Strong blocking when wind goes upslope on steep terrain
-        positive_upslope = np.clip(upslope_factor, 0, None)
-        blocking_strength = positive_upslope * terrain_slope * mountain_factor
-        blocking_strength = np.clip(blocking_strength, 0, 0.9)
-        
-        # Apply mountain blocking to wind (vectorized)
-        wind_reduction = 1.0 - blocking_strength
-        # Only apply reduction over land
-        is_land = self.elevation > 0
-        self.u = np.where(is_land, self.u * wind_reduction, self.u)
-        self.v = np.where(is_land, self.v * wind_reduction, self.v)
-        
-        # Apply terrain channeling effects (vectorized)
-        # Wind tends to follow valleys
-        valley_mask = (self.elevation > 0) & (self.elevation < mountain_height_threshold)
-        if np.any(valley_mask):
-            # Calculate valley direction (perpendicular to slope) (vectorized)
-            valley_direction_x = -terrain_gradient_y
-            valley_direction_y = terrain_gradient_x
-            
-            # Normalize valley direction vectors (vectorized)
-            valley_magnitude = np.sqrt(valley_direction_x**2 + valley_direction_y**2)
-            valley_direction_x = np.divide(valley_direction_x, valley_magnitude, 
-                                          out=np.zeros_like(valley_direction_x), where=valley_magnitude!=0)
-            valley_direction_y = np.divide(valley_direction_y, valley_magnitude, 
-                                          out=np.zeros_like(valley_direction_y), where=valley_magnitude!=0)
-            
-            # Calculate channeling effect (vectorized)
-            channeling_strength = terrain_slope * 0.5
-            channeling_strength = np.clip(channeling_strength, 0, 0.5)
-            
-            # Apply channeling only in valley areas (vectorized)
-            channeling_mask = valley_mask & (channeling_strength > 0.1)
-            if np.any(channeling_mask):
-                self.u[channeling_mask] = ((1 - channeling_strength[channeling_mask]) * self.u[channeling_mask] + 
-                                          channeling_strength[channeling_mask] * valley_direction_x[channeling_mask] * wind_magnitude[channeling_mask])
-                self.v[channeling_mask] = ((1 - channeling_strength[channeling_mask]) * self.v[channeling_mask] + 
-                                          channeling_strength[channeling_mask] * valley_direction_y[channeling_mask] * wind_magnitude[channeling_mask])
-
+    def calculate_wind_direction(self, u, v):
+        """Delegate to wind module"""
+        return self.wind_system.calculate_direction(u, v)
 
     def update_zoom_view(self, event):
         """Update zoom dialog with magnified view around mouse cursor"""
@@ -2106,10 +1997,6 @@ class SimulationApp:
             print(f"Error in elevation mapping: {e}")
             return np.zeros((self.map_height, self.map_width, 3), dtype=np.uint8)
 
-    def calculate_wind_direction(self, u, v):
-        """Calculate wind direction in degrees (meteorological convention)"""
-        return (270 - np.rad2deg(np.arctan2(v, u))) % 360
-        
     def calculate_cloud_cover(self):
         """Calculate cloud cover based on humidity and temperature"""
         try:
@@ -2321,124 +2208,6 @@ class SimulationApp:
             
         except Exception as e:
             print(f"Error updating humidity: {e}")
-            traceback.print_exc()
-
-    def update_wind(self):
-        """Update wind speed and direction"""
-        try:
-            # Initialize arrays if they don't exist
-            if not hasattr(self, '_u_geo') or self._u_geo is None:
-                self._u_geo = np.zeros_like(self.u, dtype=np.float32)
-                self._v_geo = np.zeros_like(self.v, dtype=np.float32)
-            
-            if not hasattr(self, '_u_new') or self._u_new is None:
-                self._u_new = np.zeros_like(self.u, dtype=np.float32)
-                self._v_new = np.zeros_like(self.v, dtype=np.float32)
-                
-            # --- PRESSURE GRADIENT FORCE ---
-            # Use numpy's gradient function directly with mode='wrap' for proper handling
-            dp_dy, dp_dx = np.gradient(self.pressure, 
-                                      self.grid_spacing_y, self.grid_spacing_x,
-                                      edge_order=2)  # Higher order accuracy
-            
-            # --- CORIOLIS PARAMETER ---
-            # Calculate Coriolis parameter (vectorized)
-            latitudes_rad = np.deg2rad(self.latitude)
-            f = 2 * self.Omega * np.sin(latitudes_rad)
-            
-            # --- GEOSTROPHIC WIND ---
-            rho = 1.2  # air density (kg/m³)
-            f_mask = np.abs(f) > 1e-10
-            
-            # Pre-allocate output arrays (single precision for performance)
-            if hasattr(self, '_u_geo') and self._u_geo.shape == self.u.shape:
-                u_geo = self._u_geo
-                v_geo = self._v_geo
-                u_geo.fill(0)
-                v_geo.fill(0)
-            else:
-                u_geo = np.zeros_like(self.u, dtype=np.float32)
-                v_geo = np.zeros_like(self.v, dtype=np.float32)
-                self._u_geo = u_geo
-                self._v_geo = v_geo
-            
-            # Calculate only where f is not near zero (vectorized operation)
-            rho_f = rho * f[f_mask]
-            u_geo[f_mask] = -1.0 / rho_f * dp_dy[f_mask]
-            v_geo[f_mask] = 1.0 / rho_f * dp_dx[f_mask]
-            
-            # --- THERMAL WIND ---
-            # Calculate temperature gradients
-            dT_dy, dT_dx = np.gradient(self.temperature_celsius, 
-                                      self.grid_spacing_y, self.grid_spacing_x)
-            
-            # Add thermal wind component (vectorized)
-            thermal_factor = 0.003
-            u_thermal = thermal_factor * dT_dy
-            v_thermal = -thermal_factor * dT_dx
-            
-            # --- CLOUD-INDUCED WIND EFFECTS ---
-            if hasattr(self, 'cloud_cover'):
-                # Calculate cloud gradients
-                dC_dy, dC_dx = np.gradient(self.cloud_cover, 
-                                         self.grid_spacing_y, self.grid_spacing_x)
-                
-                # Cloud-induced flows (vectorized)
-                cloud_factor = 0.05
-                u_thermal -= cloud_factor * dC_dx  # Flow toward higher cloud concentration
-                v_thermal -= cloud_factor * dC_dy
-            
-            # --- NEAR-EQUATOR HANDLING ---
-            # Single calculation for equator band
-            equator_band = np.abs(self.latitude) < 5.0
-            if np.any(equator_band):
-                gradient_factor = 5e-7
-                # Use where to modify only equator band values
-                u_geo = np.where(equator_band, -gradient_factor * dp_dx, u_geo)
-                v_geo = np.where(equator_band, -gradient_factor * dp_dy, v_geo)
-            
-            # --- SURFACE FRICTION EFFECTS ---
-            is_land = self.elevation > 0
-            friction_factor = np.where(is_land, 0.4, 0.2)  # Higher friction over land
-            
-            # Compute final wind (vectorized with in-place operations)
-            # Reduced inertia factor for more dynamic response
-            inertia = 0.75
-            
-            # Total wind components (reuse arrays where possible)
-            if not hasattr(self, '_u_new') or self._u_new.shape != self.u.shape:
-                self._u_new = np.zeros_like(self.u, dtype=np.float32)
-                self._v_new = np.zeros_like(self.v, dtype=np.float32)
-            
-            # Calculate new winds with vectorized operations
-            np.multiply(inertia, self.u, out=self._u_new)
-            np.multiply(inertia, self.v, out=self._v_new)
-            
-            np.add(self._u_new, (1 - inertia) * u_geo, out=self._u_new)
-            np.add(self._v_new, (1 - inertia) * v_geo, out=self._v_new)
-            
-            np.add(self._u_new, u_thermal, out=self._u_new)
-            np.add(self._v_new, v_thermal, out=self._v_new)
-            
-            # Apply friction (vectorized)
-            np.multiply(self._u_new, 1 - friction_factor, out=self._u_new)
-            np.multiply(self._v_new, 1 - friction_factor, out=self._v_new)
-            
-            # Apply wind speed limits (vectorized)
-            wind_speed = np.sqrt(self._u_new**2 + self._v_new**2)
-            max_wind = 50.0  # m/s
-            scaling = np.where(wind_speed > max_wind, max_wind / wind_speed, 1.0)
-            
-            # Scale wind components
-            np.multiply(self._u_new, scaling, out=self._u_new)
-            np.multiply(self._v_new, scaling, out=self._v_new)
-            
-            # Update wind fields
-            self.u, self._u_new = self._u_new, self.u  # Swap references to avoid allocation
-            self.v, self._v_new = self._v_new, self.v
-            
-        except Exception as e:
-            print(f"Error updating wind: {e}")
             traceback.print_exc()
 
     def map_precipitation_to_color(self, precipitation_data):
