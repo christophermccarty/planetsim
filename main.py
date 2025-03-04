@@ -115,7 +115,7 @@ class SimulationApp:
             self.total_radiative_forcing = self.radiative_forcing_co2 + self.radiative_forcing_ch4 + self.radiative_forcing_n2o
             
             # Multiprocessing setup
-            self.num_processes = multiprocessing.cpu_count() - 16
+            self.num_processes = multiprocessing.cpu_count() - 20
             if self.num_processes < 1:
                 self.num_processes = 1
             print(f'Number of CPU cores available: {self.num_processes}')
@@ -940,18 +940,6 @@ class SimulationApp:
         grayscale = (grayscale * 255).astype(np.uint8)
         rgb_array = np.stack((grayscale,)*3, axis=-1)
         return rgb_array
-
-
-    def debug_elevation_point(self, x, y):
-        """Debug elevation and color assignment at a specific point"""
-        grayscale = (self.elevation_normalized * 255).astype(np.uint8)[y, x]
-        elev = self.elevation[y, x]
-        print(f"\nDebug at point ({x}, {y}):")
-        print(f"Grayscale value: {grayscale}")
-        print(f"Elevation: {elev:.2f}m")
-        print(f"Is ocean (elev <= 0): {elev <= 0}")
-        print(f"Should be land (grayscale > 113): {grayscale > 113}")
-        return grayscale, elev
 
 
     def map_altitude_to_color(self, elevation):
