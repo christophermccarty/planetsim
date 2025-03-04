@@ -14,6 +14,9 @@ from numba import jit, set_num_threads
 from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
 import psutil
 import traceback
+import gc
+from temperature import Temperature
+from pressure import Pressure
 
 from map_generation import MapGenerator
 
@@ -29,7 +32,7 @@ class SimulationApp:
             
             # Time and simulation variables
             self.time_step = 0
-            self.time_step_seconds = 180  # Reduced from 360 to 180 for better stability with new diffusion parameters
+            self.time_step_seconds = 60 * 30  # Simulation time step in seconds (30 minutes)
             self.Omega = 7.2921159e-5
             self.P0 = 101325
             self.desired_simulation_step_time = 0.1  # 0.1 seconds between simulation steps
@@ -143,8 +146,14 @@ class SimulationApp:
             # Initialize basic humidity field (will be updated later)
             self.humidity = np.full((self.map_height, self.map_width), 0.5, dtype=np.float32)
 
-            # Initialize temperature field
-            self.initialize_temperature()
+            # Initialize temperature array
+            self.temperature_celsius = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            
+            # Initialize temperature module
+            self.temperature = Temperature(self)
+
+            # Initialize temperature
+            self.temperature.initialize()
 
             # Initialize humidity
             self.initialize_humidity()
@@ -237,8 +246,15 @@ class SimulationApp:
             # Flag to track if ocean data is available and calculated successfully
             self.ocean_data_available = False
             
+            # Initialize pressure module
+            self.pressure_system = Pressure(self)
+            
+            # Initialize pressure
+            self.pressure_system.initialize()
+
         except Exception as e:
             print(f"Error in initialization: {e}")
+            traceback.print_exc()
 
     def setup_gui(self):
         # Configure the root window to prevent resizing
@@ -431,6 +447,9 @@ class SimulationApp:
         self.global_lacunarity = 2.0
         self.global_persistence = 0.5
 
+        # Initialize temperature
+        self.temperature.initialize()
+
         # Rest of the on_generate implementation...
         # (Continue with the elevation generation and temperature calculation code)
 
@@ -439,13 +458,14 @@ class SimulationApp:
         try:
             start_time = time.time()
             
+            # Increment time step
             self.time_step += 1
             
-            # Update simulations in logical order for better interaction
-            self.update_humidity()          # First update humidity (affects clouds and heat capacity)
-            self.update_temperature_land_ocean()  # Then temperature (affected by humidity/clouds)
-            self.update_ocean_temperature()  # Update ocean temps (uses updated surface temps)
-            self.update_pressure()          # Update pressure (affected by temperature)
+            # Update physics fields in proper order
+            self.update_humidity()           # Update humidity first (depends on prev. temperature)
+            self.temperature.update_land_ocean()      # Update temperatures (depends on humidity)
+            self.temperature.update_ocean()  # Update ocean temps (uses updated surface temps)
+            self.pressure_system.update()          # Update pressure (affected by temperature)
             self.update_wind()              # Finally update winds (affected by all others)
             
             # Clear the pressure image cache after updating pressure to force redraw
@@ -565,21 +585,25 @@ class SimulationApp:
         return self._reusable_array
 
     def calculate_water_density(self, temperature):
-        """Calculate water density based on temperature"""
-        reference_density = 1000  # kg/m³
-        thermal_expansion = 0.0002  # per degree C
-        temperature_difference = np.abs(temperature - 4)
-        return reference_density * (1 - thermal_expansion * temperature_difference)
+        """Delegate to temperature module"""
+        return self.temperature.calculate_water_density(temperature)
 
     def initialize_wind(self):
         """Initialize wind fields with small random perturbations."""
-        self.initialize_global_circulation()
+        # Initialize u and v components
+        self.u = np.zeros((self.map_height, self.map_width))
+        self.v = np.zeros((self.map_height, self.map_width))
         
+        # Now initialize circulation patterns
+        self.initialize_global_circulation()
 
     def initialize_ocean_currents(self):
         """Initialize ocean current components"""
-        self.ocean_u = np.zeros((self.map_height, self.map_width))
-        self.ocean_v = np.zeros((self.map_height, self.map_width))
+        # First make sure the arrays exist
+        if not hasattr(self, 'ocean_u') or self.ocean_u is None:
+            self.ocean_u = np.zeros((self.map_height, self.map_width))
+        if not hasattr(self, 'ocean_v') or self.ocean_v is None:
+            self.ocean_v = np.zeros((self.map_height, self.map_width))
         
         is_ocean = self.elevation <= 0
         
@@ -611,122 +635,20 @@ class SimulationApp:
                 self.ocean_v[lat, :] = -0.2 * np.sin(np.linspace(0, 2*np.pi, self.map_width))
             elif lat_deg < -5 and lat_deg > -25:
                 self.ocean_u[lat, :] = -0.4
-
-        # Apply temperature and density effects
-        T_gradient_y, T_gradient_x = np.gradient(self.temperature_celsius)
-        density_factor = 0.1
-        self.ocean_v += -density_factor * T_gradient_y * is_ocean
-        self.ocean_u += -density_factor * T_gradient_x * is_ocean
         
-        # Modify currents near continental boundaries
-        for y in range(1, self.map_height-1):
-            for x in range(1, self.map_width-1):
-                if is_ocean[y, x]:
-                    if not is_ocean[y-1:y+2, x-1:x+2].all():
-                        boundary_factor = 1.5
-                        self.ocean_u[y, x] *= boundary_factor
-                        self.ocean_v[y, x] *= boundary_factor
-        
-        # Apply masking and smoothing
-        self.ocean_u = np.where(is_ocean, self.ocean_u, 0)
-        self.ocean_v = np.where(is_ocean, self.ocean_v, 0)
-        self.ocean_u = gaussian_filter(self.ocean_u, sigma=1.0)
-        self.ocean_v = gaussian_filter(self.ocean_v, sigma=1.0)
+        # Apply land mask - no currents on land
+        self.ocean_u[~is_ocean] = 0
+        self.ocean_v[~is_ocean] = 0
 
     def update_ocean_temperature(self):
-        """Update ocean temperatures with depth layers using vectorized operations"""
-        # Ocean mask (vectorized)
-        is_ocean = self.elevation <= 0
-        
-        # Create or update ocean layer temperatures (vectorized approach)
-        if not hasattr(self, 'ocean_layers'):
-            # Initialize ocean layers with copies of surface temperature
-            # Using vectorized slice assignment
-            num_layers = 3
-            self.ocean_layers = np.zeros((num_layers, self.map_height, self.map_width))
-            for i in range(num_layers):
-                self.ocean_layers[i] = self.temperature_celsius.copy()
-        
-        # Calculate temperature gradients (vectorized)
-        dT_dy = np.gradient(self.temperature_celsius, axis=0) / self.grid_spacing_y
-        dT_dx = np.gradient(self.temperature_celsius, axis=1) / self.grid_spacing_x
-        
-        # Temperature advection (vectorized)
-        temperature_advection = -(self.ocean_u * dT_dx + self.ocean_v * dT_dy)
-        
-        # Vertical mixing between layers (vectorized)
-        layer_diffs = np.diff(self.ocean_layers, axis=0)
-        vertical_mixing_rate = 1e-5  # m²/s
-        heat_transfer = vertical_mixing_rate * layer_diffs
-        
-        # Update layer temperatures (vectorized)
-        # First layer (surface) gets effects from atmosphere
-        self.ocean_layers[0][is_ocean] += (temperature_advection[is_ocean] * self.time_step_seconds)
-        
-        # Update all layers with vertical mixing (vectorized)
-        for i in range(len(self.ocean_layers)-1):
-            self.ocean_layers[i] -= heat_transfer[i]
-            self.ocean_layers[i+1] += heat_transfer[i]
-        
-        # Update surface temperature from first ocean layer (vectorized)
-        self.temperature_celsius[is_ocean] = self.ocean_layers[0][is_ocean]
-        
-        # Clip ocean temperatures to realistic values (vectorized)
-        self.temperature_celsius[is_ocean] = np.clip(
-            self.temperature_celsius[is_ocean], 
-            -2,  # Minimum ocean temperature
-            30   # Maximum ocean temperature
-        )
-
-        # Track ocean heat content for diagnostics (IMPROVED)
-        try:
-            # Check if oceans exist and initialize energy_budget keys if needed
-            if np.any(is_ocean):
-                # Ensure these keys exist in energy_budget
-                if 'ocean_heat_content' not in self.energy_budget:
-                    self.energy_budget['ocean_heat_content'] = 0.0
-                    self.energy_budget['ocean_heat_change'] = 0.0
-                    self.energy_budget['ocean_flux'] = 0.0
-                    
-                # Calculate ocean heat content (simplified)
-                ocean_temps = self.temperature_celsius[is_ocean]
-                ocean_volume = np.sum(is_ocean) * self.grid_spacing_x * self.grid_spacing_y * 100  # Assume 100m depth
-                specific_heat_water = 4186  # J/(kg·K)
-                density_water = 1000  # kg/m³
-                
-                # Total heat content in Joules (using absolute temperature)
-                heat_content = np.mean(ocean_temps + 273.15) * ocean_volume * density_water * specific_heat_water
-                
-                # Calculate heat exchange with atmosphere (simplified)
-                # Only calculate if there are both land and ocean cells
-                if np.any(~is_ocean):
-                    air_sea_temp_diff = np.mean(self.temperature_celsius[is_ocean]) - np.mean(self.temperature_celsius[~is_ocean])
-                    heat_flux = air_sea_temp_diff * 20  # W/m² per degree difference (simplified)
-                else:
-                    heat_flux = 0.0
-                
-                # Calculate percent change safely
-                prev_heat = self.energy_budget['ocean_heat_content']
-                if prev_heat != 0:
-                    heat_change_pct = (heat_content - prev_heat) / abs(prev_heat) * 100
-                else:
-                    heat_change_pct = 0.0
-                
-                # Store updated values
-                self.energy_budget['ocean_heat_content'] = heat_content
-                self.energy_budget['ocean_heat_change'] = heat_change_pct
-                self.energy_budget['ocean_flux'] = heat_flux
-                
-                # Set flag to indicate ocean data is available
-                self.ocean_data_available = True
-                
-        except Exception as e:
-            print(f"Error calculating ocean diagnostics: {e}")
-            # Don't let diagnostics crash the main simulation
-            traceback.print_exc()  # Print the full traceback to help debugging
-            self.ocean_data_available = False
+        """Delegate to temperature module"""
+        self.temperature.update_ocean()
 
     def update_temperature_land_ocean(self):
+        """Delegate to temperature module"""
+        self.temperature.update_land_ocean()
+
+    def update_temperature_land_ocean_old(self):
         """
         Update temperature fields with improved greenhouse effect,
         including cloud effects and humidity coupling.
@@ -1074,312 +996,12 @@ class SimulationApp:
 
 
     def update_pressure(self):
-        """Update pressure based on temperature gradients, wind patterns and global circulation"""
-        try:
-            dt = self.time_step_seconds
-            P0 = 101325.0  # Standard sea-level pressure
-            
-            # Basic masks and elevation
-            if not hasattr(self, '_elevation_factor'):
-                # Pre-compute elevation-based factors once and cache
-                is_land = self.elevation > 0
-                max_height = 1000.0
-                limited_elevation = np.clip(self.elevation, 0, max_height)
-                self._elevation_factor = np.exp(-limited_elevation / 7400.0)
-                self._is_land = is_land
-                
-                # Initialize time-varying factors
-                self._time_varying_factor = 0.0
-                
-            # Update time-varying factor - adds periodic forcing to the system
-            self._time_varying_factor += 0.1 * dt
-            seasonal_factor = np.sin(self._time_varying_factor / 86400 * 2 * np.pi)  # Daily cycle
-            
-            # Calculate minimum pressure based on elevation (cached)
-            min_pressure = P0 * self._elevation_factor
-            
-            # --- TEMPERATURE-DRIVEN PRESSURE GRADIENTS ---
-            # Temperature has a strong effect on pressure (warm = low pressure, cold = high pressure)
-            T = self.temperature_celsius
-            
-            # Calculate pressure changes due to wind convergence/divergence with wrapping
-            # Create wrapped arrays for proper edge handling
-            u_wrapped = np.hstack((self.u[:, -1:], self.u, self.u[:, :1]))
-            v_wrapped = np.vstack((self.v[-1:, :], self.v, self.v[:1, :]))
-            
-            # Calculate pressure changes due to wind convergence/divergence with wrapping
-            du_dx = np.gradient(u_wrapped, axis=1) / self.grid_spacing_x
-            dv_dy = np.gradient(v_wrapped, axis=0) / self.grid_spacing_y
-            
-            # Remove the padding from gradient results
-            du_dx = du_dx[:, 1:-1]
-            dv_dy = dv_dy[1:-1, :]
-            
-            wind_divergence = du_dx + dv_dy
-            
-            # --- ENHANCED WIND-PRESSURE COUPLING ---
-            
-            # 1. Stronger wind-driven pressure changes to represent real weather dynamics
-            # Increased convergence factor to allow winds to have stronger effect on pressure
-            convergence_factor = 0.35  # Increased from 0.25
-            pressure_change_wind = -self.pressure * wind_divergence * dt * convergence_factor
-            
-            # 2. Vorticity-based pressure changes - key for cyclone formation
-            # Calculate relative vorticity with proper wrapping (curl of wind field)
-            # Create properly padded arrays with consistent dimensions
-            u_padded = np.pad(self.u, ((1, 1), (1, 1)), mode='wrap')
-            v_padded = np.pad(self.v, ((1, 1), (1, 1)), mode='wrap')
-            
-            # Calculate gradients in x and y directions
-            du_dy = (u_padded[2:, 1:-1] - u_padded[:-2, 1:-1]) / (2 * self.grid_spacing_y)
-            dv_dx = (v_padded[1:-1, 2:] - v_padded[1:-1, :-2]) / (2 * self.grid_spacing_x)
-            
-            # Now both arrays have the same shape as the original u and v
-            vorticity = dv_dx - du_dy
-            
-            # High positive vorticity (cyclonic) creates low pressure
-            # High negative vorticity (anticyclonic) creates high pressure
-            vorticity_factor = 0.3  # Increased from 0.2
-            pressure_change_vorticity = -vorticity_factor * vorticity * self.pressure * dt
-            
-            # 3. Apply baroclinic instability effects (interactions of temperature and pressure gradients)
-            # Calculate magnitude of horizontal temperature gradient
-            T_wrapped = np.vstack((T[-1:, :], T, T[:1, :]))
-            T_wrapped = np.hstack((T_wrapped[:, -1:], T_wrapped, T_wrapped[:, :1]))
-            
-            # Calculate horizontal temperature gradients
-            dT_dx = np.gradient(T_wrapped, axis=1)[1:-1, 1:-1] / self.grid_spacing_x
-            dT_dy = np.gradient(T_wrapped, axis=0)[1:-1, 1:-1] / self.grid_spacing_y
-            
-            # Temperature gradient magnitude
-            temp_gradient_mag = np.sqrt(dT_dx**2 + dT_dy**2)
-            
-            # Simplified baroclinic instability effect - stronger in areas with large temperature gradients
-            # and where winds are already strong (reinforcing developing systems)
-            wind_mag = np.sqrt(self.u**2 + self.v**2)
-            baroclinic_factor = 0.2  # Increased from 0.15
-            pressure_change_baroclinic = -baroclinic_factor * temp_gradient_mag * wind_mag * dt
-            
-            # Modulate the baroclinic effect with latitude - stronger in mid-latitudes where
-            # frontogenesis and cyclone development are most common
-            lat_rad = np.abs(np.radians(self.latitude))
-            midlat_enhancement = np.exp(-((lat_rad - np.radians(45)) / np.radians(25))**2)
-            pressure_change_baroclinic *= midlat_enhancement
-            
-            # 4. Enhanced temperature factor - still important for overall circulation
-            temperature_factor = 0.6  # Increased from 0.5
-            
-            # Cache global average temperature and update less frequently
-            if not hasattr(self, '_global_avg_temp') or not hasattr(self, '_temp_avg_counter'):
-                self._global_avg_temp = np.mean(T)
-                self._temp_avg_counter = 0
-            
-            self._temp_avg_counter += 1
-            if self._temp_avg_counter >= 10:  # Only update every 10 steps
-                self._global_avg_temp = np.mean(T)
-                self._temp_avg_counter = 0
-            
-            pressure_change_temp = -temperature_factor * (T - self._global_avg_temp) * dt
-            
-            # 5. Land-ocean thermal contrast - important for coastal weather
-            land_ocean_effect = 0.5 * self._land_ocean_factor * (1 - self._land_ocean_factor) * dt  # Increased from 0.4
-            pressure_change_land_ocean = land_ocean_effect * np.abs(np.gradient(T)[0] + np.gradient(T)[1])
-            
-            # 6. Background latitudinal pressure patterns - REDUCED influence to allow weather patterns
-            # to dominate more
-            lat_pressure_strength = 0.003  # Reduced from 0.005
-            pressure_change_lat = self._lat_pressure * lat_pressure_strength * dt
-            
-            # 7. Semi-permanent pressure systems - also reduced to allow more dynamism
-            persistent_system_strength = 0.01  # Keep at 0.01
-            pressure_change_persistent = self._persistent_systems * persistent_system_strength * dt
-            
-            # 8. Add time-varying oscillations with seasonal component
-            self._oscillation_phase += 0.015  # Increased from 0.01
-            if self._oscillation_phase > 2 * np.pi:
-                self._oscillation_phase -= 2 * np.pi
-                
-            oscillation_x = np.sin(2 * np.pi * self.longitude / 360 + self._oscillation_phase)
-            oscillation_y = np.sin(2 * np.pi * self.latitude / 180 + self._oscillation_phase)
-            # Add seasonal influence
-            oscillation = oscillation_x * oscillation_y * (1 + 0.5 * seasonal_factor)
-            
-            oscillation_factor = 0.4  # Increased from 0.3
-            pressure_change_oscillation = oscillation * oscillation_factor * dt
-            
-            # 9. Weather system persistence (memory effect) to simulate real weather patterns that
-            # develop and persist over time rather than rapidly changing
-            if not hasattr(self, '_pressure_anomaly'):
-                self._pressure_anomaly = np.zeros_like(self.pressure)
-            
-            # Current anomaly is difference from "climate" (the background pattern)
-            climate_pressure = P0 * np.ones_like(self.pressure)
-            climate_pressure += self._lat_pressure * 0.1  # Background climate pattern
-            current_anomaly = self.pressure - climate_pressure
-            
-            # Persistence factor - how much of the anomaly persists
-            # Reduce persistence to prevent systems from becoming too static
-            persistence_factor = 0.9  # Reduced from 0.95
-            self._pressure_anomaly = persistence_factor * self._pressure_anomaly + (1 - persistence_factor) * current_anomaly
-            
-            # Apply the persistent anomaly effect to create weather pattern memory
-            weather_persistence_strength = 0.25  # Increased from 0.2
-            pressure_change_persistence = weather_persistence_strength * self._pressure_anomaly * dt
-            
-            # 10. Combine all pressure changes with new weather dynamics
-            pressure_change = (pressure_change_wind + 
-                              pressure_change_temp + 
-                              pressure_change_lat + 
-                              pressure_change_vorticity +
-                              pressure_change_baroclinic +
-                              pressure_change_persistence +
-                              pressure_change_land_ocean +
-                              pressure_change_persistent +
-                              pressure_change_oscillation)
-            
-            # 11. More localized, weather-like atmospheric variability
-            # Use a combination of simulation time and a fixed seed for the random noise
-            # This creates variability while ensuring it's not totally chaotic
-            seed_value = int((time.time() * 1000 + self.time_step * 17) % 10000)
-            np.random.seed(seed_value)
-            
-            # Create two scales of noise: large-scale and small-scale
-            # Large-scale weather systems
-            base_noise_large = np.random.normal(0, 1.2, pressure_change.shape)  # Increased variance
-            large_scale_noise = np.zeros_like(base_noise_large)
-            gaussian_filter(base_noise_large, sigma=5.0, mode='wrap', output=large_scale_noise)
-            
-            # Smaller-scale disturbances
-            base_noise_small = np.random.normal(0, 1.0, pressure_change.shape)
-            small_scale_noise = np.zeros_like(base_noise_small)
-            gaussian_filter(base_noise_small, sigma=2.0, mode='wrap', output=small_scale_noise)
-            
-            # Third scale - very localized disturbances
-            base_noise_local = np.random.normal(0, 0.8, pressure_change.shape)
-            local_noise = np.zeros_like(base_noise_local)
-            gaussian_filter(base_noise_local, sigma=0.8, mode='wrap', output=local_noise)
-            
-            # Combined noise with more emphasis on large-scale patterns
-            noise = large_scale_noise * 1.2 + small_scale_noise * 0.7 + local_noise * 0.3
-            
-            # Scale noise to have more effect in areas with strong temperature gradients
-            # This simulates frontal disturbances
-            frontal_enhancement = 1.0 + 0.5 * temp_gradient_mag / np.max(temp_gradient_mag + 1e-10)
-            noise *= frontal_enhancement
-            
-            # Apply noise to pressure change with a stronger factor
-            pressure_change += noise * 2.0  # Increased noise influence
-            
-            # 12. Lighter smoothing to preserve weather features
-            if not hasattr(self, '_pressure_change_smooth'):
-                self._pressure_change_smooth = np.zeros_like(pressure_change)
-            
-            # Reduce smoothing to preserve more weather detail
-            gaussian_filter(pressure_change, sigma=0.6, mode='wrap', output=self._pressure_change_smooth)  # Reduced from 0.8
-            
-            # Apply pressure changes
-            self.pressure += self._pressure_change_smooth
-            
-            # 13. Ensure pressure stays within realistic bounds
-            # First handle land areas with elevation-based minimum pressure
-            self.pressure[self._is_land] = np.maximum(self.pressure[self._is_land], min_pressure[self._is_land])
-            
-            # For ocean areas, ensure more gradual pressure variation
-            is_ocean = ~self._is_land
-            
-            # Get latitude dependent factors for ocean
-            lat_rad = np.abs(np.radians(self.latitude))
-            
-            # Create references for ocean pressure constraints based on latitude bands
-            # These create smoother transitions between pressure zones in oceans
-            # Near equator (low pressure)
-            equator_band = np.exp(-(lat_rad / np.radians(15))**2)
-            # Near 30° N/S (high pressure)
-            subtropical_band = np.exp(-((lat_rad - np.radians(30)) / np.radians(15))**2)
-            # Near 60° N/S (low pressure)
-            subpolar_band = np.exp(-((lat_rad - np.radians(60)) / np.radians(15))**2)
-            # Near poles (high pressure)
-            polar_band = np.exp(-((lat_rad - np.radians(90)) / np.radians(20))**2)
-            
-            # Calculate reference pressure for each ocean point based on latitude
-            base_ocean_pressure = P0 * np.ones_like(self.pressure)
-            
-            # Apply latitude-based pressure modifications with reduced strength for oceans
-            ocean_pressure_range = 3000.0
-            base_ocean_pressure -= equator_band * 0.3 * ocean_pressure_range
-            base_ocean_pressure += subtropical_band * 0.4 * ocean_pressure_range
-            base_ocean_pressure -= subpolar_band * 0.3 * ocean_pressure_range
-            base_ocean_pressure += polar_band * 0.3 * ocean_pressure_range
-            
-            # Allow pressure to deviate from base ocean pressure by more, increasing dynamism
-            max_ocean_deviation = 3000.0  # Increased from 2500.0
-            ocean_pressure_min = base_ocean_pressure - max_ocean_deviation
-            ocean_pressure_max = base_ocean_pressure + max_ocean_deviation
-            
-            # Apply ocean-specific constraints before global clipping
-            self.pressure[is_ocean] = np.clip(
-                self.pressure[is_ocean],
-                ocean_pressure_min[is_ocean],
-                ocean_pressure_max[is_ocean]
-            )
-            
-            # Final global clipping
-            self.pressure = np.clip(self.pressure, 87000.0, 108600.0)
-            
-            # 14. Final smoothing - lighter to preserve weather features
-            if not hasattr(self, '_pressure_smooth'):
-                self._pressure_smooth = np.zeros_like(self.pressure)
-            
-            # Reduced final smoothing for more detail
-            gaussian_filter(self.pressure, sigma=0.5, mode='wrap', output=self._pressure_smooth)  # Reduced from 0.8
-            self.pressure[:] = self._pressure_smooth
-            
-        except Exception as e:
-            print(f"Error updating pressure: {e}")
-            traceback.print_exc()
+        """Delegate to pressure module"""
+        self.pressure_system.update()
 
     def _add_pressure_system(self, field, lon_center, lat_center, radius, strength):
-        """Add a pressure system (high or low) to a field at the specified location using vectorized operations"""
-        # Convert longitude to 0-360 range if negative
-        if lon_center < 0:
-            lon_center += 360
-        
-        # Get grid longitudes and latitudes
-        lon = self.longitude
-        lat = self.latitude
-        
-        # Convert longitudes to match center's range for proper distance calculation
-        # (e.g., if center is at 190°, we want points at -170° to be considered close)
-        lon_adjusted = lon.copy()
-        if lon_center > 180:
-            # If center is in 180-360 range, adjust negative longitudes
-            lon_adjusted[lon < 0] += 360
-        elif lon_center < 0:
-            # If center is negative, adjust positive longitudes > 180
-            lon_center += 360
-            lon_adjusted[lon > 180] -= 360
-        
-        # Convert to radians for distance calculation
-        lon1, lat1 = np.radians(lon_adjusted), np.radians(lat)
-        lon2, lat2 = np.radians(lon_center), np.radians(lat_center)
-        
-        # Calculate distance components using broadcasting
-        dlon = lon2 - lon1
-        dlat = lat2 - lat1
-        
-        # Haversine formula (optimized for vectorized operations)
-        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-        c = 2 * np.arcsin(np.sqrt(a))
-        distance = 6371 * c  # Earth radius in km
-        
-        # Apply gaussian decay based on distance (vectorized)
-        # Only modify points within the specified distance to save computation
-        # Create a binary mask for points close enough to consider
-        mask = distance < radius * 2
-        
-        # Apply the effect only to relevant points
-        field[mask] += strength * np.exp(-(distance[mask]/radius)**2)
-
+        """Delegate to pressure module"""
+        return self.pressure_system._add_pressure_system(field, lon_center, lat_center, radius, strength)
 
     def draw_wind_vectors(self):
         """Draw wind vectors at specific latitudes"""
@@ -1642,155 +1264,12 @@ class SimulationApp:
 
 
     def initialize_temperature(self):
-        """Initialize temperature field with improved baseline for real-world values, including greenhouse effect."""
-        # Constants
-        S0 = 1361  # Solar constant in W/m²
-        albedo = 0.3  # Earth's average albedo
-        sigma = 5.670374419e-8  # Stefan-Boltzmann constant
-        lapse_rate = 6.5  # K per km
-        humidity_effect_coefficient = 0.1  # K per unit humidity
-
-        # Calculate effective temperature
-        S_avg = S0 / 4
-        cos_phi = np.clip(np.cos(self.latitudes_rad), 0, None)
-        S_lat = S_avg * cos_phi
-        T_eff = (((1 - albedo) * S_lat) / sigma) ** 0.25
-
-        # Calculate greenhouse temperature adjustment
-        climate_sensitivity = 2.0  # K per W/m²
-        greenhouse_temperature_adjustment = climate_sensitivity * self.total_radiative_forcing
-
-        # Calculate humidity adjustment
-        humidity_effect_adjustment = humidity_effect_coefficient * self.humidity
-
-        # Total surface temperature
-        T_surface = T_eff + greenhouse_temperature_adjustment + humidity_effect_adjustment
-
-        # Convert to Celsius
-        self.temperature_celsius = T_surface - 273.15  # Convert Kelvin to Celsius
-
-        # Define baseline land temperature - HIGHER VALUE FOR LAND
-        baseline_land_temperature = 18.0  # °C at sea level (was 15.0)
-
-        # Apply lapse rate relative to baseline
-        is_land = self.elevation > 0
-        altitude_km = np.maximum(self.elevation, 0) / 1000.0
-        delta_T_altitude = -lapse_rate * altitude_km
-        self.temperature_celsius[is_land] = baseline_land_temperature + delta_T_altitude[is_land]
-
-        # Initialize ocean temperatures with latitude-based gradient
-        is_ocean = self.elevation <= 0
-        ocean_base_temp = 13.0  # Cooler baseline for oceans (was implicitly 20)
-        self.temperature_celsius[is_ocean] = np.clip(
-            ocean_base_temp - (np.abs(self.latitude[is_ocean]) / 90) * 35,  # Temperature decreases with latitude
-            -2,  # Minimum ocean temperature
-            28   # Maximum ocean temperature (was 30, reduced slightly)
-        )
-
-        # Apply seasonal cycle if desired
-        # If summer in Northern hemisphere, add temperature bias
-        # This creates expected asymmetry in land vs ocean temperatures
-        summer_north = True  # Whether it's summer in the North
-        if summer_north:
-            # Add temperature bonus to Northern hemisphere, penalty to Southern
-            hemisphere_adjustment = np.cos(np.deg2rad(self.latitude)) * 3.0  # 3°C adjustment
-            self.temperature_celsius += hemisphere_adjustment
-        
-        # Clip temperatures to realistic bounds
-        self.temperature_celsius = np.clip(self.temperature_celsius, -50.0, 50.0)
-
-        # Normalize temperature for visualization
-        self.temperature_normalized = self.normalize_data(self.temperature_celsius)
-
-        # Initialize pressure after temperature
-        self.initialize_pressure()
-
+        """Delegate to temperature module"""
+        self.temperature.initialize()
 
     def initialize_pressure(self):
-        """Initialize pressure field with standard pressure and elevation effects"""
-        try:
-            # Standard sea-level pressure in hPa converted to Pa
-            P0 = 101325.0  # 1013.25 hPa in Pa
-            
-            print("Initializing pressure...")
-            
-            # Initialize pressure array with standard pressure
-            self.pressure = np.full((self.map_height, self.map_width), P0, dtype=np.float64)
-            
-            # Apply elevation effects with limits
-            max_height = 2000.0  # Limit effective height for pressure conversion
-            limited_elevation = np.clip(self.elevation, 0, max_height)
-            elevation_factor = np.exp(-limited_elevation / 7400.0)
-            elevation_factor = np.clip(elevation_factor, 0.85, 1.0)  # Limit minimum pressure reduction
-            
-            self.pressure *= elevation_factor
-            
-            # Precompute latitude pressure patterns and persistent systems
-            # This avoids expensive calculations during each update_pressure call
-            print("Precomputing global pressure patterns...")
-            lat_rad = np.radians(self.latitude)
-            
-            # Create basic pressure pattern based on latitude
-            lat_pressure = np.zeros_like(self.latitude)
-            
-            # Subtropical high pressure regions (~30° N/S)
-            subtropical_high = 800.0 * np.exp(-((np.abs(lat_rad) - np.radians(30)) / np.radians(15))**2)
-            
-            # Subpolar low pressure regions (~60° N/S)
-            subpolar_low = -600.0 * np.exp(-((np.abs(lat_rad) - np.radians(60)) / np.radians(15))**2)
-            
-            # Polar high pressure
-            polar_high = 600.0 * np.exp(-((np.abs(lat_rad) - np.radians(90)) / np.radians(20))**2)
-            
-            # Equatorial low pressure
-            equatorial_low = -400.0 * np.exp(-(lat_rad / np.radians(10))**2)
-            
-            # Combine all latitude effects and cache
-            self._lat_pressure = subtropical_high + subpolar_low + polar_high + equatorial_low
-            
-            # Create persistent semi-permanent pressure systems
-            print("Creating persistent pressure systems...")
-            self._persistent_systems = np.zeros_like(self.latitude)
-            
-            # Example persistent systems (modify coordinates and strengths as needed)
-            # North Pacific (Aleutian) Low
-            lon_center, lat_center = 180, 55  # Coordinates in degrees
-            strength = -400.0  # Negative for low pressure
-            self._add_pressure_system(self._persistent_systems, lon_center, lat_center, 20, strength)
-            
-            # Siberian High
-            lon_center, lat_center = 100, 55  # Coordinates in degrees
-            strength = 500.0  # Positive for high pressure
-            self._add_pressure_system(self._persistent_systems, lon_center, lat_center, 25, strength)
-            
-            # South Pacific High
-            lon_center, lat_center = -120, -30  # Coordinates in degrees
-            strength = 350.0  # Positive for high pressure
-            self._add_pressure_system(self._persistent_systems, lon_center, lat_center, 20, strength)
-            
-            # Azores/Bermuda High
-            lon_center, lat_center = -40, 35  # Coordinates in degrees
-            strength = 450.0  # Positive for high pressure
-            self._add_pressure_system(self._persistent_systems, lon_center, lat_center, 18, strength)
-            
-            # Initialize land-ocean mask for pressure calculations
-            print("Creating land-ocean transition zones...")
-            land_ocean_mask = np.zeros_like(self.elevation)
-            land_ocean_mask[self.elevation > 0] = 1.0  # Land
-            # Smooth the mask to create coastal transition zones
-            gaussian_filter(land_ocean_mask, sigma=2.0, mode='wrap', output=land_ocean_mask)
-            self._land_ocean_factor = land_ocean_mask
-            
-            # Initialize oscillation phase
-            self._oscillation_phase = 0
-            
-            # Store normalized version for visualization
-            self.pressure_normalized = self.normalize_data(self.pressure)
-            print("Pressure initialization complete.")
-            
-        except Exception as e:
-            print(f"Error initializing pressure: {e}")
-            traceback.print_exc()
+        """Delegate to pressure module"""
+        self.pressure_system.initialize()
 
 
     def map_pressure_to_color(self, pressure_data):
@@ -2089,102 +1568,16 @@ class SimulationApp:
             self.visualization_thread.join(timeout=1.0)
 
     def calculate_greenhouse_effect(self, params):
-        """
-        Calculate greenhouse effect with more physically-based parameters.
-        Returns forcing in W/m²
-        """
-        # Base greenhouse gases forcing (W/m²)
-        # Values based on IPCC AR6 estimates
-        base_forcings = {
-            'co2': 5.35 * np.log(self.co2_concentration / 278),  # Pre-industrial CO2 was 278 ppm
-            'ch4': 0.036 * (np.sqrt(self.ch4_concentration) - np.sqrt(722)),  # Pre-industrial CH4 was 722 ppb
-            'n2o': 0.12 * (np.sqrt(self.n2o_concentration) - np.sqrt(270))   # Pre-industrial N2O was 270 ppb
-        }
-        
-        # Calculate water vapor contribution
-        # Water vapor accounts for about 60% of Earth's greenhouse effect
-        T_kelvin = self.temperature_celsius + 273.15
-        reference_temp = 288.15  # 15°C in Kelvin
-        
-        # Base water vapor effect (should be ~90 W/m² at 15°C)
-        base_water_vapor = 90.0
-        
-        # Calculate water vapor forcing with temperature dependence
-        # Avoid negative values by using exponential relationship
-        temp_factor = np.exp(0.07 * (np.mean(T_kelvin) - reference_temp))
-        water_vapor_forcing = base_water_vapor * temp_factor
-        
-        # Other greenhouse gases (ozone, CFCs, etc.)
-        other_ghg = 25.0
-        
-        # Calculate ocean absorption modifier
-        ocean_absorption = self.calculate_ocean_co2_absorption()
-        
-        # Total greenhouse forcing with ocean absorption
-        ghg_forcing = sum(base_forcings.values())  # CO2, CH4, N2O
-        total_forcing = ((ghg_forcing + water_vapor_forcing + other_ghg) * 
-                        params['greenhouse_strength'] * 
-                        (1.0 + ocean_absorption))  # Apply ocean absorption modifier
-        
-        # Store individual components for debugging
-        self.energy_budget.update({
-            'co2_forcing': base_forcings['co2'],
-            'ch4_forcing': base_forcings['ch4'],
-            'n2o_forcing': base_forcings['n2o'],
-            'water_vapor_forcing': water_vapor_forcing,
-            'other_ghg_forcing': other_ghg,
-            'ocean_absorption': ocean_absorption,
-            'total_greenhouse_forcing': total_forcing
-        })
-
-        return total_forcing
-
+        """Delegate to temperature module"""
+        return self.temperature.calculate_greenhouse_effect(params)
 
     def calculate_water_vapor_saturation(self, T):
-        """
-        Calculate water vapor saturation pressure using the Clausius-Clapeyron equation
-        T: Temperature in Celsius
-        Returns: Saturation vapor pressure in Pa
-        
-        Optimized with caching for repeated temperature calculations
-        """
-        # Initialize cache attributes if they don't exist
-        if not hasattr(self, '_saturation_vapor_cache') or not hasattr(self, '_temp_range_for_cache'):
-            self._saturation_vapor_cache = None
-            self._temp_range_for_cache = None
-        
-        # Check if we have a valid temperature range cache
-        if self._saturation_vapor_cache is None or self._temp_range_for_cache is None:
-            # Create cache with temperature range from -50°C to +50°C with 0.1°C steps
-            min_temp, max_temp = -50.0, 50.0
-            step = 0.1
-            self._temp_range_for_cache = np.arange(min_temp, max_temp + step, step, dtype=np.float32)
-            
-            # Constants for water vapor
-            L = 2.5e6  # Latent heat of vaporization (J/kg)
-            Rv = 461.5  # Gas constant for water vapor (J/(kg·K))
-            T0 = 273.15  # Reference temperature (K)
-            e0 = 611.0  # Reference vapor pressure (Pa)
-            
-            # Calculate once for all temperatures in range
-            T_kelvin = self._temp_range_for_cache + 273.15
-            self._saturation_vapor_cache = e0 * np.exp((L/Rv) * (1/T0 - 1/T_kelvin))
-        
-        # Use vectorized lookup by rounding temperatures to nearest 0.1°C
-        # and finding indices in the cached array
-        T_floored = np.round((np.clip(T, self._temp_range_for_cache[0], 
-                                      self._temp_range_for_cache[-1]) - 
-                             self._temp_range_for_cache[0]) / 0.1).astype(int)
-        
-        # Return values from cache using advanced indexing
-        return self._saturation_vapor_cache[T_floored]
-
+        """Delegate to temperature module"""
+        return self.temperature.calculate_water_vapor_saturation(T)
 
     def calculate_relative_humidity(self, vapor_pressure, T):
-        """Calculate relative humidity from vapor pressure and temperature"""
-        saturation_pressure = self.calculate_water_vapor_saturation(T)
-        return np.clip(vapor_pressure / saturation_pressure, 0, 1)
-
+        """Delegate to temperature module"""
+        return self.temperature.calculate_relative_humidity(vapor_pressure, T)
 
     def initialize_global_circulation(self):
         """Initialize wind patterns with realistic global circulation and wind belts"""
