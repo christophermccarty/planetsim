@@ -411,7 +411,7 @@ class Temperature:
         other_ghg = 25.0
         
         # Calculate ocean absorption modifier
-        ocean_absorption = self.sim.calculate_ocean_co2_absorption()
+        ocean_absorption = self.calculate_ocean_co2_absorption()
         
         # Total greenhouse forcing with ocean absorption
         ghg_forcing = sum(base_forcings.values())  # CO2, CH4, N2O
@@ -431,6 +431,43 @@ class Temperature:
         })
 
         return total_forcing
+
+    def calculate_ocean_co2_absorption(self):
+        """Calculate the amount of CO2 absorbed by oceans and impact on greenhouse effect"""
+        try:
+            # Get the ocean mask
+            ocean_mask = self.sim.elevation < 0
+            
+            # Get the ocean temperature in Celsius for calculations
+            ocean_temp_celsius = self.sim.temperature_celsius[ocean_mask]
+            
+            # Skip if no ocean
+            if not np.any(ocean_mask):
+                return 0
+            
+            # Calculate absorption based on temperature 
+            # Cold water absorbs more CO2 than warm water
+            # Normalized temperature (0-1 scale, 1 being coldest)
+            temp_norm = 1.0 - ocean_temp_celsius / 30  # Assuming ocean temps 0-30C
+            temp_norm = np.clip(temp_norm, 0, 1)
+            
+            # Absorption coefficient (0-1)
+            # This simplistic model assumes max absorption at coldest temps
+            absorption_coef = temp_norm
+            
+            # Calculate mean absorption across all oceans
+            mean_absorption = np.mean(absorption_coef)
+            
+            # Scale the greenhouse effect modification
+            # At optimal absorption (1.0), reduce greenhouse effect by up to 25%
+            greenhouse_modifier = -0.25 * mean_absorption
+            
+            return greenhouse_modifier
+        
+        except Exception as e:
+            print(f"Error in calculate_ocean_co2_absorption: {e}")
+            traceback.print_exc()
+            return 0
 
     def calculate_water_vapor_saturation(self, T):
         """
