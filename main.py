@@ -582,7 +582,6 @@ class SimulationApp:
             print(f"Error in update_mouse_over: {e}")
             # Don't reraise to prevent thread crashes
             
-    # [Implement the rest of the methods from the original code, adjusting them to use `self` instead of global variables.]
 
     def normalize_data(self, data):
         """Normalize data to range [0,1]"""
