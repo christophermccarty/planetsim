@@ -75,9 +75,11 @@ class Precipitation:
             is_ocean = self.sim.elevation <= 0
             is_land = ~is_ocean
             
-            # Calculate saturation vapor pressure (Clausius-Clapeyron)
+            # Calculate saturation vapor pressure at current temperature
             T = self.sim.temperature_celsius
-            saturation_vapor_pressure = self.sim.calculate_water_vapor_saturation(T)
+            
+            # Use the temperature module's method
+            saturation_vapor_pressure = self.sim.temperature.calculate_water_vapor_saturation(T)
             
             # Vectorized evaporation calculation
             evaporation_base_rate = np.full_like(self.humidity, 0.005, dtype=np.float32)  # Start with land rate
@@ -197,7 +199,7 @@ class Precipitation:
                 
             # Calculate saturation vapor pressure
             T = self.sim.temperature_celsius
-            saturation_vapor_pressure = self.sim.calculate_water_vapor_saturation(T)
+            saturation_vapor_pressure = self.sim.temperature.calculate_water_vapor_saturation(T)
             
             # Calculate actual vapor pressure and RH
             vapor_pressure = self.humidity * saturation_vapor_pressure

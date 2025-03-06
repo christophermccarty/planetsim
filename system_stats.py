@@ -128,7 +128,7 @@ class SystemStats:
             # Get predominant wind direction
             u_mean = np.mean(self.sim.u)
             v_mean = np.mean(self.sim.v)
-            mean_direction = self.sim.calculate_wind_direction(u_mean, v_mean)
+            mean_direction = self.sim.wind_system.calculate_direction(u_mean, v_mean)
             
             # Calculate wind vorticity (curl) - indicator of cyclonic/anticyclonic behavior
             dy = self.sim.grid_spacing_y

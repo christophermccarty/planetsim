@@ -48,7 +48,29 @@ class MapGenerator:
 
     @staticmethod
     def normalize_data(data):
-        return (data - data.min()) / (data.max() - data.min())
+        """Normalize data to range [0,1]"""
+        min_val = np.min(data)
+        max_val = np.max(data)
+        if max_val > min_val:
+            return (data - min_val) / (max_val - min_val)
+        return np.zeros_like(data)
+
+    @staticmethod
+    def calculate_laplacian(field):
+        """Calculate discrete Laplacian of a 2D field"""
+        laplacian = np.zeros_like(field)
+        
+        # Use vectorized operations for better performance
+        # Calculate second derivatives
+        laplacian[1:-1, 1:-1] = (
+            field[:-2, 1:-1] +  # up
+            field[2:, 1:-1] +   # down
+            field[1:-1, :-2] +  # left
+            field[1:-1, 2:] -   # right
+            4 * field[1:-1, 1:-1]  # center
+        )
+        
+        return laplacian
 
 def generate_noise_chunk(args):
     (

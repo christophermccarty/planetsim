@@ -11,6 +11,8 @@ import traceback
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from scipy.ndimage import gaussian_filter
+import pickle
+import random
 
 from temperature import Temperature
 from pressure import Pressure
@@ -181,14 +183,14 @@ class SimulationApp:
             self.wind_system.initialize()
 
             # Initialize ocean currents
-            self.initialize_ocean_currents()
+            self.temperature.initialize_ocean_currents()
 
             # Initialize threading event for visualization control
             self.visualization_active = threading.Event()
             self.visualization_active.set()  # Start in active state
 
             # Start visualization in separate thread
-            self.visualization_thread = threading.Thread(target=self.update_visualization_loop)
+            self.visualization_thread = threading.Thread(target=self.visualization.update_visualization_loop)
             self.visualization_thread.daemon = True
             self.visualization_thread.start()
 
@@ -197,7 +199,8 @@ class SimulationApp:
             self.root.after(100, self.simulate)
 
             # Trigger initial map update
-            self.update_map()
+            if hasattr(self, 'visualization'):
+                self.visualization.update_map()
             
             # Add this near the end of your __init__ method
             # Flag for ocean diagnostics
@@ -324,17 +327,17 @@ class SimulationApp:
 
         # Add radio buttons for each map layer horizontally
         tk.Radiobutton(checkbox_frame, text="Elevation", variable=self.selected_layer, value="Elevation",
-                    command=self.update_map).pack(side=tk.LEFT)
+                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
         tk.Radiobutton(checkbox_frame, text="Altitude", variable=self.selected_layer, value="Altitude", 
-                    command=self.update_map).pack(side=tk.LEFT)
+                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
         tk.Radiobutton(checkbox_frame, text="Temperature", variable=self.selected_layer, value="Temperature",
-                    command=self.update_map).pack(side=tk.LEFT)
+                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
         tk.Radiobutton(checkbox_frame, text="Wind", variable=self.selected_layer, value="Wind", 
-                    command=self.update_map).pack(side=tk.LEFT)
+                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
         tk.Radiobutton(checkbox_frame, text="Ocean Temperature", variable=self.selected_layer, value="Ocean Temperature",
-                    command=self.update_map).pack(side=tk.LEFT)
+                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
         tk.Radiobutton(checkbox_frame, text="Precipitation", variable=self.selected_layer, value="Precipitation",
-                    command=self.update_map).pack(side=tk.LEFT)
+                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
 
         # Add new radio button for pressure map
         tk.Radiobutton(
@@ -342,7 +345,7 @@ class SimulationApp:
             text="Pressure",
             variable=self.selected_layer,
             value="Pressure",
-            command=self.update_map
+            command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None
         ).pack(anchor=tk.W)
 
         # Label at the bottom to display the current values at the mouse position
@@ -377,7 +380,8 @@ class SimulationApp:
 
             # Reset to default view
             self.selected_layer.set("Elevation")
-            self.update_map()
+            if hasattr(self, 'visualization'):
+                self.visualization.update_map()
         except Exception as e:
             print(f"Error in on_new: {e}")
             traceback.print_exc()
@@ -584,199 +588,77 @@ class SimulationApp:
             
 
     def normalize_data(self, data):
-        """Normalize data to range [0,1]"""
-        min_val = np.min(data)
-        max_val = np.max(data)
-        if max_val > min_val:
-            return (data - min_val) / (max_val - min_val)
-        return np.zeros_like(data)
+        """Delegate to MapGenerator module"""
+        return MapGenerator.normalize_data(data)
 
     def calculate_laplacian(self, field):
-        """Calculate Laplacian of a 2D field using finite differences"""
-        laplacian = np.zeros_like(field)
-        
-        # Use vectorized operations for better performance
-        # Calculate second derivatives
-        laplacian[1:-1, 1:-1] = (
-            field[:-2, 1:-1] +  # up
-            field[2:, 1:-1] +   # down
-            field[1:-1, :-2] +  # left
-            field[1:-1, 2:] -   # right
-            4 * field[1:-1, 1:-1]  # center
-        )
-        
-        return laplacian
+        """Delegate to MapGenerator module"""
+        return MapGenerator.calculate_laplacian(field)
 
 
-    def initialize_ocean_currents(self):
-        """Initialize ocean current vectors"""
-        # Create arrays for currents
-        self.ocean_u = np.zeros((self.map_height, self.map_width))
-        self.ocean_v = np.zeros((self.map_height, self.map_width))
-        
-        # For initial currents, use a simple model based on Coriolis effect
-        # and temperature gradients
-        
-        # 1. Create a mask for ocean cells
-        ocean_mask = self.elevation < 0
-        
-        # Skip if no ocean
-        if not np.any(ocean_mask):
-            return
-        
-        # 2. Calculate temperature gradients
-        # Get temperature differences in x and y directions
-        # We'll use these as initial forcing for currents
-        temp_grad_y, temp_grad_x = np.gradient(self.temperature_celsius)
-        
-        # 3. Initialize currents based on temperature gradients and Coriolis
-        # In the northern hemisphere, Coriolis deflects to the right
-        # In the southern hemisphere, Coriolis deflects to the left
-        
-        # Create a y-coordinate array where 0 is at the equator
-        y_coords = np.linspace(-1, 1, self.map_height)[:, np.newaxis]
-        
-        # Calculate Coriolis parameter (varies with latitude)
-        coriolis = y_coords * 0.01  # simplified
-        
-        # Only set currents in ocean cells
-        # u-component (east-west)
-        self.ocean_u[ocean_mask] = -temp_grad_y[ocean_mask] * 2.0
-        
-        # v-component (north-south) 
-        self.ocean_v[ocean_mask] = temp_grad_x[ocean_mask] * 2.0
-        
-        # Apply Coriolis deflection
-        # A simplified approach - in reality this is more complex
-        coriolis_factor = 0.2
-        temp_u = self.ocean_u.copy()
-        
-        # Deflect currents based on Coriolis (u affects v, v affects u)
-        self.ocean_u[ocean_mask] -= coriolis[ocean_mask] * self.ocean_v[ocean_mask] * coriolis_factor
-        self.ocean_v[ocean_mask] += coriolis[ocean_mask] * temp_u[ocean_mask] * coriolis_factor
-        
-        # Normalize to reasonable values
-        # Find the maximum speed
-        max_speed = np.sqrt(np.maximum(self.ocean_u**2 + self.ocean_v**2, 1e-10))
-        max_speed_val = np.max(max_speed)
-        
-        if max_speed_val > 0:
-            # Scale to ensure max current is 1.0
-            scale_factor = 1.0 / max_speed_val
-            self.ocean_u *= scale_factor
-            self.ocean_v *= scale_factor
-
-    def update_map(self):
-        """Delegate to visualization module"""
-        if hasattr(self, 'visualization'):
-            self.visualization.update_map()
-
-    def draw_wind_vectors(self):
-        """Delegate to visualization module"""
-        if hasattr(self, 'visualization'):
-            self.visualization.draw_wind_vectors()
-            
-    def draw_current_arrows(self):
-        """Delegate to visualization module"""
-        if hasattr(self, 'visualization'):
-            self.visualization.draw_current_arrows()
-
-    def update_visualization_loop(self):
-        """Delegate to visualization module"""
-        if hasattr(self, 'visualization'):
-            self.visualization.update_visualization_loop()
-        else:
-            # If visualization module isn't available yet, just wait
-            while self.visualization_active.is_set():
-                time.sleep(0.1)
-
-    def map_to_grayscale(self, data):
-        """Delegate to visualization module"""
-        return self.visualization.map_to_grayscale(data)
-        
-    def map_altitude_to_color(self, elevation):
-        """Delegate to visualization module"""
-        return self.visualization.map_altitude_to_color(elevation)
-        
-    def map_temperature_to_color(self, temperature_data):
-        """Delegate to visualization module"""
-        return self.visualization.map_temperature_to_color(temperature_data)
-        
-    def map_ocean_temperature_to_color(self, data_normalized):
-        """Delegate to visualization module"""
-        return self.visualization.map_ocean_temperature_to_color(data_normalized)
-        
-    def map_pressure_to_color(self, pressure_data):
-        """Delegate to visualization module"""
-        return self.visualization.map_pressure_to_color(pressure_data)
-        
-    def map_precipitation_to_color(self, precipitation_data):
-        """Delegate to visualization module"""
-        return self.visualization.map_precipitation_to_color(precipitation_data)
-        
-    def map_clouds_to_color(self):
-        """Delegate to visualization module"""
-        return self.visualization.map_clouds_to_color()
-        
-    def map_elevation_to_color(self, elevation_data):
-        """Delegate to visualization module"""
-        return self.visualization.map_elevation_to_color(elevation_data)
-        
     def cleanup(self):
         """Clean up threads before closing"""
-        self.visualization_active.clear()  # Signal threads to stop
+        self.visualization_active.clear()
+        
         if hasattr(self, 'visualization_thread'):
             self.visualization_thread.join(timeout=1.0)
 
-    def calculate_water_vapor_saturation(self, T):
-        """Delegate to temperature module"""
-        return self.temperature.calculate_water_vapor_saturation(T)
-    
-        
-    def calculate_wind_direction(self, u, v):
-        """Delegate to wind module"""
-        return self.wind_system.calculate_direction(u, v)
-
-
     def update_zoom_view(self, event):
-        """Update zoom dialog with magnified view around mouse cursor"""
+        """Update the zoom window display when the user moves the mouse over the main map"""
         try:
-            # Get current mouse position
+            if not self.zoom_dialog or not hasattr(self, 'zoom_dialog') or not self.zoom_dialog.winfo_exists():
+                return
+                
+            # Get cursor position
             x, y = event.x, event.y
             
-            # Calculate zoom view boundaries
-            half_view = self.zoom_dialog.view_size // 2
-            x_start = max(0, x - half_view)
-            y_start = max(0, y - half_view)
-            x_end = min(self.map_width, x + half_view + 1)
-            y_end = min(self.map_height, y + half_view + 1)
+            # Calculate the zoom window dimensions
+            zoom_factor = self.zoom_dialog.zoom_factor
+            # Use the zoom dialog's canvas width and height instead of undefined attributes
+            zoom_canvas_width = self.zoom_dialog.canvas.winfo_width()
+            zoom_canvas_height = self.zoom_dialog.canvas.winfo_height()
+            half_width = int(zoom_canvas_width / (2 * zoom_factor))
+            half_height = int(zoom_canvas_height / (2 * zoom_factor))
             
-            # Get current layer data
-            if self.selected_layer.get() == "Elevation":
-                view_data = self.map_to_grayscale(self.elevation_normalized)[y_start:y_end, x_start:x_end]
-            elif self.selected_layer.get() == "Altitude":
-                view_data = self.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
-            elif self.selected_layer.get() == "Temperature":
-                view_data = self.map_temperature_to_color(self.temperature_celsius)[y_start:y_end, x_start:x_end]
-            elif self.selected_layer.get() == "Pressure":
-                view_data = self.map_pressure_to_color(self.pressure)[y_start:y_end, x_start:x_end]
-            elif self.selected_layer.get() == "Wind":
-                view_data = self.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
-            elif self.selected_layer.get() == "Ocean Temperature":
-                is_ocean = self.elevation <= 0
-                ocean_temp = np.copy(self.temperature_celsius)
-                ocean_temp[~is_ocean] = np.nan
-                ocean_temp_normalized = np.zeros_like(ocean_temp)
-                ocean_mask = ~np.isnan(ocean_temp)
-                if ocean_mask.any():
-                    ocean_temp_normalized[ocean_mask] = self.normalize_data(ocean_temp[ocean_mask])
-                view_data = self.map_ocean_temperature_to_color(ocean_temp_normalized)[y_start:y_end, x_start:x_end]
-            elif self.selected_layer.get() == "Precipitation":
-                view_data = self.map_precipitation_to_color(self.precipitation)[y_start:y_end, x_start:x_end]
+            # Calculate the region to extract, ensuring we don't go out of bounds
+            x_start = max(0, x - half_width)
+            x_end = min(self.map_width, x + half_width)
+            y_start = max(0, y - half_height)
+            y_end = min(self.map_height, y + half_height)
+            
+            # Extract the region from the appropriate data based on selected layer
+            layer = self.selected_layer.get()
+            
+            if layer == "Elevation (Grayscale)":
+                view_data = self.visualization.map_to_grayscale(self.elevation_normalized)[y_start:y_end, x_start:x_end]
+            elif layer == "Terrain":
+                view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
+            elif layer == "Temperature":
+                view_data = self.visualization.map_temperature_to_color(self.temperature_celsius)[y_start:y_end, x_start:x_end]
+            elif layer == "Pressure":
+                view_data = self.visualization.map_pressure_to_color(self.pressure)[y_start:y_end, x_start:x_end]
+            elif layer == "Rain Shadow":
+                view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
+            elif layer == "Biomes":
+                # Implement biome visualization using real biome data when available
+                # For now, just show terrain
+                if hasattr(self, 'biomes') and self.biomes is not None:
+                    # Implement biome color mapping when available
+                    view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
+                else:
+                    view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
+            elif layer == "Ocean Temperature":
+                # Normalize ocean temps to 0-1 range for better visualization
+                ocean_temp_normalized = self.normalize_data(self.ocean_temperature)
+                view_data = self.visualization.map_ocean_temperature_to_color(ocean_temp_normalized)[y_start:y_end, x_start:x_end]
+            elif layer == "Precipitation":
+                view_data = self.visualization.map_precipitation_to_color(self.precipitation)[y_start:y_end, x_start:x_end]
+            elif layer == "Ocean Currents":
+                # For ocean currents, still use elevation as background
+                view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
             else:
-                # Default to altitude map
-                print(f"Unknown Layer: {self.selected_layer.get()}")
-                view_data = self.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
+                # Default to terrain
+                view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
             
             # Create zoomed image
             img = Image.fromarray(view_data)
@@ -815,16 +697,16 @@ class SimulationApp:
             print(f"Current layer: {self.selected_layer.get()}")
 
 
-    def calculate_ocean_co2_absorption(self):
-        """Delegate to temperature module"""
-        return self.temperature.calculate_ocean_co2_absorption()
-
-
     def update_humidity(self):
-        """Delegate to precipitation module"""
+        """
+        Update precipitation system and synchronize humidity data with main simulation.
+        This method is maintained for compatibility with code that expects humidity,
+        precipitation, and cloud_cover attributes directly on the SimulationApp instance.
+        """
+        # Run the precipitation system update
         self.precipitation_system.update()
         
-        # Update simulation attributes to maintain compatibility
+        # Synchronize data between the precipitation system and main simulation attributes
         self.humidity = self.precipitation_system.humidity
         self.precipitation = self.precipitation_system.precipitation
         self.cloud_cover = self.precipitation_system.cloud_cover
