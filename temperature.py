@@ -520,6 +520,74 @@ class Temperature:
         return reference_density * (1 - thermal_expansion * temperature_difference)
 
     def calculate_relative_humidity(self, vapor_pressure, T):
-        """Calculate relative humidity from vapor pressure and temperature"""
-        saturation_pressure = self.calculate_water_vapor_saturation(T)
-        return np.clip(vapor_pressure / saturation_pressure, 0, 1) 
+        """
+        Calculate relative humidity from vapor pressure and temperature
+        Returns value from 0-1
+        """
+        return vapor_pressure / self.calculate_water_vapor_saturation(T)
+        
+    def initialize_ocean_currents(self):
+        """Initialize ocean current vectors"""
+        # 1. Create ocean mask
+        ocean_mask = self.sim.elevation <= 0
+        
+        # Skip if no ocean
+        if not np.any(ocean_mask):
+            return
+            
+        # Create arrays for u and v components if they don't exist or are None
+        if not hasattr(self.sim, 'ocean_u') or self.sim.ocean_u is None:
+            self.sim.ocean_u = np.zeros((self.sim.map_height, self.sim.map_width))
+        else:
+            self.sim.ocean_u.fill(0.0)
+            
+        if not hasattr(self.sim, 'ocean_v') or self.sim.ocean_v is None:
+            self.sim.ocean_v = np.zeros((self.sim.map_height, self.sim.map_width))
+        else:
+            self.sim.ocean_v.fill(0.0)
+        
+        # 2. Calculate temperature gradients
+        # Get temperature differences in x and y directions
+        # We'll use these as initial forcing for currents
+        temp_grad_y, temp_grad_x = np.gradient(self.sim.temperature_celsius)
+        
+        # 3. Initialize currents based on temperature gradients
+        # Only set currents in ocean cells
+        # u-component (east-west)
+        self.sim.ocean_u[ocean_mask] = -temp_grad_y[ocean_mask] * 2.0
+        
+        # v-component (north-south) 
+        self.sim.ocean_v[ocean_mask] = temp_grad_x[ocean_mask] * 2.0
+        
+        # 4. Apply a simple Coriolis-like effect based on latitude
+        # Create a latitude effect array
+        latitudes = np.linspace(-1, 1, self.sim.map_height)
+        lat_effect = np.zeros_like(self.sim.ocean_u)
+        
+        # Apply latitude effect to each row
+        for i, lat in enumerate(latitudes):
+            lat_effect[i, :] = lat * 0.01
+        
+        # Apply the effect only to ocean cells
+        ocean_indices = np.where(ocean_mask)
+        for i in range(len(ocean_indices[0])):
+            y, x = ocean_indices[0][i], ocean_indices[1][i]
+            coriolis_factor = lat_effect[y, x] * 0.2
+            
+            # Store original u value
+            temp_u = self.sim.ocean_u[y, x]
+            
+            # Apply Coriolis-like effect
+            self.sim.ocean_u[y, x] -= coriolis_factor * self.sim.ocean_v[y, x]
+            self.sim.ocean_v[y, x] += coriolis_factor * temp_u
+        
+        # 5. Normalize to reasonable values
+        # Find the maximum speed
+        max_speed = np.sqrt(np.maximum(self.sim.ocean_u**2 + self.sim.ocean_v**2, 1e-10))
+        max_speed_val = np.max(max_speed)
+        
+        if max_speed_val > 0:
+            # Scale to ensure max current is 1.0
+            scale_factor = 1.0 / max_speed_val
+            self.sim.ocean_u *= scale_factor
+            self.sim.ocean_v *= scale_factor 
