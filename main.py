@@ -585,16 +585,6 @@ class SimulationApp:
         except Exception as e:
             print(f"Error in update_mouse_over: {e}")
             # Don't reraise to prevent thread crashes
-            
-
-    def normalize_data(self, data):
-        """Delegate to MapGenerator module"""
-        return MapGenerator.normalize_data(data)
-
-    def calculate_laplacian(self, field):
-        """Delegate to MapGenerator module"""
-        return MapGenerator.calculate_laplacian(field)
-
 
     def cleanup(self):
         """Clean up threads before closing"""
@@ -649,7 +639,7 @@ class SimulationApp:
                     view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
             elif layer == "Ocean Temperature":
                 # Normalize ocean temps to 0-1 range for better visualization
-                ocean_temp_normalized = self.normalize_data(self.ocean_temperature)
+                ocean_temp_normalized = MapGenerator.normalize_data(self.ocean_temperature)
                 view_data = self.visualization.map_ocean_temperature_to_color(ocean_temp_normalized)[y_start:y_end, x_start:x_end]
             elif layer == "Precipitation":
                 view_data = self.visualization.map_precipitation_to_color(self.precipitation)[y_start:y_end, x_start:x_end]

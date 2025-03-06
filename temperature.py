@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.ndimage import gaussian_filter
 import traceback
+from scipy.ndimage import binary_dilation
+from map_generation import MapGenerator
 
 class Temperature:
     def __init__(self, sim):
@@ -78,8 +80,8 @@ class Temperature:
         # Clip temperatures to realistic bounds
         self.sim.temperature_celsius = np.clip(self.sim.temperature_celsius, -50.0, 50.0)
 
-        # Normalize temperature for visualization
-        self.sim.temperature_normalized = self.sim.normalize_data(self.sim.temperature_celsius)
+        # Calculate normalized temperature for visualization (0-1 range)
+        self.sim.temperature_normalized = MapGenerator.normalize_data(self.sim.temperature_celsius)
 
     def update_land_ocean(self):
         """
@@ -255,7 +257,6 @@ class Temperature:
             kernel[1, 1] = False
             
             # Find cells that are land but adjacent to ocean
-            from scipy.ndimage import binary_dilation
             coastal_land = is_land & binary_dilation(is_ocean, structure=kernel)
             
             # Find cells that are ocean but adjacent to land

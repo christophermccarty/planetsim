@@ -2,6 +2,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 import time
 import traceback
+from map_generation import MapGenerator
 
 class Pressure:
     def __init__(self, sim):
@@ -87,7 +88,7 @@ class Pressure:
             self._land_ocean_factor = land_ocean_mask
             
             # Store normalized version for visualization
-            self.sim.pressure_normalized = self.sim.normalize_data(self.sim.pressure)
+            self.sim.pressure_normalized = MapGenerator.normalize_data(self.sim.pressure)
             print("Pressure initialization complete.")
             
         except Exception as e:
