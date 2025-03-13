@@ -28,10 +28,21 @@ class SimulationApp:
     def __init__(self):
         """Initialize the simulation"""
         try:
+            # Create the root window first
+            self.root = tk.Tk()
+            self.root.title("Climate Simulation - Planet Sim")
+            
             # Initialize all variables
             self.map_size = 512
-            self.map_width = None  # Will be set when image is loaded
-            self.map_height = None # Will be set when image is loaded
+            self.map_width = self.map_size  # Set default width until image is loaded
+            self.map_height = self.map_size # Set default height until image is loaded
+            
+            # Variable to track the selected layer - this needs to exist before setup_gui
+            self.selected_layer = tk.StringVar(value="Elevation")
+            
+            # Mouse tracking
+            self.last_mouse_x = 0
+            self.last_mouse_y = 0
             
             # Time and simulation variables
             self.time_step = 0
@@ -57,7 +68,7 @@ class SimulationApp:
                 'humidity_transport': 0,
                 'temperature_history': []  # Initialize temperature history list
             }
-
+            
             # Adjustable climate parameters
             self.climate_params = {
                 'solar_constant': 1361,      # Solar constant (W/m²)
@@ -75,10 +86,6 @@ class SimulationApp:
                 'min_ocean_temp': -2.0        # Minimum ocean temperature
             }
             
-            # Mouse tracking
-            self.last_mouse_x = 0
-            self.last_mouse_y = 0
-            
             # Seeds
             self.seed = 4200
             self.elevation_seed = self.seed
@@ -89,21 +96,6 @@ class SimulationApp:
             self.global_lacunarity = 2.0
             self.global_persistence = 0.5
             
-            # Initialize arrays
-            self.altitude = None
-            self.elevation = None
-            self.elevation_normalized = None
-            self.temperature_celsius = None
-            self.previous_temperature_celsius = 0
-            self.temperature_normalized = None
-            self.pressure = None
-            self.pressure_normalized = None
-
-            self.u = None
-            self.v = None
-            self.ocean_u = None
-            self.ocean_v = None
-
             # Atmospheric parameters
             # Greenhouse gas concentrations
             # Values based on approximate current atmospheric concentrations
@@ -119,72 +111,73 @@ class SimulationApp:
             # Total Radiative Forcing from Greenhouse Gases
             self.total_radiative_forcing = self.radiative_forcing_co2 + self.radiative_forcing_ch4 + self.radiative_forcing_n2o
             
-            # Multiprocessing setup
-            self.num_processes = multiprocessing.cpu_count() - 20
-            if self.num_processes < 1:
-                self.num_processes = 1
-            print(f'Number of CPU cores available: {self.num_processes}')
+            # Setup GUI first
+            self.setup_gui()
             
-            # Create Tkinter window
-            self.root = tk.Tk()
-            self.root.title("Climate Simulation - Planet Sim")
-            
-            # Variable to track the selected layer
-            self.selected_layer = tk.StringVar(value="Wind")
-            
-            # Load initial data (this will set map dimensions)
-            # self.on_load("D:\\dev\\planetsim\\images\\1024x512_earth_8bit.png")
-            self.on_load("D:\dev\planetsim\images\GRAY_HR_SR_W_stretched.tif")
-            
-            # Initialize modular systems
+            # Initialize modules after GUI and data arrays are set up
+            self.system_stats = SystemStats(self)
             self.temperature = Temperature(self)
             self.pressure_system = Pressure(self)
             self.wind_system = Wind(self)
             self.precipitation_system = Precipitation(self)
-            self.system_stats = SystemStats(self)
             
-            # Setup GUI first
-            self.setup_gui()
-            
-            # Initialize visualization only after canvas is created in setup_gui
-            self.visualization = Visualization(self)
-
-            # Initialize coordinate arrays first
+            # Load initial data (this will set map dimensions)
+            try:
+                self.on_load("D:\dev\planetsim\images\GRAY_HR_SR_W_stretched.tif")
+                print("Successfully loaded terrain data")
+            except Exception as e:
+                print(f"Error loading terrain data: {e}")
+                # Initialize fallback empty arrays
+                self.elevation = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+                self.elevation_normalized = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+                self.altitude = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+                
+            # Initialize coordinate arrays
             latitudes = np.linspace(90, -90, self.map_height)
             longitudes = np.linspace(-180, 180, self.map_width)
             self.latitude, self.longitude = np.meshgrid(latitudes, longitudes, indexing='ij')
             self.latitudes_rad = np.deg2rad(self.latitude)
-
-            # Initialize basic humidity field (will be updated later)
-            self.humidity = np.full((self.map_height, self.map_width), 0.5, dtype=np.float32)
-
-            # Initialize temperature array
-            self.temperature_celsius = np.zeros((self.map_height, self.map_width), dtype=np.float32)
             
-            # Initialize temperature module
-            self.temperature.initialize()
-
-            # Initialize temperature
-            self.temperature.initialize()
+            # Initialize basic arrays if they don't already exist
+            if not hasattr(self, 'humidity') or self.humidity is None:
+                self.humidity = np.full((self.map_height, self.map_width), 0.5, dtype=np.float32)
+            if not hasattr(self, 'temperature_celsius') or self.temperature_celsius is None:
+                self.temperature_celsius = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            if not hasattr(self, 'pressure') or self.pressure is None:
+                self.pressure = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            if not hasattr(self, 'u') or self.u is None:
+                self.u = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            if not hasattr(self, 'v') or self.v is None:
+                self.v = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            if not hasattr(self, 'ocean_u') or self.ocean_u is None:
+                self.ocean_u = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            if not hasattr(self, 'ocean_v') or self.ocean_v is None:
+                self.ocean_v = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            if not hasattr(self, 'ocean_temperature') or self.ocean_temperature is None:
+                self.ocean_temperature = np.zeros((self.map_height, self.map_width), dtype=np.float32)
             
-            # Initialize pressure module
-            self.pressure_system.initialize()
+            # Initialize visualization only after canvas is created in setup_gui
+            self.visualization = Visualization(self)
             
-            # Initialize wind module
-            self.wind_system.initialize()
-
-            # Initialize humidity
-            self.precipitation_system.initialize()
-
-            # Initialize other attributes
-            self.humidity_effect_coefficient = 0.1
-
-            # Initialize wind via the wind system
-            self.wind_system.initialize()
-
-            # Initialize ocean currents
-            self.temperature.initialize_ocean_currents()
-
+            # Now bind events that require visualization
+            self.canvas.bind("<Motion>", self.visualization.update_zoom_view)
+            
+            # Initialize modules in the correct order with error handling
+            try:
+                print("Initializing temperature module...")
+                self.temperature.initialize()
+                print("Initializing pressure module...")
+                self.pressure_system.initialize()
+                print("Initializing wind module...")
+                self.wind_system.initialize()
+                print("Initializing precipitation module...")
+                self.precipitation_system.initialize()
+                print("Initializing ocean currents...")
+                self.temperature.initialize_ocean_currents()
+            except Exception as e:
+                print(f"Error during module initialization: {e}")
+                traceback.print_exc()
+                
             # Initialize threading event for visualization control
             self.visualization_active = threading.Event()
             self.visualization_active.set()  # Start in active state
@@ -195,19 +188,17 @@ class SimulationApp:
             self.visualization_thread.start()
 
             # Start simulation using Tkinter's after method instead of a thread
-            # This ensures all Tkinter interactions happen in the main thread
             self.root.after(100, self.simulate)
-
-            # Trigger initial map update
-            if hasattr(self, 'visualization'):
-                self.visualization.update_map()
             
-            # Add this near the end of your __init__ method
+            # Create simulation control flags
+            self.simulation_active = threading.Event()
+            self.simulation_active.set()
+            
+            # Initialize other attributes
+            self.humidity_effect_coefficient = 0.1
+
             # Flag for ocean diagnostics
             self.ocean_data_available = False
-            
-            # Remove duplicated initialization
-            # self.energy_budget = {}
             
             # Optimization: Precompute and cache temperature-dependent values
             self._temp_cache = {}
@@ -235,10 +226,6 @@ class SimulationApp:
             # Optimization: Arrays for cloud calculations
             self._relative_humidity = None
             self._cloud_coverage = None
-            
-            # Create a Tkinter root window - ALREADY CREATED ABOVE, DON'T CREATE A SECOND ONE
-            # self.root = tk.Tk()
-            # self.root.title("Climate Simulation")
             
             # Update the title of the existing window to be more descriptive
             self.root.title("Climate Simulation - Planet Sim")
@@ -281,91 +268,106 @@ class SimulationApp:
             self.simulation_running = False
 
         except Exception as e:
-            print(f"Error in initialization: {e}")
+            print(f"Critical error in initialization: {e}")
             traceback.print_exc()
+            try:
+                messagebox.showerror("Initialization Error", f"Failed to initialize application: {str(e)}\n\nSee console for details.")
+                # Attempt to clean up
+                if hasattr(self, 'root') and self.root:
+                    self.root.destroy()
+            except:
+                pass  # Just in case the messagebox itself fails
+            sys.exit(1)
 
     def setup_gui(self):
-        # Configure the root window to prevent resizing
-        self.root.resizable(False, False)
+        # Configure the root window to allow resizing
+        self.root.resizable(True, True)
         
-        # Calculate window dimensions
-        # Add buffer for UI elements: 60px for controls and 30px for mouse_over label
-        ui_buffer = 90
-        window_width = self.map_width
-        window_height = self.map_height + ui_buffer
-        
-        # Set window geometry
-        self.root.geometry(f'{window_width}x{window_height}')
-        
-        # Create the menu bar
-        menubar = tk.Menu(self.root)
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="New", command=self.on_new)
-        file_menu.add_command(label="Open", command=self.on_load)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
-        menubar.add_cascade(label="File", menu=file_menu)
-        self.root.config(menu=menubar)
-
-        # Create main frame
+        # Main frame to contain all controls
         main_frame = tk.Frame(self.root)
-        main_frame.pack(expand=False, fill=tk.BOTH)
-
-        # Initialize the canvas with exact map dimensions
-        self.canvas = tk.Canvas(main_frame, 
-                            width=self.map_width,
-                            height=self.map_height)
-        self.canvas.pack(expand=False)
-
-        # Frame for controls
-        control_frame = tk.Frame(self.root)
-        control_frame.pack(fill=tk.X)
+        main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Create a frame for radio buttons
-        checkbox_frame = tk.Frame(self.root)
-        checkbox_frame.pack(anchor='w')
-
-        # Add radio buttons for each map layer horizontally
-        tk.Radiobutton(checkbox_frame, text="Elevation", variable=self.selected_layer, value="Elevation",
-                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
-        tk.Radiobutton(checkbox_frame, text="Altitude", variable=self.selected_layer, value="Altitude", 
-                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
-        tk.Radiobutton(checkbox_frame, text="Temperature", variable=self.selected_layer, value="Temperature",
-                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
-        tk.Radiobutton(checkbox_frame, text="Wind", variable=self.selected_layer, value="Wind", 
-                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
-        tk.Radiobutton(checkbox_frame, text="Ocean Temperature", variable=self.selected_layer, value="Ocean Temperature",
-                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
-        tk.Radiobutton(checkbox_frame, text="Precipitation", variable=self.selected_layer, value="Precipitation",
-                    command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None).pack(side=tk.LEFT)
-
-        # Add new radio button for pressure map
-        tk.Radiobutton(
-            control_frame,
-            text="Pressure",
-            variable=self.selected_layer,
-            value="Pressure",
-            command=lambda: self.visualization.update_map() if hasattr(self, 'visualization') else None
-        ).pack(anchor=tk.W)
-
-        # Label at the bottom to display the current values at the mouse position
-        self.mouse_over_label = tk.Label(self.root, text="Pressure: --, Temperature: --, Wind Speed: --, Wind Direction: --")
-        self.mouse_over_label.pack(anchor="w")
-
-        # Bind the mouse motion event to the canvas
-        self.canvas.bind("<Motion>", self.update_mouse_over)
-
-        # Initialize zoom dialog
+        # Create control frame at top
+        control_frame = tk.Frame(main_frame)
+        control_frame.pack(side=tk.TOP, fill=tk.X)
+        
+        # Add buttons for file operations
+        button_frame = tk.Frame(control_frame)
+        button_frame.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        # File buttons
+        new_button = tk.Button(button_frame, text="New", command=self.on_new)
+        new_button.pack(side=tk.LEFT, padx=2)
+        
+        load_button = tk.Button(button_frame, text="Load", command=lambda: self.on_load(None))
+        load_button.pack(side=tk.LEFT, padx=2)
+        
+        # Layer selector
+        checkbox_frame = tk.Frame(control_frame)
+        checkbox_frame.pack(side=tk.LEFT, padx=10)
+        
+        # Make radiobuttons for layer selection
+        tk.Label(checkbox_frame, text="Layer:").pack(side=tk.LEFT)
+        
+        layers = [
+            "Elevation", "Temperature", "Pressure", "Wind", 
+            "Precipitation", "Ocean Temperature"
+        ]
+        
+        for layer in layers:
+            rb = tk.Radiobutton(checkbox_frame, text=layer, variable=self.selected_layer, value=layer,
+                          command=lambda layer=layer: self.on_layer_change(layer))
+            rb.pack(side=tk.LEFT)
+        
+        # Status label
+        self.status_label = tk.Label(control_frame, text="Ready", anchor=tk.W)
+        self.status_label.pack(side=tk.RIGHT, padx=5)
+        
+        # Create frame for visualization
+        self.visualization_frame = tk.Frame(main_frame)
+        self.visualization_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False)
+        
+        # Create canvas with fixed dimensions
+        canvas_width = self.map_width if self.map_width is not None else self.map_size
+        canvas_height = self.map_height if self.map_height is not None else self.map_size
+        
+        self.canvas = tk.Canvas(self.visualization_frame, bg='black', 
+                                width=canvas_width, height=canvas_height)
+        self.canvas.pack(fill=tk.NONE, expand=False)  # Don't allow canvas to resize
+        
+        # Create mouse-over info label
+        self.mouse_over_label = tk.Label(main_frame, text="Mouse over data will appear here", 
+                                       anchor=tk.W, justify=tk.LEFT)
+        self.mouse_over_label.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=3)
+        
+        # Create stats display frame
+        self.stats_frame = tk.Frame(main_frame, height=100)
+        self.stats_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Create zoom dialog
         self.zoom_dialog = ZoomDialog(self.root)
         self.zoom_dialog.withdraw()  # Hide initially
         
-        # Bind mouse events
-        self.canvas.bind("<Motion>", self.update_zoom_view)
+        # Bind mouse events that don't require visualization
         self.canvas.bind("<Leave>", lambda e: self.zoom_dialog.withdraw())
         self.canvas.bind("<Enter>", lambda e: self.zoom_dialog.deiconify())
-
+        
+        # Motion binding will be added after visualization is created
+        
         # Add cleanup on window close
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Set initial window size
+        self._resize_window_to_map()
+
+    def on_layer_change(self, layer):
+        """Handle layer change event"""
+        try:
+            if hasattr(self, 'visualization'):
+                self.visualization.update_map()
+        except Exception as e:
+            print(f"Error changing layer: {e}")
+            traceback.print_exc()
 
     def on_closing(self):
         """Handle window closing"""
@@ -392,6 +394,9 @@ class SimulationApp:
             try:
                 elevation_image = Image.open(file_path)
                 self.map_width, self.map_height = elevation_image.size
+                
+                # Resize window to match the new map dimensions
+                self._resize_window_to_map()
                 
                 # Calculate grid spacing
                 earth_circumference = 40075000  # meters
@@ -446,6 +451,27 @@ class SimulationApp:
                 print(f"Error with on_load: {e}")
                 raise e
 
+    def _resize_window_to_map(self):
+        """Resize the window and canvas to match the map dimensions"""
+        try:
+            if hasattr(self, 'canvas') and self.map_width is not None and self.map_height is not None:
+                # Configure canvas size explicitly
+                self.canvas.config(width=self.map_width, height=self.map_height)
+                
+                # Calculate window size with space for controls
+                window_width = self.map_width
+                window_height = self.map_height + 120  # Add space for controls
+                
+                # Set window size directly
+                self.root.geometry(f"{window_width}x{window_height}")
+                
+                # Configure grid weights to ensure canvas gets proper space
+                self.root.update_idletasks()
+                print(f"Resized window to {window_width}x{window_height} (map: {self.map_width}x{self.map_height})")
+        except Exception as e:
+            print(f"Error resizing window: {e}")
+            traceback.print_exc()
+
     def on_generate(self, elevation_data=None):
         # Cancel the previous simulation if running
         if hasattr(self, 'simulation_after_id'):
@@ -482,6 +508,9 @@ class SimulationApp:
         # Rest of the on_generate implementation...
         # (Continue with the elevation generation and temperature calculation code)
 
+        # Resize window to match map dimensions
+        self._resize_window_to_map()
+
     def simulate(self):
         """
         Main simulation loop - runs on its own thread.
@@ -496,7 +525,13 @@ class SimulationApp:
             self.time_step += 1
             
             # Update physics fields in proper order
-            self.update_humidity()           # Update humidity first (depends on prev. temperature)
+            self.precipitation_system.update()  # Update humidity first (depends on prev. temperature)
+            
+            # Synchronize humidity data with main simulation for compatibility
+            self.humidity = self.precipitation_system.humidity
+            self.precipitation = self.precipitation_system.precipitation
+            self.cloud_cover = self.precipitation_system.cloud_cover
+            
             self.temperature.update_land_ocean()      # Update temperatures (depends on humidity)
             self.temperature.update_ocean()  # Update ocean temps (uses updated surface temps)
             self.pressure_system.update()          # Update pressure (affected by temperature)
@@ -592,114 +627,6 @@ class SimulationApp:
         
         if hasattr(self, 'visualization_thread'):
             self.visualization_thread.join(timeout=1.0)
-
-    def update_zoom_view(self, event):
-        """Update the zoom window display when the user moves the mouse over the main map"""
-        try:
-            if not self.zoom_dialog or not hasattr(self, 'zoom_dialog') or not self.zoom_dialog.winfo_exists():
-                return
-                
-            # Get cursor position
-            x, y = event.x, event.y
-            
-            # Calculate the zoom window dimensions
-            zoom_factor = self.zoom_dialog.zoom_factor
-            # Use the zoom dialog's canvas width and height instead of undefined attributes
-            zoom_canvas_width = self.zoom_dialog.canvas.winfo_width()
-            zoom_canvas_height = self.zoom_dialog.canvas.winfo_height()
-            half_width = int(zoom_canvas_width / (2 * zoom_factor))
-            half_height = int(zoom_canvas_height / (2 * zoom_factor))
-            
-            # Calculate the region to extract, ensuring we don't go out of bounds
-            x_start = max(0, x - half_width)
-            x_end = min(self.map_width, x + half_width)
-            y_start = max(0, y - half_height)
-            y_end = min(self.map_height, y + half_height)
-            
-            # Extract the region from the appropriate data based on selected layer
-            layer = self.selected_layer.get()
-            
-            if layer == "Elevation (Grayscale)":
-                view_data = self.visualization.map_to_grayscale(self.elevation_normalized)[y_start:y_end, x_start:x_end]
-            elif layer == "Terrain":
-                view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
-            elif layer == "Temperature":
-                view_data = self.visualization.map_temperature_to_color(self.temperature_celsius)[y_start:y_end, x_start:x_end]
-            elif layer == "Pressure":
-                view_data = self.visualization.map_pressure_to_color(self.pressure)[y_start:y_end, x_start:x_end]
-            elif layer == "Rain Shadow":
-                view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
-            elif layer == "Biomes":
-                # Implement biome visualization using real biome data when available
-                # For now, just show terrain
-                if hasattr(self, 'biomes') and self.biomes is not None:
-                    # Implement biome color mapping when available
-                    view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
-                else:
-                    view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
-            elif layer == "Ocean Temperature":
-                # Normalize ocean temps to 0-1 range for better visualization
-                ocean_temp_normalized = MapGenerator.normalize_data(self.ocean_temperature)
-                view_data = self.visualization.map_ocean_temperature_to_color(ocean_temp_normalized)[y_start:y_end, x_start:x_end]
-            elif layer == "Precipitation":
-                view_data = self.visualization.map_precipitation_to_color(self.precipitation)[y_start:y_end, x_start:x_end]
-            elif layer == "Ocean Currents":
-                # For ocean currents, still use elevation as background
-                view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
-            else:
-                # Default to terrain
-                view_data = self.visualization.map_altitude_to_color(self.elevation)[y_start:y_end, x_start:x_end]
-            
-            # Create zoomed image
-            img = Image.fromarray(view_data)
-            img = img.resize((self.zoom_dialog.view_size * self.zoom_dialog.zoom_factor,) * 2, 
-                            Image.Resampling.NEAREST)
-            
-            # Convert to PhotoImage
-            photo = ImageTk.PhotoImage(img)
-            self.zoom_dialog.canvas.delete("image")  # Only delete image, keep crosshair
-            self.zoom_dialog.canvas.create_image(0, 0, anchor="nw", image=photo, tags="image")
-            self.zoom_dialog.canvas.tag_raise('crosshair')  # Ensure crosshair stays on top
-            self.zoom_dialog.image = photo  # Keep reference
-            
-            # Position dialog near cursor but not under it
-            dialog_x = self.root.winfo_rootx() + event.x + 20
-            dialog_y = self.root.winfo_rooty() + event.y + 20
-            
-            # Ensure dialog stays within screen bounds
-            screen_width = self.root.winfo_screenwidth()
-            screen_height = self.root.winfo_screenheight()
-            dialog_width = self.zoom_dialog.view_size * self.zoom_dialog.zoom_factor
-            dialog_height = dialog_width
-            
-            if dialog_x + dialog_width > screen_width:
-                dialog_x = event.x - dialog_width - 20
-            if dialog_y + dialog_height > screen_height:
-                dialog_y = event.y - dialog_height - 20
-            
-            self.zoom_dialog.geometry(f"+{dialog_x}+{dialog_y}")
-            
-            # Update mouse over info
-            self.update_mouse_over(event)
-            
-        except Exception as e:
-            print(f"Error updating zoom view: {e}")
-            print(f"Current layer: {self.selected_layer.get()}")
-
-
-    def update_humidity(self):
-        """
-        Update precipitation system and synchronize humidity data with main simulation.
-        This method is maintained for compatibility with code that expects humidity,
-        precipitation, and cloud_cover attributes directly on the SimulationApp instance.
-        """
-        # Run the precipitation system update
-        self.precipitation_system.update()
-        
-        # Synchronize data between the precipitation system and main simulation attributes
-        self.humidity = self.precipitation_system.humidity
-        self.precipitation = self.precipitation_system.precipitation
-        self.cloud_cover = self.precipitation_system.cloud_cover
 
     def toggle_stats_display(self, enabled=None):
         """Toggle or set the system stats display"""

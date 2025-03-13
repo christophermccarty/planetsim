@@ -4,6 +4,7 @@ import traceback
 import tkinter as tk
 from PIL import Image, ImageTk
 from scipy.ndimage import gaussian_filter
+from map_generation import MapGenerator
 
 class Visualization:
     """Class responsible for visualization of simulation data"""
@@ -932,4 +933,97 @@ class Visualization:
                 
         except Exception as e:
             print(f"Error in _update_visualization_safe: {e}")
-            traceback.print_exc() 
+            traceback.print_exc()
+            
+    def update_zoom_view(self, event):
+        """Update the zoom window display when the user moves the mouse over the main map"""
+        try:
+            if not self.sim.zoom_dialog or not hasattr(self.sim, 'zoom_dialog') or not self.sim.zoom_dialog.winfo_exists():
+                return
+                
+            # Get cursor position
+            x, y = event.x, event.y
+            
+            # Calculate the zoom window dimensions
+            zoom_factor = self.sim.zoom_dialog.zoom_factor
+            # Use the zoom dialog's canvas width and height instead of undefined attributes
+            zoom_canvas_width = self.sim.zoom_dialog.canvas.winfo_width()
+            zoom_canvas_height = self.sim.zoom_dialog.canvas.winfo_height()
+            half_width = int(zoom_canvas_width / (2 * zoom_factor))
+            half_height = int(zoom_canvas_height / (2 * zoom_factor))
+            
+            # Calculate the region to extract, ensuring we don't go out of bounds
+            x_start = max(0, x - half_width)
+            x_end = min(self.sim.map_width, x + half_width)
+            y_start = max(0, y - half_height)
+            y_end = min(self.sim.map_height, y + half_height)
+            
+            # Extract the region from the appropriate data based on selected layer
+            layer = self.sim.selected_layer.get()
+            
+            if layer == "Elevation (Grayscale)":
+                view_data = self.map_to_grayscale(self.sim.elevation_normalized)[y_start:y_end, x_start:x_end]
+            elif layer == "Terrain":
+                view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
+            elif layer == "Temperature":
+                view_data = self.map_temperature_to_color(self.sim.temperature_celsius)[y_start:y_end, x_start:x_end]
+            elif layer == "Pressure":
+                view_data = self.map_pressure_to_color(self.sim.pressure)[y_start:y_end, x_start:x_end]
+            elif layer == "Rain Shadow":
+                view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
+            elif layer == "Biomes":
+                # Implement biome visualization using real biome data when available
+                # For now, just show terrain
+                if hasattr(self.sim, 'biomes') and self.sim.biomes is not None:
+                    # Implement biome color mapping when available
+                    view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
+                else:
+                    view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
+            elif layer == "Ocean Temperature":
+                # Normalize ocean temps to 0-1 range for better visualization
+                ocean_temp_normalized = MapGenerator.normalize_data(self.sim.ocean_temperature)
+                view_data = self.map_ocean_temperature_to_color(ocean_temp_normalized)[y_start:y_end, x_start:x_end]
+            elif layer == "Precipitation":
+                view_data = self.map_precipitation_to_color(self.sim.precipitation)[y_start:y_end, x_start:x_end]
+            elif layer == "Ocean Currents":
+                # For ocean currents, still use elevation as background
+                view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
+            else:
+                # Default to terrain
+                view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
+            
+            # Create zoomed image
+            img = Image.fromarray(view_data)
+            img = img.resize((self.sim.zoom_dialog.view_size * self.sim.zoom_dialog.zoom_factor,) * 2, 
+                            Image.Resampling.NEAREST)
+            
+            # Convert to PhotoImage
+            photo = ImageTk.PhotoImage(img)
+            self.sim.zoom_dialog.canvas.delete("image")  # Only delete image, keep crosshair
+            self.sim.zoom_dialog.canvas.create_image(0, 0, anchor="nw", image=photo, tags="image")
+            self.sim.zoom_dialog.canvas.tag_raise('crosshair')  # Ensure crosshair stays on top
+            self.sim.zoom_dialog.image = photo  # Keep reference
+            
+            # Position dialog near cursor but not under it
+            dialog_x = self.sim.root.winfo_rootx() + event.x + 20
+            dialog_y = self.sim.root.winfo_rooty() + event.y + 20
+            
+            # Ensure dialog stays within screen bounds
+            screen_width = self.sim.root.winfo_screenwidth()
+            screen_height = self.sim.root.winfo_screenheight()
+            dialog_width = self.sim.zoom_dialog.view_size * self.sim.zoom_dialog.zoom_factor
+            dialog_height = dialog_width
+            
+            if dialog_x + dialog_width > screen_width:
+                dialog_x = event.x - dialog_width - 20
+            if dialog_y + dialog_height > screen_height:
+                dialog_y = event.y - dialog_height - 20
+            
+            self.sim.zoom_dialog.geometry(f"+{dialog_x}+{dialog_y}")
+            
+            # Update mouse over info
+            self.sim.update_mouse_over(event)
+            
+        except Exception as e:
+            print(f"Error updating zoom view: {e}")
+            print(f"Current layer: {self.sim.selected_layer.get()}") 
