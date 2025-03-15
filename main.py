@@ -28,14 +28,19 @@ class SimulationApp:
     def __init__(self):
         """Initialize the simulation"""
         try:
+            print("Starting SimulationApp initialization...")
             # Create the root window first
             self.root = tk.Tk()
             self.root.title("Climate Simulation - Planet Sim")
+            print("Created root window")
             
             # Initialize all variables
             self.map_size = 512
             self.map_width = self.map_size  # Set default width until image is loaded
             self.map_height = self.map_size # Set default height until image is loaded
+            
+            # Add show_stats variable to control system stats display
+            self.show_stats = False  # Default to showing stats
             
             # Variable to track the selected layer - this needs to exist before setup_gui
             self.selected_layer = tk.StringVar(value="Elevation")
@@ -46,7 +51,14 @@ class SimulationApp:
             
             # Time and simulation variables
             self.time_step = 0
-            self.time_step_seconds = 60 * 30  # Simulation time step in seconds (30 minutes)
+            self.time_step_seconds = 60 * 60  # Simulation time step in seconds (1 hour)
+            self.minimum_simulation_hours = 24  # Minimum number of hours to simulate per cycle
+            self.target_update_rate = 1.0  # Target updates per second
+            self.min_simulation_hours_per_update = 1.0  # Minimum hours to simulate per update
+            self.max_simulation_hours_per_update = 24.0  # Maximum hours to simulate per update
+            self.high_speed_mode = True  # Enable high-speed physics approximation
+            self.physics_downsampling = 4  # Spatial downsampling factor for faster physics
+            self._last_step_time = 0.1  # Initialize with a reasonable default value
             self.Omega = 7.2921159e-5
             self.P0 = 101325
             self.desired_simulation_step_time = 0.1  # 0.1 seconds between simulation steps
@@ -68,6 +80,7 @@ class SimulationApp:
                 'humidity_transport': 0,
                 'temperature_history': []  # Initialize temperature history list
             }
+            print("Basic variables initialized")
             
             # Adjustable climate parameters
             self.climate_params = {
@@ -110,18 +123,24 @@ class SimulationApp:
 
             # Total Radiative Forcing from Greenhouse Gases
             self.total_radiative_forcing = self.radiative_forcing_co2 + self.radiative_forcing_ch4 + self.radiative_forcing_n2o
+            print("Climate parameters initialized")
             
             # Setup GUI first
+            print("Setting up GUI...")
             self.setup_gui()
+            print("GUI setup completed")
             
             # Initialize modules after GUI and data arrays are set up
+            print("Initializing system modules...")
             self.system_stats = SystemStats(self)
             self.temperature = Temperature(self)
             self.pressure_system = Pressure(self)
             self.wind_system = Wind(self)
             self.precipitation_system = Precipitation(self)
+            print("System modules initialized")
             
             # Load initial data (this will set map dimensions)
+            print("Loading initial data...")
             try:
                 self.on_load("D:\dev\planetsim\images\GRAY_HR_SR_W_stretched.tif")
                 print("Successfully loaded terrain data")
@@ -155,12 +174,15 @@ class SimulationApp:
                 self.ocean_v = np.zeros((self.map_height, self.map_width), dtype=np.float32)
             if not hasattr(self, 'ocean_temperature') or self.ocean_temperature is None:
                 self.ocean_temperature = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            print("Arrays initialized")
             
             # Initialize visualization only after canvas is created in setup_gui
+            print("Initializing visualization...")
             self.visualization = Visualization(self)
+            print("Visualization initialized")
             
             # Now bind events that require visualization
-            self.canvas.bind("<Motion>", self.visualization.update_zoom_view)
+            self.canvas.bind("<Motion>", self.on_mouse_move)
             
             # Initialize modules in the correct order with error handling
             try:
@@ -174,25 +196,28 @@ class SimulationApp:
                 self.precipitation_system.initialize()
                 print("Initializing ocean currents...")
                 self.temperature.initialize_ocean_currents()
+                print("All modules initialized successfully")
             except Exception as e:
-                print(f"Error during module initialization: {e}")
+                print(f"Error initializing modules: {e}")
                 traceback.print_exc()
+                # Don't exit, let's try to continue with defaults
                 
-            # Initialize threading event for visualization control
-            self.visualization_active = threading.Event()
-            self.visualization_active.set()  # Start in active state
-
-            # Start visualization in separate thread
+            # Initialize visualization thread
+            print("Setting up visualization thread...")
             self.visualization_thread = threading.Thread(target=self.visualization.update_visualization_loop)
             self.visualization_thread.daemon = True
             self.visualization_thread.start()
-
+            
             # Start simulation using Tkinter's after method instead of a thread
+            print("Scheduling first simulation run...")
             self.root.after(100, self.simulate)
             
             # Create simulation control flags
             self.simulation_active = threading.Event()
             self.simulation_active.set()
+            self.visualization_active = threading.Event()
+            self.visualization_active.set()
+            self.simulation_running = False  # Start with simulation off
             
             # Initialize other attributes
             self.humidity_effect_coefficient = 0.1
@@ -260,12 +285,16 @@ class SimulationApp:
             # self.canvas.pack(fill=tk.BOTH, expand=True)
             # self.visualization = Visualization(self)
 
-            # Create simulation control flags
-            self.simulation_active = threading.Event()
-            self.visualization_active = threading.Event()
+            # Stability tracking - added for better monitoring
+            self.stability_history = {
+                'fixed_counts': [],  # Track how many values we've had to fix
+                'severe_counts': [],  # Track severe instability occurrences
+                'last_reset_time': 0,  # Track when we last reset the simulation
+                'stable_cycles': 0,    # Count consecutive stable cycles
+                'unstable_cycles': 0   # Count consecutive unstable cycles
+            }
             
-            # Master switch for event detection
-            self.simulation_running = False
+            print("SimulationApp initialization complete")
 
         except Exception as e:
             print(f"Critical error in initialization: {e}")
@@ -281,84 +310,135 @@ class SimulationApp:
 
     def setup_gui(self):
         # Configure the root window to allow resizing
+        self.root.geometry(f"{self.map_width}x{self.map_height+120}")  # Extra height for controls
         self.root.resizable(True, True)
-        
-        # Main frame to contain all controls
-        main_frame = tk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Create control frame at top
-        control_frame = tk.Frame(main_frame)
-        control_frame.pack(side=tk.TOP, fill=tk.X)
-        
-        # Add buttons for file operations
-        button_frame = tk.Frame(control_frame)
-        button_frame.pack(side=tk.LEFT, padx=5, pady=5)
-        
-        # File buttons
-        new_button = tk.Button(button_frame, text="New", command=self.on_new)
-        new_button.pack(side=tk.LEFT, padx=2)
-        
-        load_button = tk.Button(button_frame, text="Load", command=lambda: self.on_load(None))
-        load_button.pack(side=tk.LEFT, padx=2)
-        
-        # Layer selector
-        checkbox_frame = tk.Frame(control_frame)
-        checkbox_frame.pack(side=tk.LEFT, padx=10)
-        
-        # Make radiobuttons for layer selection
-        tk.Label(checkbox_frame, text="Layer:").pack(side=tk.LEFT)
-        
-        layers = [
-            "Elevation", "Temperature", "Pressure", "Wind", 
-            "Precipitation", "Ocean Temperature"
-        ]
-        
-        for layer in layers:
-            rb = tk.Radiobutton(checkbox_frame, text=layer, variable=self.selected_layer, value=layer,
-                          command=lambda layer=layer: self.on_layer_change(layer))
-            rb.pack(side=tk.LEFT)
-        
-        # Status label
-        self.status_label = tk.Label(control_frame, text="Ready", anchor=tk.W)
-        self.status_label.pack(side=tk.RIGHT, padx=5)
-        
-        # Create frame for visualization
-        self.visualization_frame = tk.Frame(main_frame)
-        self.visualization_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False)
-        
-        # Create canvas with fixed dimensions
-        canvas_width = self.map_width if self.map_width is not None else self.map_size
-        canvas_height = self.map_height if self.map_height is not None else self.map_size
-        
-        self.canvas = tk.Canvas(self.visualization_frame, bg='black', 
-                                width=canvas_width, height=canvas_height)
-        self.canvas.pack(fill=tk.NONE, expand=False)  # Don't allow canvas to resize
-        
-        # Create mouse-over info label
-        self.mouse_over_label = tk.Label(main_frame, text="Mouse over data will appear here", 
-                                       anchor=tk.W, justify=tk.LEFT)
-        self.mouse_over_label.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=3)
-        
-        # Create stats display frame
-        self.stats_frame = tk.Frame(main_frame, height=100)
-        self.stats_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        
-        # Create zoom dialog
-        self.zoom_dialog = ZoomDialog(self.root)
-        self.zoom_dialog.withdraw()  # Hide initially
-        
-        # Bind mouse events that don't require visualization
-        self.canvas.bind("<Leave>", lambda e: self.zoom_dialog.withdraw())
-        self.canvas.bind("<Enter>", lambda e: self.zoom_dialog.deiconify())
-        
-        # Motion binding will be added after visualization is created
-        
-        # Add cleanup on window close
+        self.root.configure(bg='#1E1E1E')
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        # Set initial window size
-        self._resize_window_to_map()
+        # Create a main frame
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create a frame for the top controls
+        self.controls_frame = ttk.Frame(self.main_frame)
+        self.controls_frame.pack(fill=tk.X, side=tk.TOP, pady=(0, 10))
+        
+        # Create a frame for the elevation map
+        self.map_frame = ttk.Frame(self.main_frame)
+        self.map_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Add the canvas for the map display
+        self.canvas = tk.Canvas(self.map_frame, width=self.map_width, height=self.map_height, bg='black', highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Create buttons for file operations
+        file_frame = ttk.Frame(self.controls_frame)
+        file_frame.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # New and load buttons
+        self.new_button = ttk.Button(file_frame, text="New", command=self.on_new)
+        self.new_button.pack(side=tk.LEFT, padx=2)
+        
+        self.load_button = ttk.Button(file_frame, text="Load", command=lambda: self.on_load())
+        self.load_button.pack(side=tk.LEFT, padx=2)
+        
+        # Add layer selection combo
+        layer_frame = ttk.Frame(self.controls_frame)
+        layer_frame.pack(side=tk.LEFT, padx=10)
+        
+        ttk.Label(layer_frame, text="Layer:").pack(side=tk.LEFT)
+        layers = ["Elevation", "Temperature", "Pressure", "Wind", "Ocean Temperature", "Precipitation", "Ocean Currents", "Humidity", "Cloud Cover"]
+        self.layer_combo = ttk.Combobox(layer_frame, textvariable=self.selected_layer, values=layers, width=15, state="readonly")
+        self.layer_combo.current(0)
+        self.layer_combo.pack(side=tk.LEFT, padx=5)
+        self.layer_combo.bind("<<ComboboxSelected>>", lambda e: self.on_layer_change(self.selected_layer.get()))
+        
+        # Add simulation control frame
+        sim_frame = ttk.Frame(self.controls_frame)
+        sim_frame.pack(side=tk.RIGHT, padx=10)
+        
+        # Simulate button
+        self.sim_button = ttk.Button(sim_frame, text="Start", command=self.on_generate)
+        self.sim_button.pack(side=tk.RIGHT, padx=2)
+        
+        # Add performance optimization frame
+        perf_frame = ttk.Frame(self.controls_frame)
+        perf_frame.pack(side=tk.RIGHT, padx=10)
+        
+        # High-speed approximation toggle
+        self.high_speed_var = tk.BooleanVar(value=self.high_speed_mode)
+        self.high_speed_check = ttk.Checkbutton(
+            perf_frame, 
+            text="High-Speed Mode", 
+            variable=self.high_speed_var,
+            command=self.toggle_high_speed_mode
+        )
+        self.high_speed_check.pack(side=tk.RIGHT, padx=5)
+        
+        # Stats display toggle
+        self.stats_var = tk.BooleanVar(value=self.show_stats)
+        self.stats_check = ttk.Checkbutton(
+            perf_frame, 
+            text="Show Stats", 
+            variable=self.stats_var,
+            command=lambda: self.toggle_stats_display(self.stats_var.get())
+        )
+        self.stats_check.pack(side=tk.RIGHT, padx=5)
+        
+        # Initialize zoom window state
+        self.zoom_enabled = tk.BooleanVar(value=False)
+        
+        # Add zoom toggle button
+        zoom_button = ttk.Checkbutton(
+            perf_frame,
+            text="Zoom Window",
+            variable=self.zoom_enabled,
+            command=self.toggle_zoom_window
+        )
+        zoom_button.pack(side=tk.RIGHT, padx=5)
+        
+        # Initialize zoom window as None
+        self.zoom_dialog = None
+        
+        # Create bottom status bar frame
+        self.status_frame = tk.Frame(self.root, height=30, bg="#111")
+        self.status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Add mouse over information label
+        self.mouse_over_label = tk.Label(
+            self.status_frame, 
+            text="Move mouse over map for cell information",
+            anchor=tk.W,
+            background="#111",
+            foreground="#FFF",
+            font=("Arial", 10),
+            padx=10,
+            pady=5,
+            width=150  # Increased width to accommodate more information
+        )
+        self.mouse_over_label.pack(side=tk.LEFT, anchor=tk.W, fill=tk.X, expand=True)
+        
+        # Start periodic mouse-over updates
+        self._start_mouse_info_updates()
+
+    def _start_mouse_info_updates(self):
+        """Start periodic updates for mouse-over information"""
+        # Update mouse-over info every 200ms even without mouse movement
+        self.update_mouse_over()  # Initial update
+        self.root.after(200, self._periodic_mouse_update)
+    
+    def _periodic_mouse_update(self):
+        """Update mouse-over information periodically"""
+        try:
+            # Update the information
+            self.update_mouse_over()
+            
+            # Schedule the next update
+            self.root.after(200, self._periodic_mouse_update)
+        except Exception as e:
+            print(f"Error in periodic mouse update: {e}")
+            # Try to reschedule despite error
+            self.root.after(1000, self._periodic_mouse_update)
 
     def on_layer_change(self, layer):
         """Handle layer change event"""
@@ -373,6 +453,20 @@ class SimulationApp:
         """Handle window closing"""
         self.cleanup()
         self.root.destroy()
+        
+    def toggle_zoom_window(self):
+        """Toggle the zoom window on/off"""
+        if self.zoom_enabled.get():
+            # Create zoom window if it doesn't exist
+            if not hasattr(self, 'zoom_dialog') or self.zoom_dialog is None or not self.zoom_dialog.winfo_exists():
+                self.zoom_dialog = ZoomDialog(self.root)
+                # Position the zoom dialog in the bottom right initially
+                self.zoom_dialog.geometry(f"+{self.root.winfo_rootx() + self.map_width - 250}+{self.root.winfo_rooty() + self.map_height - 250}")
+        else:
+            # Destroy zoom window if it exists
+            if hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
+                self.zoom_dialog.destroy()
+                self.zoom_dialog = None
 
     def on_new(self):
         # [Implement as in the original code...]
@@ -473,12 +567,18 @@ class SimulationApp:
             traceback.print_exc()
 
     def on_generate(self, elevation_data=None):
+        """Start generating the simulation"""
+        print("on_generate() method called")
         # Cancel the previous simulation if running
         if hasattr(self, 'simulation_after_id'):
+            print("Canceling previous simulation")
             self.root.after_cancel(self.simulation_after_id)
 
         # Reset time_step
         self.time_step = 0
+        
+        # Make sure simulation_running is False during initialization
+        self.simulation_running = False
 
         # Generate coordinate arrays
         x = np.linspace(0, 1, self.map_width, endpoint=False)
@@ -502,40 +602,137 @@ class SimulationApp:
         self.global_lacunarity = 2.0
         self.global_persistence = 0.5
 
+        print("Initializing systems...")
         # Initialize temperature
         self.temperature.initialize()
 
-        # Rest of the on_generate implementation...
-        # (Continue with the elevation generation and temperature calculation code)
+        # Initialize pressure system
+        print("Initializing pressure...")
+        self.pressure_system.initialize()
+
+        # Initialize wind
+        print("Initializing winds...")
+        self.wind_system.initialize()
+
+        # Initialize precipitation
+        print("Initializing precipitation...")
+        self.precipitation_system.initialize()
+
+        # Initialize ocean currents
+        print("Initializing ocean currents...")
+        self.temperature.initialize_ocean_currents()
+        
+        # Change the button text to "Stop" if simulation is starting
+        print("Configuring UI elements...")
+        self.sim_button.config(text="Stop", command=self.stop_simulation)
+        
+        # Make sure visualization is active
+        if not hasattr(self, 'visualization_active'):
+            self.visualization_active = threading.Event()
+        self.visualization_active.set()
+        
+        # Set simulation_running flag to True to start the simulation
+        print("Setting simulation_running = True")
+        self.simulation_running = True
+        
+        # Initialize _last_step_time if needed
+        if not hasattr(self, '_last_step_time') or self._last_step_time <= 0:
+            self._last_step_time = 0.1
+        
+        # Schedule first simulation step
+        print("Scheduling first simulation step")
+        self.simulation_after_id = self.root.after(100, self.simulate)
+        print("First simulation step scheduled")
 
         # Resize window to match map dimensions
         self._resize_window_to_map()
+        print("on_generate() method completed")
+
+    def stop_simulation(self):
+        """Stop the running simulation"""
+        # Cancel any pending simulation
+        if hasattr(self, 'simulation_after_id'):
+            self.root.after_cancel(self.simulation_after_id)
+            
+        # Set flag to stop simulation
+        self.simulation_running = False
+        
+        # Change button text back to "Start"
+        self.sim_button.config(text="Start", command=self.on_generate)
+        
+        print("Simulation stopped")
 
     def simulate(self):
-        """
-        Main simulation loop - runs on its own thread.
-        
-        Called by a timer, processes one step of the simulation and then reschedules itself.
-        Updates pressure, temperature, and other systems based on current state.
-        """
+        """Main simulation loop - manages physics update and visualization"""
         try:
-            start_time = time.time()
+            print(f"simulate() called at time {time.time()}")
+            # Make sure the simulation is running, or return immediately
+            if not hasattr(self, 'simulation_running') or not self.simulation_running:
+                print("simulation_running is False, exiting simulate()")
+                return
+                
+            # Get start time for this cycle
+            cycle_start = time.time()
             
-            # Increment time step
+            # Update current step
             self.time_step += 1
+            print(f"Starting simulation step {self.time_step}")
             
-            # Update physics fields in proper order
-            self.precipitation_system.update()  # Update humidity first (depends on prev. temperature)
+            # Determine simulation time based on time since last update
+            current_time = time.time()
             
-            # Synchronize humidity data with main simulation for compatibility
-            self.humidity = self.precipitation_system.humidity
-            self.precipitation = self.precipitation_system.precipitation
-            self.cloud_cover = self.precipitation_system.cloud_cover
+            # If we're just starting or _last_step_time doesn't exist yet, use a safe default
+            if not hasattr(self, '_last_step_time') or self._last_step_time <= 0:
+                self._last_step_time = 0.1  # Use a reasonable default value
+                
+            # Calculate simulation speed
+            target_seconds_per_update = 1.0 / self.target_update_rate
             
-            self.temperature.update_land_ocean()      # Update temperatures (depends on humidity)
-            self.temperature.update_ocean()  # Update ocean temps (uses updated surface temps)
-            self.pressure_system.update()          # Update pressure (affected by temperature)
-            self.wind_system.update()              # Finally update winds (affected by all others)
+            # Default steps_needed value (will be updated for standard mode)
+            steps_needed = 1
+            
+            # Check for mode transition to handle it gracefully
+            transitioning = hasattr(self, '_transitioning_speed_mode') and self._transitioning_speed_mode
+            
+            # Check if we should use high-speed approximation or standard simulation
+            if self.high_speed_mode:
+                # During transition to high-speed, use a more conservative approach
+                if transitioning:
+                    print("Transitioning to high-speed mode - using conservative settings")
+                    approximation_factor = 2  # Start with a lower factor during transition
+                else:
+                    print("Using high-speed approximation mode")
+                    approximation_factor = 6  # Normal high-speed operation
+                
+                # In high-speed mode, we run with a fixed approximation factor
+                # This gives more consistent visual updates but less precise physics
+                target_hours = self.time_step_seconds * approximation_factor / 3600
+                self._run_approximated_simulation(target_hours)
+                self.simulation_speed = target_hours
+                
+                # For timing calculations in high-speed mode
+                steps_needed = approximation_factor
+            else:
+                # During transition from high-speed, use more stable settings
+                if transitioning:
+                    print("Transitioning to standard mode - using stable settings")
+                    # Use more modest step count during transition
+                    steps_needed = 1
+                else:
+                    print("Using standard simulation mode")
+                    # In standard mode, adapt time steps based on system performance
+                    steps_possible = max(1, int(target_seconds_per_update / (self._last_step_time or 0.1)))
+                    steps_needed = max(1, min(steps_possible, int(self.max_simulation_hours_per_update * 3600 / self.time_step_seconds)))
+                    
+                    # Always simulate at least the minimum hours even if it means going slower than target rate
+                    min_steps = max(1, int(self.min_simulation_hours_per_update * 3600 / self.time_step_seconds))
+                    steps_needed = max(steps_needed, min_steps)
+                
+                # Run the standard simulation with the calculated steps
+                self._run_standard_simulation(steps_needed)
+                
+                # Calculate actual simulation speed
+                self.simulation_speed = steps_needed * self.time_step_seconds / 3600
             
             # Clear the pressure image cache after updating pressure to force redraw
             if hasattr(self, '_pressure_image'):
@@ -547,76 +744,648 @@ class SimulationApp:
                 delattr(self, '_cached_pressure_data')
             
             # Schedule GUI updates to happen in the main thread
+            print("Scheduling GUI updates")
             self.root.after(0, self.visualization.update_map)
             self.root.after(0, self.system_stats.print_stats)
-            self.root.after(0, self.update_mouse_over)
+            # Remove redundant call - we now have a periodic update system
+            # self.root.after(0, self.update_mouse_over)
             
-            elapsed_time = time.time() - start_time
-            # print(f"Cycle {self.time_step} completed in {elapsed_time:.4f} seconds")
+            # Measure total elapsed time
+            elapsed_time = time.time() - cycle_start
             
-            # Schedule next simulation step with a reduced or zero delay
-            # Option 1: Set a smaller minimum delay
+            # Schedule next simulation step with a minimum delay
             min_delay = 1  # milliseconds
-            delay = max(min_delay, int(elapsed_time * 1000))
+            delay = max(min_delay, int((target_seconds_per_update - elapsed_time) * 1000))
+            delay = max(min_delay, delay)  # Ensure delay is at least minimum
             
-            # Option 2: Remove min_delay to run as fast as possible
-            # delay = max(0, int(elapsed_time * 1000))
-            
+            print(f"Scheduling next simulation step with delay {delay}ms")
             self.simulation_after_id = self.root.after(delay, self.simulate)
             
             # Mark simulation as active
-            self.simulation_active.set()
+            if hasattr(self, 'simulation_active'):
+                self.simulation_active.set()
+            
+            # Ensure visualization flag is set
+            if hasattr(self, 'visualization_active'):
+                self.visualization_active.set()
             
             # Start visualization in another thread if not already running
-            if not hasattr(self, 'visualization_active') or not self.visualization_active.is_set():
-                self.visualization_active = threading.Event()
-                self.visualization_active.set()
+            # We should only start this once, not every simulation step
+            if not hasattr(self, 'visualization_thread') or not self.visualization_thread.is_alive():
+                print("Starting new visualization thread")
                 self.visualization_thread = threading.Thread(target=self.visualization.update_visualization_loop)
                 self.visualization_thread.daemon = True
                 self.visualization_thread.start()
             
+            # Update _last_step_time before exiting - use elapsed_time directly
+            self._last_step_time = elapsed_time / max(1, steps_needed)
+            print(f"Completed simulation step {self.time_step}")
+            
         except Exception as e:
             print(f"Error in simulation: {e}")
+            traceback.print_exc()  # Print the full stack trace for better debugging
+            
+    def _run_standard_simulation(self, steps_needed):
+        """Run standard simulation for the specified number of steps"""
+        # Track time for performance measurement
+        step_start_time = time.time()
+        
+        # Run multiple simulation steps to reach the target time
+        for _ in range(steps_needed):
+            # Increment time step
+            self.time_step += 1
+            
+            # Update physics fields in proper order
+            self.precipitation_system.update()
+            self.humidity = self.precipitation_system.humidity
+            self.precipitation = self.precipitation_system.precipitation
+            self.cloud_cover = self.precipitation_system.cloud_cover
+            
+            self.temperature.update_land_ocean()
+            self.temperature.update_ocean()
+            self.pressure_system.update()
+            self.wind_system.update()
+        
+        # Measure the average time per step
+        step_end_time = time.time()
+        total_step_time = step_end_time - step_start_time
+        measured_step_time = total_step_time / steps_needed
+        
+        # Use exponential moving average for smoother timing adjustments
+        if not hasattr(self, '_last_step_time'):
+            self._last_step_time = measured_step_time
+        else:
+            # EMA with alpha=0.3 gives reasonable stability while allowing adjustments
+            alpha = 0.3
+            self._last_step_time = alpha * measured_step_time + (1 - alpha) * self._last_step_time
+    
+    def _run_approximated_simulation(self, target_hours):
+        """Run an approximated high-speed simulation to achieve the target hours"""
+        step_start_time = time.time()
+        
+        # Calculate total simulation seconds
+        total_seconds = target_hours * 3600
+        
+        # Ensure all critical attributes exist to prevent errors
+        if not hasattr(self, 'cloud_cover') or self.cloud_cover is None:
+            print("Initializing missing cloud_cover attribute")
+            self.cloud_cover = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            
+        if not hasattr(self, 'humidity') or self.humidity is None:
+            print("Initializing missing humidity attribute")
+            self.humidity = np.ones((self.map_height, self.map_width), dtype=np.float32) * 0.5
+            
+        if not hasattr(self, 'precipitation') or self.precipitation is None:
+            print("Initializing missing precipitation attribute") 
+            self.precipitation = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+        
+        # Initialize the temperature field if missing
+        if not hasattr(self, 'temperature_celsius') or self.temperature_celsius is None:
+            print("Initializing temperature field")
+            self.temperature_celsius = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+            # Set reasonable defaults based on latitude
+            lat_factor = np.abs(self.latitude) / 90.0
+            self.temperature_celsius = 30.0 - 40.0 * lat_factor
+            
+        # For better stability, use a conservative approximation factor
+        approximation_factor = 2  # Reduced from 3 to 2 for better stability
+        approx_time_step = self.time_step_seconds * approximation_factor
+        steps_needed = max(1, int(total_seconds / approx_time_step))
+        
+        print(f"Running simplified physics with {steps_needed} steps at {approx_time_step/60:.1f} min/step")
+        
+        # Pre-check for existing instabilities before starting high-speed
+        fix_count = self._check_stability_vectorized()
+        if fix_count > 0:
+            print(f"Fixed {fix_count} issues before starting high-speed simulation")
+        
+        # Only update essential components in high-speed mode
+        # Temperature is most visually important, followed by precipitation
+        essential_updates = {
+            'temperature': True,   # Always update temperature
+            'precipitation': 3,    # Every 3rd step
+            'pressure': 4,         # Every 4th step (reduced frequency)
+            'wind': 4,             # Every 4th step
+            'ocean': 8             # Every 8th step (reduced frequency)
+        }
+        
+        # Run all steps at once with minimal stability checking
+        for step in range(steps_needed):
+            # Increment time step counter
+            self.time_step += 1
+            
+            # Apply scaled time step
+            temp_time_step = self.time_step_seconds
+            self.time_step_seconds = approx_time_step
+            
+            try:
+                # 1. Always update temperature (most important for visualization)
+                # Use simplified temperature update that's more stable at large time steps
+                self._update_temperature_simplified()
+                
+                # 2. Selective system updates based on schedule
+                if step % essential_updates['precipitation'] == 0:
+                    self._update_precipitation_simplified()
+                    
+                if step % essential_updates['pressure'] == 0:
+                    self._update_pressure_simplified()
+                    
+                if step % essential_updates['wind'] == 0:
+                    self._update_wind_simplified()
+                    
+                if step % essential_updates['ocean'] == 0:
+                    self._update_ocean_simplified()
+                
+                # 3. Only do stability check occasionally to save performance
+                if step % 6 == 0:  # Less frequent checks (every 6th step)
+                    fix_count = self._check_stability_vectorized()
+                    if fix_count > 100:
+                        print(f"Step {step}: Fixed {fix_count} stability issues")
+                    
+            except Exception as e:
+                print(f"Error in high-speed step {step}: {e}")
+                traceback.print_exc()
+                # Reset time step and skip this iteration
+                self.time_step_seconds = temp_time_step
+                continue
+                
+            # Restore original time step
+            self.time_step_seconds = temp_time_step
+            
+        # Final stability cleanup
+        fix_count = self._check_stability_vectorized()
+        if fix_count > 0:
+            print(f"Final stability check: fixed {fix_count} issues")
+        
+        # Update timing stats for high-speed mode
+        step_end_time = time.time()
+        total_step_time = step_end_time - step_start_time
+        
+        # Calculate timing metrics
+        high_speed_step_time = total_step_time / steps_needed if steps_needed > 0 else 0
+        self._last_step_time = high_speed_step_time / approximation_factor
+        
+        print(f"Completed {steps_needed} steps in {total_step_time:.2f}s ({high_speed_step_time:.4f}s per step)")
+        print(f"Effective simulation speed: {3600/high_speed_step_time*approximation_factor:.1f}x real-time")
+    
+    def _update_temperature_simplified(self):
+        """Simplified temperature update for high-speed mode with better stability"""
+        try:
+            # Basic temperature update with simpler physics
+            # Get masks for land and ocean
+            is_land = self.elevation > 0
+            is_ocean = ~is_land
+            
+            # 1. Apply solar heating based on latitude - keep 2D shape
+            cos_lat = np.cos(np.radians(self.latitude))
+            solar_factor = np.clip(cos_lat, 0, 1) * 0.1
+            
+            # 2. Apply basic greenhouse effect (scalar)
+            greenhouse_factor = 0.05
+            
+            # 3. Apply cooling based on temperature difference from equilibrium
+            # Instead of directly using masked arrays which can cause shape issues,
+            # create full-sized arrays and then apply masks to update specific regions
+            
+            # Create equilibrium temperature arrays (same shape as original grid)
+            land_equil_full = 15.0 - 30.0 * (np.abs(self.latitude) / 90.0)
+            ocean_equil_full = 20.0 - 25.0 * (np.abs(self.latitude) / 90.0)
+            
+            # Only update if attributes exist
+            if hasattr(self, 'temperature_celsius'):
+                # Create arrays to hold temperature changes
+                delta_temp = np.zeros_like(self.temperature_celsius)
+                
+                # Calculate temperature changes for land
+                if np.any(is_land):
+                    cooling_rate_land = 0.05
+                    # Calculate relaxation for land regions
+                    land_relaxation = (land_equil_full[is_land] - self.temperature_celsius[is_land]) * cooling_rate_land
+                    # Add heating factors
+                    delta_temp[is_land] = land_relaxation + solar_factor[is_land] + greenhouse_factor
+                
+                # Calculate temperature changes for ocean
+                if np.any(is_ocean):
+                    cooling_rate_ocean = 0.015  # Slower for ocean (0.05 * 0.3)
+                    # Calculate relaxation for ocean regions
+                    ocean_relaxation = (ocean_equil_full[is_ocean] - self.temperature_celsius[is_ocean]) * cooling_rate_ocean
+                    # Add heating factors
+                    delta_temp[is_ocean] = ocean_relaxation + solar_factor[is_ocean] + greenhouse_factor
+                
+                # Apply all changes at once
+                self.temperature_celsius += delta_temp
+                
+                # Apply simple smoothing for stability
+                self.temperature_celsius = gaussian_filter(self.temperature_celsius, sigma=0.5)
+                
+                # Enforce temperature bounds
+                self.temperature_celsius = np.clip(self.temperature_celsius, -60, 60)
+                
+        except Exception as e:
+            print(f"Error in simplified temperature update: {e}")
             traceback.print_exc()
+    
+    def _update_precipitation_simplified(self):
+        """Simplified precipitation update for high-speed mode with better stability"""
+        try:
+            # Ensure all required attributes exist to prevent errors
+            if not hasattr(self, 'humidity'):
+                print("Initializing missing humidity attribute")
+                self.humidity = np.ones((self.map_height, self.map_width), dtype=np.float32) * 0.5
+                
+            if not hasattr(self, 'precipitation'):
+                print("Initializing missing precipitation attribute")
+                self.precipitation = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+                
+            if not hasattr(self, 'cloud_cover'):
+                print("Initializing missing cloud_cover attribute")
+                self.cloud_cover = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+                
+            # Simple relaxation model
+            # 1. Update humidity based on temperature and terrain
+            is_ocean = self.elevation <= 0
+            
+            # Ocean evaporation adds humidity
+            if np.any(is_ocean):
+                ocean_humidity = 0.7 + 0.2 * np.cos(np.radians(self.latitude[is_ocean]))
+                # Relaxation toward target
+                self.humidity[is_ocean] += (ocean_humidity - self.humidity[is_ocean]) * 0.1
+            
+            # Land has lower equilibrium humidity
+            if np.any(~is_ocean):
+                land_humidity = 0.5 + 0.3 * np.cos(np.radians(self.latitude[~is_ocean]))
+                self.humidity[~is_ocean] += (land_humidity - self.humidity[~is_ocean]) * 0.05
+            
+            # 2. Cloud formation based on humidity
+            cloud_threshold = 0.6
+            self.cloud_cover = np.clip((self.humidity - cloud_threshold) * 2.0, 0, 1)
+            
+            # 3. Precipitation based on clouds and stability
+            self.precipitation = np.zeros_like(self.cloud_cover)
+            rain_mask = self.cloud_cover > 0.4
+            if np.any(rain_mask):
+                self.precipitation[rain_mask] = (self.cloud_cover[rain_mask] - 0.4) * 0.05
+            
+            # Apply simple smoothing for stability
+            self.humidity = gaussian_filter(self.humidity, sigma=1.0)
+            self.cloud_cover = gaussian_filter(self.cloud_cover, sigma=1.0)
+            self.precipitation = gaussian_filter(self.precipitation, sigma=1.0)
+            
+            # Ensure bounds
+            self.humidity = np.clip(self.humidity, 0.1, 1.0)
+            self.cloud_cover = np.clip(self.cloud_cover, 0, 1.0)
+            self.precipitation = np.clip(self.precipitation, 0, 0.1)
+                
+        except Exception as e:
+            print(f"Error in simplified precipitation update: {e}")
+            traceback.print_exc()
+    
+    def _update_pressure_simplified(self):
+        """Simplified pressure update for high-speed mode with better stability"""
+        try:
+            if hasattr(self, 'pressure') and hasattr(self, 'temperature_celsius'):
+                # 1. Base pressure based on elevation (higher = lower pressure)
+                elevation_factor = np.exp(-np.clip(self.elevation, 0, 2000) / 8000)
+                
+                # 2. Temperature effect (hotter = lower pressure)
+                temp_factor = 1.0 - (self.temperature_celsius - 15) / 100
+                
+                # 3. Latitude effect (high/low pressure bands)
+                lat_rad = np.abs(np.radians(self.latitude))
+                lat_factor = 1.0 + 0.02 * np.cos(lat_rad * 6)
+                
+                # Calculate target pressure
+                base_pressure = 101325.0  # 1013.25 hPa
+                target_pressure = base_pressure * elevation_factor * temp_factor * lat_factor
+                
+                # Apply relaxation toward target pressure
+                relaxation_rate = 0.1
+                self.pressure += (target_pressure - self.pressure) * relaxation_rate
+                
+                # Apply simple smoothing for stability
+                self.pressure = gaussian_filter(self.pressure, sigma=1.0)
+                
+                # Ensure realistic pressure range
+                self.pressure = np.clip(self.pressure, 87000, 108000)
+                
+        except Exception as e:
+            print(f"Error in simplified pressure update: {e}")
+    
+    def _update_wind_simplified(self):
+        """Simplified wind update for high-speed mode with better stability"""
+        try:
+            if hasattr(self, 'u') and hasattr(self, 'v') and hasattr(self, 'pressure'):
+                # Calculate pressure gradients
+                dy, dx = np.gradient(self.pressure)
+                
+                # Convert to wind components (negative gradient = wind direction)
+                # Scale by grid spacing
+                target_u = -dx / self.grid_spacing_x * 0.0001
+                target_v = -dy / self.grid_spacing_y * 0.0001
+                
+                # Apply Coriolis effect (simplified)
+                coriolis_factor = np.sin(np.radians(self.latitude)) * 0.0001
+                target_u_coriolis = target_u - coriolis_factor * target_v
+                target_v_coriolis = target_v + coriolis_factor * target_u
+                
+                # Update wind with relaxation
+                relaxation_rate = 0.2
+                self.u += (target_u_coriolis - self.u) * relaxation_rate
+                self.v += (target_v_coriolis - self.v) * relaxation_rate
+                
+                # Apply simple smoothing
+                self.u = gaussian_filter(self.u, sigma=1.0)
+                self.v = gaussian_filter(self.v, sigma=1.0)
+                
+                # Clip to realistic values
+                max_wind = 30.0
+                wind_mag = np.sqrt(self.u**2 + self.v**2)
+                wind_correction = np.where(
+                    wind_mag > max_wind,
+                    max_wind / wind_mag,
+                    1.0
+                )
+                self.u *= wind_correction
+                self.v *= wind_correction
+                
+        except Exception as e:
+            print(f"Error in simplified wind update: {e}")
+    
+    def _update_ocean_simplified(self):
+        """Simplified ocean temperature update for high-speed mode with better stability"""
+        try:
+            if hasattr(self, 'temperature_celsius') and hasattr(self, 'elevation'):
+                # Only process ocean cells
+                is_ocean = self.elevation <= 0
+                if np.any(is_ocean):
+                    # 1. Ocean has high thermal inertia - changes more slowly
+                    # Base ocean temperature on latitude
+                    lat = np.abs(self.latitude[is_ocean])
+                    target_temp = 25.0 - 25.0 * (lat / 90.0)
+                    
+                    # Apply slower relaxation for ocean
+                    relaxation_rate = 0.02
+                    self.temperature_celsius[is_ocean] += (target_temp - self.temperature_celsius[is_ocean]) * relaxation_rate
+                    
+                    # 2. Apply simplified ocean currents (just diffusion)
+                    # Extract ocean temperature
+                    ocean_temp = np.zeros_like(self.temperature_celsius)
+                    ocean_temp[is_ocean] = self.temperature_celsius[is_ocean]
+                    
+                    # Apply diffusion
+                    ocean_temp = gaussian_filter(ocean_temp, sigma=1.5) 
+                    
+                    # Update only ocean cells
+                    self.temperature_celsius[is_ocean] = ocean_temp[is_ocean]
+                    
+                    # Ensure realistic ocean temperature bounds
+                    self.temperature_celsius[is_ocean] = np.clip(self.temperature_celsius[is_ocean], -2, 30)
+                
+        except Exception as e:
+            print(f"Error in simplified ocean update: {e}")
+
+    def _check_stability_vectorized(self):
+        """Vectorized stability check that's much faster than the original loop-based version"""
+        try:
+            fixed_count = 0
+            severe_count = 0
+            
+            # 1. Check temperature field (most common source of instability)
+            if hasattr(self, 'temperature_celsius'):
+                # Create a mask for all problematic values
+                temp_invalid = (
+                    np.isnan(self.temperature_celsius) | 
+                    np.isinf(self.temperature_celsius) | 
+                    (self.temperature_celsius < -100) | 
+                    (self.temperature_celsius > 100)
+                )
+                
+                if np.any(temp_invalid):
+                    # Count fixes
+                    fixed_count += np.sum(temp_invalid)
+                    severe_count += np.sum(np.isnan(self.temperature_celsius) | np.isinf(self.temperature_celsius))
+                    
+                    # Create default values
+                    is_ocean = self.elevation <= 0
+                    default_temp = np.zeros_like(self.temperature_celsius)
+                    
+                    # Create latitude-based defaults
+                    y_indices = np.arange(self.map_height)
+                    latitude_factor = np.abs(90 - y_indices * 180 / self.map_height) / 90
+                    lat_factor_expanded = np.tile(latitude_factor[:, np.newaxis], (1, self.map_width))
+                    
+                    # Set ocean defaults
+                    default_temp[is_ocean] = 15.0 + np.random.uniform(-3, 3, size=np.sum(is_ocean))
+                    
+                    # Set land defaults
+                    default_temp[~is_ocean] = 30 * lat_factor_expanded[~is_ocean] - 10 + np.random.uniform(-5, 5, size=np.sum(~is_ocean))
+                    
+                    # Apply fixes
+                    self.temperature_celsius[temp_invalid] = default_temp[temp_invalid]
+            
+            # 2. Check pressure field
+            if hasattr(self, 'pressure'):
+                # Create mask for invalid pressure
+                pressure_invalid = (
+                    np.isnan(self.pressure) | 
+                    np.isinf(self.pressure) | 
+                    (self.pressure < 87000) | 
+                    (self.pressure > 108000)
+                )
+                
+                if np.any(pressure_invalid):
+                    # Count fixes
+                    fixed_count += np.sum(pressure_invalid)
+                    severe_count += np.sum(np.isnan(self.pressure) | np.isinf(self.pressure))
+                    
+                    # Set to standard pressure with small random variation
+                    self.pressure[pressure_invalid] = 101325.0 + np.random.uniform(-500, 500, size=np.sum(pressure_invalid))
+            
+            # 3. Check wind components
+            if hasattr(self, 'u') and hasattr(self, 'v'):
+                # Create masks for invalid wind components
+                u_invalid = (
+                    np.isnan(self.u) | 
+                    np.isinf(self.u) | 
+                    (self.u < -50) | 
+                    (self.u > 50)
+                )
+                
+                v_invalid = (
+                    np.isnan(self.v) | 
+                    np.isinf(self.v) | 
+                    (self.v < -50) | 
+                    (self.v > 50)
+                )
+                
+                # Fix u component
+                if np.any(u_invalid):
+                    fixed_count += np.sum(u_invalid)
+                    severe_count += np.sum(np.isnan(self.u) | np.isinf(self.u))
+                    self.u[u_invalid] = 0.0
+                
+                # Fix v component
+                if np.any(v_invalid):
+                    fixed_count += np.sum(v_invalid)
+                    severe_count += np.sum(np.isnan(self.v) | np.isinf(self.v))
+                    self.v[v_invalid] = 0.0
+            
+            # 4. Check precipitation and humidity
+            if hasattr(self, 'precipitation'):
+                precip_invalid = (
+                    np.isnan(self.precipitation) | 
+                    np.isinf(self.precipitation) | 
+                    (self.precipitation < 0) | 
+                    (self.precipitation > 1)
+                )
+                
+                if np.any(precip_invalid):
+                    fixed_count += np.sum(precip_invalid)
+                    severe_count += np.sum(np.isnan(self.precipitation) | np.isinf(self.precipitation))
+                    self.precipitation[precip_invalid] = 0.0
+            
+            if hasattr(self, 'humidity'):
+                humidity_invalid = (
+                    np.isnan(self.humidity) | 
+                    np.isinf(self.humidity) | 
+                    (self.humidity < 0) | 
+                    (self.humidity > 1)
+                )
+                
+                if np.any(humidity_invalid):
+                    fixed_count += np.sum(humidity_invalid)
+                    severe_count += np.sum(np.isnan(self.humidity) | np.isinf(self.humidity))
+                    self.humidity[humidity_invalid] = 0.5
+            
+            # 5. Check cloud cover
+            if hasattr(self, 'cloud_cover'):
+                cloud_invalid = (
+                    np.isnan(self.cloud_cover) | 
+                    np.isinf(self.cloud_cover) | 
+                    (self.cloud_cover < 0) | 
+                    (self.cloud_cover > 1)
+                )
+                
+                if np.any(cloud_invalid):
+                    fixed_count += np.sum(cloud_invalid)
+                    severe_count += np.sum(np.isnan(self.cloud_cover) | np.isinf(self.cloud_cover))
+                    self.cloud_cover[cloud_invalid] = 0.0
+            
+            # Take emergency actions if severe issues detected
+            if severe_count > 100 or fixed_count > 50000:
+                print(f"STABILITY: Fixed {fixed_count} issues, including {severe_count} severe problems")
+                if self.high_speed_mode and fixed_count > 500000:  # Increased from 100,000 to 500,000
+                    print("EMERGENCY: Disabling high-speed mode due to severe instability")
+                    self.high_speed_mode = False
+                    if hasattr(self, 'high_speed_var'):
+                        self.high_speed_var.set(False)
+                    
+            return fixed_count
+                        
+        except Exception as e:
+            print(f"Error in stability check: {e}")
+            return 0
 
     def update_mouse_over(self, event=None):
+        """Update mouse-over information display"""
         try:
-            if event is None:
+            # Get mouse coordinates
+            if event is not None:
+                # Update from event if available
+                x, y = event.x, event.y
+                
+                # Store last mouse position for reference
+                self.last_mouse_x = x
+                self.last_mouse_y = y
+                
+                # Also store in zoom dialog if it exists
+                if hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
+                    self.zoom_dialog.last_main_x = x
+                    self.zoom_dialog.last_main_y = y
+            elif hasattr(self, 'last_mouse_x') and hasattr(self, 'last_mouse_y'):
+                # Use stored position if no event
                 x, y = self.last_mouse_x, self.last_mouse_y
             else:
-                x, y = event.x, event.y
-                self.last_mouse_x, self.last_mouse_y = x, y
-
-            if 0 <= x < self.map_width and 0 <= y < self.map_height:
-                # Retrieve data at mouse position
-                pressure_value = self.pressure[y, x]
-                temperature_value = self.temperature_celsius[y, x]
-                wind_speed_value = np.sqrt(self.u[y, x] ** 2 + self.v[y, x] ** 2)
+                # No position data available
+                if hasattr(self, 'mouse_over_label') and self.mouse_over_label:
+                    self.mouse_over_label.config(text="Move mouse over map for cell information")
+                return
+            
+            # Skip if out of bounds
+            if x < 0 or y < 0 or x >= self.map_width or y >= self.map_height:
+                if hasattr(self, 'mouse_over_label') and self.mouse_over_label:
+                    self.mouse_over_label.config(text="Move mouse over map for cell information")
+                return
+                
+            # Extract values from the map data at this location
+            display_parts = [f"Position: ({x}, {y})"]
+            
+            # Determine if ocean or land
+            is_ocean = False
+            if hasattr(self, 'elevation') and self.elevation is not None:
                 elevation_value = self.elevation[y, x]
-                latitude_value = self.latitude[y, x]
-                longitude_value = self.longitude[y, x]
-                grayscale_value = self.altitude[y, x]
+                display_parts.append(f"Elevation: {elevation_value:.1f}m")
                 
-                # Get precipitation value if available
-                precipitation_value = 0
-                if hasattr(self, 'precipitation') and self.precipitation is not None:
-                    precipitation_value = self.precipitation[y, x]
+                is_ocean = elevation_value <= 0
+                if is_ocean:
+                    display_parts.append("(Ocean)")
+                else:
+                    display_parts.append("(Land)")
+            
+            # Always show temperature data (depends on land vs ocean)
+            if hasattr(self, 'temperature_celsius'):
+                # For land, show air temperature
+                if not is_ocean:
+                    temp = self.temperature_celsius[y, x]
+                    display_parts.append(f"Temp: {temp:.1f}°C")
+                # For ocean, show ocean temperature if available
+                elif hasattr(self, 'ocean_temperature') and self.ocean_temperature is not None:
+                    ocean_temp = self.ocean_temperature[y, x]
+                    display_parts.append(f"Ocean Temp: {ocean_temp:.1f}°C")
+                    # Also show air temperature for ocean cells
+                    temp = self.temperature_celsius[y, x]
+                    display_parts.append(f"Air Temp: {temp:.1f}°C")
+            
+            # Always show pressure if available
+            if hasattr(self, 'pressure'):
+                pressure = self.pressure[y, x]
+                display_parts.append(f"Pressure: {pressure/100:.1f} hPa")
                 
-                # Calculate wind direction (direction wind is blowing TO)
-                wind_direction_rad = np.arctan2(-self.u[y, x], -self.v[y, x])
-                wind_direction_deg = (90 - np.degrees(wind_direction_rad)) % 360
-
-                # Update label text
-                self.mouse_over_label.config(text=(
-                    f"Pressure: {pressure_value:.2f} Pa, "
-                    f"Temperature: {temperature_value:.2f} °C, "
-                    f"Wind Speed: {wind_speed_value:.2f} m/s, "
-                    f"Wind Direction: {wind_direction_deg:.2f}°, "
-                    f"Precipitation: {precipitation_value:.2f} mm/hr\n"
-                    f"Latitude: {latitude_value:.2f}°, Longitude: {longitude_value:.2f}°, "
-                    f"Elevation: {elevation_value:.2f} m, "
-                    f"Y: {y}, X: {x}"
-                ))
+            # Always show wind if available
+            if hasattr(self, 'u') and hasattr(self, 'v'):
+                u = self.u[y, x]
+                v = self.v[y, x]
+                speed = np.sqrt(u*u + v*v)
+                if hasattr(self, 'wind_system') and hasattr(self.wind_system, 'calculate_direction'):
+                    direction = self.wind_system.calculate_direction(u, v)
+                    display_parts.append(f"Wind: {speed:.1f} m/s {direction:.0f}°")
+                else:
+                    display_parts.append(f"Wind: {speed:.1f} m/s")
+                
+            # Always show precipitation if available
+            if hasattr(self, 'precipitation'):
+                precip = self.precipitation[y, x]
+                if precip > 0.001:  # Only show if significant
+                    display_parts.append(f"Rain: {precip:.2f} mm/h")
+                
+            # Always show humidity if available
+            if hasattr(self, 'humidity'):
+                humidity = self.humidity[y, x] * 100
+                display_parts.append(f"Humidity: {humidity:.0f}%")
+                
+            # Always show cloud cover if available
+            if hasattr(self, 'cloud_cover'):
+                clouds = self.cloud_cover[y, x] * 100
+                if clouds > 1.0:  # Only show if significant
+                    display_parts.append(f"Clouds: {clouds:.0f}%")
+            
+            # Join all parts with pipe separator
+            display_str = " | ".join(display_parts)
+            
+            # Update mouse over label if it exists
+            if hasattr(self, 'mouse_over_label') and self.mouse_over_label:
+                self.mouse_over_label.config(text=display_str)
+                
         except Exception as e:
             print(f"Error in update_mouse_over: {e}")
             # Don't reraise to prevent thread crashes
@@ -632,15 +1401,257 @@ class SimulationApp:
         """Toggle or set the system stats display"""
         if enabled is None:
             # Toggle current state
-            self.system_stats.print_stats_enabled = not self.system_stats.print_stats_enabled
+            self.show_stats = not self.show_stats
+            self.system_stats.print_stats_enabled = self.show_stats
         else:
             # Set to specified state
+            self.show_stats = enabled
             self.system_stats.print_stats_enabled = enabled
+
+    def toggle_high_speed_mode(self):
+        """Toggle or set the high-speed approximation mode"""
+        old_value = self.high_speed_mode
+        new_value = self.high_speed_var.get()
+        
+        # If no change, do nothing to avoid unnecessary work
+        if old_value == new_value:
+            return
+            
+        self.high_speed_mode = new_value
+        mode_text = "enabled" if self.high_speed_mode else "disabled"
+        print(f"High-speed mode {mode_text}")
+        
+        # Use a short-term flag to indicate we're transitioning modes
+        # This allows the simulation to handle the transition more smoothly
+        self._transitioning_speed_mode = True
+        
+        # For enabling high-speed mode, show a temporary status message
+        # instead of blocking with a MessageBox
+        if self.high_speed_mode:
+            if hasattr(self, 'system_label') and self.system_label:
+                current_text = self.system_label.cget("text")
+                self.system_label.config(text=f"High-speed mode enabled - optimizing simulation...")
+                
+                # Schedule restoration of normal status text after a short delay
+                self.root.after(2000, lambda: self.system_label.config(text=current_text))
+        
+        # Reset timing data to force recalculation but don't delete it
+        # This avoids allocation/deallocation overhead
+        if hasattr(self, '_last_step_time'):
+            self._last_step_time = 0.1  # Reset to initial value
+        
+        # Schedule stability check to run after UI update completes
+        # This prevents UI freezing during the check
+        self.root.after(100, self._perform_mode_transition_tasks)
+    
+    def _perform_mode_transition_tasks(self):
+        """Perform tasks needed when transitioning between simulation modes"""
+        try:
+            # Perform a lightweight stability check when changing modes
+            if hasattr(self, '_check_stability_vectorized'):
+                # Use a more targeted stability check during mode transitions
+                self._check_stability_for_mode_transition()
+            
+            # Clear the transition flag
+            self._transitioning_speed_mode = False
+        except Exception as e:
+            print(f"Error during mode transition: {e}")
+            traceback.print_exc()
+            self._transitioning_speed_mode = False
+    
+    def _check_stability_for_mode_transition(self):
+        """Perform a faster targeted stability check during mode transitions"""
+        # Only check temperature and pressure - the most critical fields
+        # This is much faster than the full stability check
+        fixed_count = 0
+        
+        # Check temperature field using vectorized operations
+        if hasattr(self, 'temperature_celsius'):
+            temp = self.temperature_celsius
+            if temp is not None:
+                # Find all temperature values that are outside valid range or NaN/Inf
+                invalid_temp = np.isnan(temp) | np.isinf(temp) | (temp < -100) | (temp > 100)
+                fixed_count += np.sum(invalid_temp)
+                
+                # Fix invalid temperature values
+                if np.any(invalid_temp):
+                    # Create replacement values based on latitude
+                    height, width = temp.shape
+                    y_indices, x_indices = np.where(invalid_temp)
+                    
+                    # Create default values for fixes
+                    is_ocean = self.elevation[y_indices, x_indices] <= 0
+                    
+                    # Apply ocean defaults (ocean temperature is more stable)
+                    ocean_fixes = np.where(is_ocean)[0]
+                    if len(ocean_fixes) > 0:
+                        # Use moderate ocean temperature with small variations
+                        ocean_default = 15.0 + np.random.uniform(-3, 3, size=len(ocean_fixes))
+                        ocean_idx = y_indices[ocean_fixes], x_indices[ocean_fixes]
+                        temp[ocean_idx] = ocean_default
+                    
+                    # Apply land defaults (more variable by latitude)
+                    land_fixes = np.where(~is_ocean)[0]
+                    if len(land_fixes) > 0:
+                        # Calculate latitude-based temperatures
+                        land_idx = y_indices[land_fixes], x_indices[land_fixes]
+                        latitude_factor = abs(90 - land_idx[0] * 180 / height) / 90
+                        land_default = 30 * latitude_factor - 10 + np.random.uniform(-5, 5, size=len(land_fixes))
+                        temp[land_idx] = land_default
+        
+        # Check pressure field using vectorized operations
+        if hasattr(self, 'pressure'):
+            pressure = self.pressure
+            if pressure is not None:
+                # Find all pressure values that are outside valid range or NaN/Inf
+                invalid_pressure = np.isnan(pressure) | np.isinf(pressure) | (pressure < 87000) | (pressure > 108000)
+                fixed_count += np.sum(invalid_pressure)
+                
+                # Fix invalid pressure values
+                if np.any(invalid_pressure):
+                    # Set to standard pressure with small variations
+                    pressure[invalid_pressure] = 1013.0 + np.random.uniform(-10, 10)
+        
+        # Only print message if fixes were substantial
+        if fixed_count > 100:
+            print(f"Mode transition - fixed {fixed_count} values for stability")
+            
+        return fixed_count
+
+    def update_stability_tracking(self, fixed_count, severe_count):
+        """Update stability tracking metrics"""
+        # Add current counts to history (keep last 10 values)
+        self.stability_history['fixed_counts'].append(fixed_count)
+        if len(self.stability_history['fixed_counts']) > 10:
+            self.stability_history['fixed_counts'].pop(0)
+            
+        self.stability_history['severe_counts'].append(severe_count)
+        if len(self.stability_history['severe_counts']) > 10:
+            self.stability_history['severe_counts'].pop(0)
+        
+        # Update stable/unstable cycle counts
+        if fixed_count > 1000 or severe_count > 0:
+            self.stability_history['unstable_cycles'] += 1
+            self.stability_history['stable_cycles'] = 0
+        else:
+            self.stability_history['stable_cycles'] += 1
+            self.stability_history['unstable_cycles'] = 0
+            
+        # Check if we need adaptive measures
+        current_time = time.time()
+        time_since_last_reset = current_time - self.stability_history['last_reset_time']
+        
+        # If we've been unstable for several cycles and it's been at least 60 seconds since last reset
+        if self.stability_history['unstable_cycles'] >= 5 and time_since_last_reset > 60:
+            print("STABILITY WARNING: Multiple consecutive unstable cycles detected")
+            
+            # Take adaptive measures based on severity
+            if self.stability_history['unstable_cycles'] >= 10:
+                print("STABILITY ACTION: Performing emergency stability reset")
+                self._emergency_stability_reset()
+                self.stability_history['last_reset_time'] = current_time
+                
+        # Update system label with stability info if severe enough
+        if fixed_count > 100 or severe_count > 0:
+            if hasattr(self, 'system_label') and self.system_label:
+                current_text = self.system_label.cget("text")
+                if not "STABILITY" in current_text:
+                    stability_info = f"\nSTABILITY: {fixed_count} fixes, {severe_count} severe issues"
+                    self.system_label.config(text=current_text + stability_info)
+                    
+    def _emergency_stability_reset(self):
+        """Perform emergency reset of simulation state to recover stability"""
+        # Disable high-speed mode
+        if self.high_speed_mode:
+            self.high_speed_mode = False
+            if hasattr(self, 'high_speed_var'):
+                self.high_speed_var.set(False)
+                
+        # Reduce time step
+        self.time_step_seconds = min(self.time_step_seconds, 600)  # Max 10 minutes
+        
+        # Reset temperature field with smooth, physically reasonable values
+        if hasattr(self, 'temperature') and hasattr(self.temperature, 'temperature'):
+            shape = self.temperature.temperature.shape
+            new_temp = np.zeros(shape)
+            
+            # Helper function to safely get terrain information
+            def is_ocean(x, y):
+                try:
+                    return self.elevation[y, x] <= 0
+                except (IndexError, TypeError):
+                    return False
+                    
+            # Generate realistic temperature field
+            for y in range(shape[0]):
+                for x in range(shape[1]):
+                    # Calculate latitude factor (0 at poles, 1 at equator)
+                    latitude_factor = 1.0 - abs(y - shape[0]//2) / (shape[0]//2)
+                    
+                    # Base temperature varies with latitude (warm at equator, cold at poles)
+                    base_temp = 30 * latitude_factor - 15
+                    
+                    # Add some noise
+                    noise = np.random.normal(0, 2)
+                    
+                    # Oceans have more moderate temperatures
+                    if is_ocean(x, y):
+                        # Ocean temperature varies less with latitude
+                        ocean_temp = 25 * latitude_factor - 5
+                        new_temp[y, x] = ocean_temp + noise * 0.5
+                    else:
+                        # Land has more extreme temperatures
+                        new_temp[y, x] = base_temp + noise
+            
+            # Apply final smoothing
+            new_temp = gaussian_filter(new_temp, sigma=1.0)
+            
+            # Replace temperature field
+            self.temperature.temperature = new_temp.astype(np.float32)
+            self.temperature_celsius = new_temp.astype(np.float32)
+        
+        # Reset wind to gentle global patterns
+        if hasattr(self, 'wind_system'):
+            if hasattr(self.wind_system, 'u') and self.wind_system.u is not None:
+                shape = self.wind_system.u.shape
+                # Create simple wind patterns based on latitude
+                for y in range(shape[0]):
+                    # Calculate latitude (-1 to 1, where 0 is equator)
+                    lat = 2 * (y / shape[0] - 0.5)
+                    
+                    # Create simple zonal wind pattern (east-west)
+                    # Trade winds, westerlies, and polar easterlies
+                    if abs(lat) < 0.3:  # Trade winds (easterly near equator)
+                        self.wind_system.u[y, :] = -5.0
+                    elif abs(lat) < 0.7:  # Westerlies (mid-latitudes)
+                        self.wind_system.u[y, :] = 8.0
+                    else:  # Polar easterlies (high latitudes)
+                        self.wind_system.u[y, :] = -3.0
+                    
+                    # Add some random noise
+                    self.wind_system.u[y, :] += np.random.normal(0, 1, shape[1])
+                
+                # Apply smoothing
+                self.wind_system.u = gaussian_filter(self.wind_system.u, sigma=1.0)
+        
+        print("Emergency stability reset completed")
+
+    def on_mouse_move(self, event):
+        """Handle mouse movement by updating both cell info and zoom view"""
+        # Update the cell information display first
+        self.update_mouse_over(event)
+        
+        # Then update the zoom view if needed
+        if hasattr(self, 'visualization'):
+            self.visualization.update_zoom_view(event)
 
 
 class ZoomDialog(tk.Toplevel):
     def __init__(self, parent, zoom_factor=4):
         super().__init__(parent)
+        
+        # Store reference to parent for event handling
+        self.parent = parent
         
         # Remove window decorations and make it stay on top
         self.overrideredirect(True)
@@ -684,6 +1695,47 @@ class ZoomDialog(tk.Toplevel):
         self.canvas.create_line(center + outline_offset, center - self.crosshair_size, 
                               center + outline_offset, center + self.crosshair_size, 
                               fill='white', width=1, tags='crosshair')
+                              
+        # Bind mouse events to update zoom window when mouse moves within it
+        self.canvas.bind("<Motion>", self.on_mouse_move)
+        
+        # Track original mouse position on main canvas
+        self.last_main_x = 0
+        self.last_main_y = 0
+        
+    def on_mouse_move(self, event):
+        """Handle mouse movement in the zoom window"""
+        try:
+            # Calculate the relative position in the zoom view
+            zoom_x = event.x // self.zoom_factor
+            zoom_y = event.y // self.zoom_factor
+            
+            # Calculate the corresponding position on the main map
+            center_offset = self.view_size // 2
+            map_x = self.last_main_x - center_offset + zoom_x
+            map_y = self.last_main_y - center_offset + zoom_y
+            
+            # Ensure coordinates are within map bounds
+            map_x = max(0, min(map_x, self.parent.map_width - 1))
+            map_y = max(0, min(map_y, self.parent.map_height - 1))
+            
+            # Create a synthetic event to pass to the parent's update_mouse_over
+            class SyntheticEvent:
+                pass
+                
+            synthetic_event = SyntheticEvent()
+            synthetic_event.x = map_x
+            synthetic_event.y = map_y
+            
+            # Update parent's mouse position display
+            self.parent.update_mouse_over(synthetic_event)
+            
+            # Also update the zoom view with the new coordinates
+            if hasattr(self.parent, 'visualization'):
+                self.parent.visualization.update_zoom_view(synthetic_event)
+                
+        except Exception as e:
+            print(f"Error in on_mouse_move: {e}")
 
 
 if __name__ == "__main__":
@@ -693,5 +1745,20 @@ if __name__ == "__main__":
         # Context already set, continue with current settings
         pass
         
+    print("Creating SimulationApp instance...")
     app = SimulationApp()
-    app.root.mainloop()
+    print("Starting mainloop...")
+    try:
+        app.root.mainloop()
+        print("mainloop exited")
+    except Exception as e:
+        print(f"Error in mainloop: {e}")
+        traceback.print_exc()
+    
+    print("Program ended - sleeping to prevent immediate exit...")
+    try:
+        # Wait for a while to see output
+        import time
+        time.sleep(10)
+    except KeyboardInterrupt:
+        print("Sleep interrupted by user")

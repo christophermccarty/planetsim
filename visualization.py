@@ -5,6 +5,7 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from scipy.ndimage import gaussian_filter
 from map_generation import MapGenerator
+import threading
 
 class Visualization:
     """Class responsible for visualization of simulation data"""
@@ -841,10 +842,23 @@ class Visualization:
     def update_visualization_loop(self):
         """Continuous loop for updating visualization in separate thread"""
         try:
-            while self.sim.visualization_active.is_set():
-                # Just schedule the update in the main thread, don't do any GUI operations here
+            print("Visualization thread started")
+            
+            # Run continuously until thread is explicitly stopped
+            while True:
+                # Check if we should continue running
+                if hasattr(self.sim, 'visualization_active'):
+                    if not self.sim.visualization_active.is_set():
+                        print("Visualization thread stopping (flag cleared)")
+                        break
+                else:
+                    # If visualization_active doesn't exist, create it
+                    print("Creating missing visualization_active attribute")
+                    self.sim.visualization_active = threading.Event()
+                    self.sim.visualization_active.set()
+                
+                # Schedule update in the main thread
                 try:
-                    # Schedule update with a unique identifier to avoid accumulation of pending updates
                     if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
                         # Cancel any existing scheduled update
                         if hasattr(self, '_update_after_id'):
@@ -860,6 +874,8 @@ class Visualization:
                 
                 # Sleep for a short time to prevent excessive CPU usage
                 time.sleep(0.033)  # ~30 FPS
+            
+            print("Visualization thread ended")
         except Exception as e:
             print(f"Error in visualization loop: {e}")
             traceback.print_exc()
@@ -936,56 +952,85 @@ class Visualization:
             traceback.print_exc()
             
     def update_zoom_view(self, event):
-        """Update the zoom window display when the user moves the mouse over the main map"""
+        """
+        Update the zoom window display when the user moves the mouse over the main map or zoomed view.
+        
+        This method:
+        1. Takes mouse coordinates from the event
+        2. Determines the region around the cursor to display in the zoom window
+        3. Creates a magnified view of that region
+        4. Updates the zoom dialog with the new view
+        
+        When the mouse is over the zoom window itself, the coordinates are translated
+        back to the main map coordinates by the zoom window's event handler.
+        """
         try:
+            # Skip if zoom_dialog doesn't exist
+            if not hasattr(self.sim, 'zoom_dialog') or self.sim.zoom_dialog is None:
+                return
+                
             if not self.sim.zoom_dialog or not hasattr(self.sim, 'zoom_dialog') or not self.sim.zoom_dialog.winfo_exists():
                 return
                 
-            # Get cursor position
+            # Get current layer
+            current_layer = self.sim.selected_layer.get()
+            
+            # Get map dimensions
+            map_height, map_width = self.sim.map_height, self.sim.map_width
+            
+            # Get mouse coordinates
             x, y = event.x, event.y
             
-            # Calculate the zoom window dimensions
-            zoom_factor = self.sim.zoom_dialog.zoom_factor
-            # Use the zoom dialog's canvas width and height instead of undefined attributes
-            zoom_canvas_width = self.sim.zoom_dialog.canvas.winfo_width()
-            zoom_canvas_height = self.sim.zoom_dialog.canvas.winfo_height()
-            half_width = int(zoom_canvas_width / (2 * zoom_factor))
-            half_height = int(zoom_canvas_height / (2 * zoom_factor))
+            # Skip if out of bounds
+            if x < 0 or y < 0 or x >= map_width or y >= map_height:
+                return
+                
+            # Get view size
+            view_size = self.sim.zoom_dialog.view_size
             
-            # Calculate the region to extract, ensuring we don't go out of bounds
-            x_start = max(0, x - half_width)
-            x_end = min(self.sim.map_width, x + half_width)
-            y_start = max(0, y - half_height)
-            y_end = min(self.sim.map_height, y + half_height)
+            # Calculate the region to display
+            half_view = view_size // 2
+            x_start = max(0, x - half_view)
+            y_start = max(0, y - half_view)
+            x_end = min(map_width, x + half_view + 1)
+            y_end = min(map_height, y + half_view + 1)
             
-            # Extract the region from the appropriate data based on selected layer
-            layer = self.sim.selected_layer.get()
+            # Ensure we get exactly view_size pixels
+            if x_end - x_start < view_size:
+                if x_start == 0:
+                    x_end = min(map_width, x_start + view_size)
+                else:
+                    x_start = max(0, x_end - view_size)
             
-            if layer == "Elevation (Grayscale)":
-                view_data = self.map_to_grayscale(self.sim.elevation_normalized)[y_start:y_end, x_start:x_end]
-            elif layer == "Terrain":
-                view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-            elif layer == "Temperature":
+            if y_end - y_start < view_size:
+                if y_start == 0:
+                    y_end = min(map_height, y_start + view_size)
+                else:
+                    y_start = max(0, y_end - view_size)
+            
+            # Get data based on selected layer
+            if current_layer == "Elevation":
+                view_data = self.map_elevation_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
+            elif current_layer == "Temperature":
                 view_data = self.map_temperature_to_color(self.sim.temperature_celsius)[y_start:y_end, x_start:x_end]
-            elif layer == "Pressure":
+            elif current_layer == "Pressure":
                 view_data = self.map_pressure_to_color(self.sim.pressure)[y_start:y_end, x_start:x_end]
-            elif layer == "Rain Shadow":
+            elif current_layer == "Wind":
                 view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-            elif layer == "Biomes":
-                # Implement biome visualization using real biome data when available
-                # For now, just show terrain
+                # We'll add wind vectors separately
+            elif current_layer == "Biomes":
                 if hasattr(self.sim, 'biomes') and self.sim.biomes is not None:
                     # Implement biome color mapping when available
                     view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
                 else:
                     view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-            elif layer == "Ocean Temperature":
+            elif current_layer == "Ocean Temperature":
                 # Normalize ocean temps to 0-1 range for better visualization
                 ocean_temp_normalized = MapGenerator.normalize_data(self.sim.ocean_temperature)
                 view_data = self.map_ocean_temperature_to_color(ocean_temp_normalized)[y_start:y_end, x_start:x_end]
-            elif layer == "Precipitation":
+            elif current_layer == "Precipitation":
                 view_data = self.map_precipitation_to_color(self.sim.precipitation)[y_start:y_end, x_start:x_end]
-            elif layer == "Ocean Currents":
+            elif current_layer == "Ocean Currents":
                 # For ocean currents, still use elevation as background
                 view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
             else:
@@ -1014,16 +1059,92 @@ class Visualization:
             dialog_width = self.sim.zoom_dialog.view_size * self.sim.zoom_dialog.zoom_factor
             dialog_height = dialog_width
             
+            # Adjust position if would be off-screen
             if dialog_x + dialog_width > screen_width:
-                dialog_x = event.x - dialog_width - 20
+                dialog_x = screen_width - dialog_width - 20
             if dialog_y + dialog_height > screen_height:
-                dialog_y = event.y - dialog_height - 20
+                dialog_y = screen_height - dialog_height - 20
             
-            self.sim.zoom_dialog.geometry(f"+{dialog_x}+{dialog_y}")
+            # Position the dialog
+            self.sim.zoom_dialog.geometry(f"{dialog_width}x{dialog_height}+{dialog_x}+{dialog_y}")
             
-            # Update mouse over info
-            self.sim.update_mouse_over(event)
+            # Add wind vectors if showing wind layer
+            if current_layer == "Wind":
+                # Clear existing vectors
+                self.sim.zoom_dialog.canvas.delete("vector")
+                
+                # Draw wind vectors on the zoomed view
+                vector_spacing = 5  # Draw vectors every N pixels
+                vector_scale = 3.0  # Scale factor for vectors
+                
+                for i in range(0, view_size, vector_spacing):
+                    for j in range(0, view_size, vector_spacing):
+                        if y_start + i < map_height and x_start + j < map_width:
+                            u_val = self.sim.u[y_start + i, x_start + j]
+                            v_val = self.sim.v[y_start + i, x_start + j]
+                            
+                            # Scale vectors based on wind strength
+                            magnitude = np.sqrt(u_val**2 + v_val**2)
+                            if magnitude > 0:
+                                # Scale vector length by zoom factor
+                                dx = -u_val / magnitude * vector_scale * self.sim.zoom_dialog.zoom_factor
+                                dy = -v_val / magnitude * vector_scale * self.sim.zoom_dialog.zoom_factor
+                                
+                                # Calculate pixel positions
+                                x1 = j * self.sim.zoom_dialog.zoom_factor
+                                y1 = i * self.sim.zoom_dialog.zoom_factor
+                                x2 = x1 + dx
+                                y2 = y1 + dy
+                                
+                                # Draw the vector
+                                self.sim.zoom_dialog.canvas.create_line(
+                                    x1, y1, x2, y2, 
+                                    fill="white", 
+                                    arrow=tk.LAST,
+                                    width=1,
+                                    tags="vector"
+                                )
+            
+            # Draw ocean currents if showing ocean current layer
+            elif current_layer == "Ocean Currents":
+                # Clear existing vectors
+                self.sim.zoom_dialog.canvas.delete("vector")
+                
+                if hasattr(self.sim, 'current_u') and hasattr(self.sim, 'current_v'):
+                    # Draw current vectors on the zoomed view
+                    vector_spacing = 7  # Draw vectors every N pixels
+                    vector_scale = 5.0  # Scale factor for current vectors
+                    
+                    for i in range(0, view_size, vector_spacing):
+                        for j in range(0, view_size, vector_spacing):
+                            if y_start + i < map_height and x_start + j < map_width:
+                                # Only draw vectors in ocean areas
+                                if self.sim.elevation[y_start + i, x_start + j] <= 0:
+                                    u_val = self.sim.current_u[y_start + i, x_start + j]
+                                    v_val = self.sim.current_v[y_start + i, x_start + j]
+                                    
+                                    # Scale vectors based on current strength
+                                    magnitude = np.sqrt(u_val**2 + v_val**2)
+                                    if magnitude > 0.01:  # Only draw if magnitude is significant
+                                        # Scale vector length by zoom factor
+                                        dx = -u_val / magnitude * vector_scale * self.sim.zoom_dialog.zoom_factor
+                                        dy = -v_val / magnitude * vector_scale * self.sim.zoom_dialog.zoom_factor
+                                        
+                                        # Calculate pixel positions
+                                        x1 = j * self.sim.zoom_dialog.zoom_factor
+                                        y1 = i * self.sim.zoom_dialog.zoom_factor
+                                        x2 = x1 + dx
+                                        y2 = y1 + dy
+                                        
+                                        # Draw the vector
+                                        self.sim.zoom_dialog.canvas.create_line(
+                                            x1, y1, x2, y2, 
+                                            fill="#00AAFF",  # Light blue for ocean currents
+                                            arrow=tk.LAST,
+                                            width=1,
+                                            tags="vector"
+                                        )
             
         except Exception as e:
             print(f"Error updating zoom view: {e}")
-            print(f"Current layer: {self.sim.selected_layer.get()}") 
+            traceback.print_exc() 

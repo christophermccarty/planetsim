@@ -8,10 +8,23 @@ class SystemStats:
     def __init__(self, simulation):
         """Initialize the system stats object with reference to simulation app"""
         self.sim = simulation
-        self.print_stats_enabled = True
+        # Initialize using the simulation's show_stats setting
+        self.print_stats_enabled = getattr(simulation, 'show_stats', True)
         self.last_cycle_time = time.time()
         self.last_values = {}
         
+    def _get_cloud_bias(self, day_factor):
+        """Calculate cloud bias with safety check for cloud_cover attribute"""
+        try:
+            if hasattr(self.sim, 'cloud_cover') and self.sim.cloud_cover is not None:
+                cloud_mean = np.mean(self.sim.cloud_cover) * 100
+                cloud_bias = cloud_mean - (self.sim.cloud_cover * (0.7 - day_factor)).mean() * 100
+                return cloud_bias
+            else:
+                return 0.0  # Default value when no cloud data
+        except Exception:
+            return 0.0  # Safe fallback on error
+    
     def print_stats(self):
         """Print system statistics with live updates on the same lines"""
         try:
@@ -198,8 +211,15 @@ class SystemStats:
             # Calculate FPS with safety check
             fps = min(1/cycle_time, 999.9)  # Cap FPS display at 999.9
             
+            # Get simulation speed (hours per update)
+            sim_speed = getattr(self.sim, 'simulation_speed', 0)
+            
+            # Check if high-speed mode is active
+            high_speed = getattr(self.sim, 'high_speed_mode', False)
+            high_speed_text = " (Approx)" if high_speed and sim_speed >= 12 else ""
+            
             # Create the output strings with fixed width
-            cycle_str = f"Simulation Cycle: {self.sim.time_step:6d} | Cycle Time: {cycle_time:6.3f}s | FPS: {fps:5.1f}"
+            cycle_str = f"Simulation Cycle: {self.sim.time_step:6d} | Cycle Time: {cycle_time:6.3f}s | FPS: {fps:5.1f} | Sim Speed: {sim_speed:4.1f}h/update{high_speed_text}"
             temp_str = f"Temperature (°C)   | Avg: {avg_temp:6.1f}  | Min: {min_temp:6.1f} | Max: {max_temp:6.1f} | Δ: {temp_change:+6.2f}"
             pres_str = f"Pressure (Pa)      | Avg: {avg_pressure:8.0f} | Min: {min_pressure:8.0f} | Max: {max_pressure:8.0f} | Δ: {pressure_change:+6.0f}"
             wind_str = f"Wind Speed (m/s)   | Avg: {avg_wind:6.1f}  | Min: {min_wind:6.1f} | Max: {max_wind:6.1f} | Δ: {wind_change:+6.2f}"
@@ -228,7 +248,7 @@ class SystemStats:
                 
                 # 1. DIURNAL CYCLE TRACKING
                 # Calculate day/night phase more precisely
-                f"Day-Night Status   | Phase: {'Day' if day_factor > 0.5 else 'Night'} | Sol. Factor: {day_factor:0.2f} | Cloud Bias: {np.mean(self.sim.cloud_cover) * 100 - (self.sim.cloud_cover * (0.7 - day_factor)).mean() * 100:+.1f}%",
+                f"Day-Night Status   | Phase: {'Day' if day_factor > 0.5 else 'Night'} | Sol. Factor: {day_factor:0.2f} | Cloud Bias: {self._get_cloud_bias(day_factor):+.1f}%",
                 
                 # 2. ENERGY FLUX BREAKDOWN
                 # Calculate percentage contribution of each energy component

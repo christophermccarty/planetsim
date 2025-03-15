@@ -109,6 +109,17 @@ class Temperature:
             if not hasattr(self, '_delta_T') or self._delta_T is None:
                 self._delta_T = np.zeros_like(self.sim.temperature_celsius, dtype=np.float32)
             
+            # STABILITY CHECK: Handle NaN values in temperature at the beginning
+            if np.any(np.isnan(self.sim.temperature_celsius)):
+                print("WARNING: NaN values detected in temperature, resetting to reasonable defaults")
+                is_land = self.sim.elevation > 0
+                nan_mask = np.isnan(self.sim.temperature_celsius)
+                self.sim.temperature_celsius[nan_mask & is_land] = 15.0  # Default land temp
+                self.sim.temperature_celsius[nan_mask & ~is_land] = 5.0  # Default ocean temp
+            
+            # STABILITY CHECK: Clip extreme temperatures before calculations
+            self.sim.temperature_celsius = np.clip(self.sim.temperature_celsius, -100.0, 100.0)
+            
             params = self.sim.climate_params
             
             # Type conversion for better performance
@@ -148,6 +159,14 @@ class Temperature:
             
             # --- CLOUD EFFECTS ---
             if hasattr(self.sim, 'cloud_cover'):
+                # STABILITY CHECK: Handle NaN values in cloud cover
+                if np.any(np.isnan(self.sim.cloud_cover)):
+                    print("WARNING: NaN values detected in cloud cover, resetting to zero")
+                    self.sim.cloud_cover = np.nan_to_num(self.sim.cloud_cover, nan=0.0)
+                
+                # STABILITY CHECK: Clip cloud cover values
+                self.sim.cloud_cover = np.clip(self.sim.cloud_cover, 0.0, 1.0)
+                
                 # Cloud albedo calculation (vectorized)
                 cloud_albedo = np.float32(0.6)
                 effective_albedo = (1 - self.sim.cloud_cover) * self._base_albedo * zenith_factor + self.sim.cloud_cover * cloud_albedo
@@ -204,12 +223,18 @@ class Temperature:
             np.add(self._solar_in, greenhouse_forcing, out=self._net_flux)
             np.subtract(self._net_flux, self._longwave_out, out=self._net_flux)
             
+            # STABILITY CHECK: Remove extreme flux values
+            self._net_flux = np.clip(self._net_flux, -1000.0, 1000.0)
+            
             self.sim.energy_budget['net_flux'] = float(np.mean(self._net_flux))
             
             # --- HEAT ADVECTION ---
             # Calculate temperature gradients
             dT_dy, dT_dx = np.gradient(self.sim.temperature_celsius, self.sim.grid_spacing_y, self.sim.grid_spacing_x)
             temperature_advection = -(self.sim.u * dT_dx + self.sim.v * dT_dy)
+            
+            # STABILITY CHECK: Limit advection to reasonable values
+            temperature_advection = np.clip(temperature_advection, -5.0, 5.0)
             
             # --- HEAT CAPACITY ---
             # Initialize heat capacity array (reuse if possible)
@@ -222,8 +247,19 @@ class Temperature:
             
             # Adjust for humidity (vectorized)
             if hasattr(self.sim, 'humidity'):
+                # STABILITY CHECK: Handle NaN values in humidity
+                if np.any(np.isnan(self.sim.humidity)):
+                    print("WARNING: NaN values detected in humidity, resetting to reasonable defaults")
+                    self.sim.humidity = np.nan_to_num(self.sim.humidity, nan=0.5)
+                
+                # STABILITY CHECK: Clip humidity values
+                self.sim.humidity = np.clip(self.sim.humidity, 0.01, 1.0)
+                
                 moisture_factor = 1.0 + self.sim.humidity * 0.5
                 self._heat_capacity[is_land] *= moisture_factor[is_land]
+            
+            # STABILITY CHECK: Ensure heat capacity is never zero
+            self._heat_capacity = np.maximum(self._heat_capacity, 1.0e4)
             
             # --- TEMPERATURE CHANGE ---
             # Calculate delta T (vectorized)
@@ -234,8 +270,18 @@ class Temperature:
             np.multiply(self._delta_T, self.sim.time_step_seconds, out=self._delta_T)
             np.add(self._delta_T, temperature_advection * self.sim.time_step_seconds, out=self._delta_T)
             
+            # STABILITY CHECK: Limit temperature change per step
+            self._delta_T = np.clip(self._delta_T, -5.0, 5.0)
+            
             # Apply temperature change (vectorized)
             np.add(self.sim.temperature_celsius, self._delta_T, out=self.sim.temperature_celsius)
+            
+            # STABILITY CHECK: Handle any NaN values that may have been created
+            if np.any(np.isnan(self.sim.temperature_celsius)):
+                print("WARNING: NaN values generated during temperature update, fixing")
+                nan_mask = np.isnan(self.sim.temperature_celsius)
+                self.sim.temperature_celsius[nan_mask & is_land] = 15.0  # Default land temp
+                self.sim.temperature_celsius[nan_mask & ~is_land] = 5.0  # Default ocean temp
             
             # --- APPLY DIFFUSION WITH SEPARATE LAND AND OCEAN TREATMENT ---
             # Treat land and ocean diffusion separately
@@ -278,12 +324,18 @@ class Temperature:
                 sigma=0.5  # Reduced final smoothing - just enough to remove any remaining artifacts
             ).astype(np.float32)
             
+            # FINAL STABILITY CHECK: Clip temperatures to physically reasonable bounds
+            self.sim.temperature_celsius = np.clip(self.sim.temperature_celsius, -100.0, 100.0)
+            
             # Track temperature history
             if 'temperature_history' not in self.sim.energy_budget:
                 self.sim.energy_budget['temperature_history'] = []
             
             # Append current average temperature to history
-            self.sim.energy_budget['temperature_history'].append(float(np.mean(self.sim.temperature_celsius)))
+            avg_temp = float(np.mean(self.sim.temperature_celsius))
+            # Only append if it's a valid value
+            if not np.isnan(avg_temp) and not np.isinf(avg_temp):
+                self.sim.energy_budget['temperature_history'].append(avg_temp)
             
         except Exception as e:
             print(f"Error updating temperature: {e}")
@@ -472,46 +524,55 @@ class Temperature:
 
     def calculate_water_vapor_saturation(self, T):
         """
-        Calculate water vapor saturation pressure using the Clausius-Clapeyron equation
-        T: Temperature in Celsius
-        Returns: Saturation vapor pressure in Pa
-        
-        Optimized with caching for repeated temperature calculations
+        Calculate saturation vapor pressure (hPa) based on temperature (°C)
+        Uses Bolton's formula for accuracy and efficiency with enhanced stability.
         """
-        # Initialize cache attributes if they don't exist
-        if not hasattr(self, '_saturation_vapor_cache') or not hasattr(self, '_temp_range_for_cache'):
-            self._saturation_vapor_cache = None
-            self._temp_range_for_cache = None
-        
-        # Check if we have a valid temperature range cache
-        if self._saturation_vapor_cache is None or self._temp_range_for_cache is None:
-            # Create cache with temperature range from -50°C to +50°C with 0.1°C steps
-            min_temp, max_temp = -50.0, 50.0
-            step = 0.1
-            self._temp_range_for_cache = np.arange(min_temp, max_temp + step, step, dtype=np.float32)
+        try:
+            # Ensure T is a numpy array for vectorized operations
+            if not isinstance(T, np.ndarray):
+                T = np.array(T)
             
-            # Constants for water vapor
-            L = 2.5e6  # Latent heat of vaporization (J/kg)
-            Rv = 461.5  # Gas constant for water vapor (J/(kg·K))
-            T0 = 273.15  # Reference temperature (K)
-            e0 = 611.0  # Reference vapor pressure (Pa)
+            # Check for NaN or inf values and replace with reasonable defaults
+            bad_values = np.isnan(T) | np.isinf(T)
+            if np.any(bad_values):
+                print(f"WARNING: Found {np.sum(bad_values)} NaN/Inf values in temperature for vapor saturation")
+                # Create a copy to avoid modifying the original array
+                T = np.copy(T)
+                # Replace bad values with reasonable defaults (15°C)
+                T[bad_values] = 15.0
+                
+            # Hard clip temperature values to prevent numerical issues
+            T_clipped = np.clip(T, -50, 50)  # Limit to physically reasonable range
             
-            # Calculate once for all temperatures in range
-            T_kelvin = self._temp_range_for_cache + 273.15
-            self._saturation_vapor_cache = e0 * np.exp((L/Rv) * (1/T0 - 1/T_kelvin))
-        
-        # Handle None input
-        if T is None:
-            return np.zeros_like(self.sim.temperature_celsius)
+            # Initialize cache if needed (do this once for performance)
+            if not hasattr(self, '_saturation_vapor_cache') or self._saturation_vapor_cache is None:
+                # Create a temperature range covering -50°C to 50°C in 0.1°C steps
+                temp_range = np.linspace(-50, 50, 1001)
+                
+                # Apply Bolton's formula to the range: e_sat = 6.112 * exp(17.67 * T / (T + 243.5))
+                self._saturation_vapor_cache = 6.112 * np.exp(17.67 * temp_range / (temp_range + 243.5))
+                self._temp_range_for_cache = temp_range
             
-        # Use vectorized lookup by rounding temperatures to nearest 0.1°C
-        # and finding indices in the cached array
-        T_floored = np.round((np.clip(T, self._temp_range_for_cache[0], 
-                                      self._temp_range_for_cache[-1]) - 
-                             self._temp_range_for_cache[0]) / 0.1).astype(int)
-        
-        # Return values from cache using advanced indexing
-        return self._saturation_vapor_cache[T_floored]
+            # Convert temperature to index in the cache (0 = -50°C, 1000 = 50°C)
+            indices = np.clip(((T_clipped + 50) * 10).astype(np.int32), 0, 1000)
+            
+            # Look up values in the cache
+            result = self._saturation_vapor_cache[indices]
+            
+            # Final validation: ensure result is within physical limits
+            if np.any(np.isnan(result)) or np.any(np.isinf(result)):
+                print("WARNING: Saturation vapor calculation produced invalid results, fixing")
+                result = np.nan_to_num(result, nan=6.112, posinf=100.0, neginf=0.1)
+                
+            return result
+            
+        except Exception as e:
+            print(f"Error in calculate_water_vapor_saturation: {e}")
+            # Return a safe default value if there's an error
+            if isinstance(T, np.ndarray):
+                return np.full_like(T, 6.112)
+            else:
+                return 6.112
 
     def calculate_water_density(self, temperature):
         """Calculate water density based on temperature"""

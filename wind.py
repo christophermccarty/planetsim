@@ -84,66 +84,6 @@ class Wind:
             print(f"Error in global circulation initialization: {e}")
             traceback.print_exc()
 
-    def calculate(self):
-        """Calculate wind patterns with terrain effects using vectorized operations"""
-        # Calculate terrain gradients (vectorized)
-        terrain_gradient_y, terrain_gradient_x = np.gradient(self.sim.elevation)
-        
-        # Calculate terrain slope magnitude (vectorized)
-        terrain_slope = np.sqrt(terrain_gradient_x**2 + terrain_gradient_y**2)
-        
-        # Calculate wind direction (vectorized)
-        wind_magnitude = np.sqrt(self.sim.u**2 + self.sim.v**2)
-        wind_direction_x = np.divide(self.sim.u, wind_magnitude, out=np.zeros_like(self.sim.u), where=wind_magnitude!=0)
-        wind_direction_y = np.divide(self.sim.v, wind_magnitude, out=np.zeros_like(self.sim.v), where=wind_magnitude!=0)
-        
-        # Calculate dot product between wind direction and terrain gradient (vectorized)
-        upslope_factor = (wind_direction_x * terrain_gradient_x + wind_direction_y * terrain_gradient_y)
-        
-        # Calculate mountain blocking effect (vectorized)
-        mountain_height_threshold = 1000  # meters
-        mountain_factor = np.clip((self.sim.elevation - mountain_height_threshold) / 1000, 0, 1)
-        
-        # Calculate blocking strength (vectorized)
-        # Strong blocking when wind goes upslope on steep terrain
-        positive_upslope = np.clip(upslope_factor, 0, None)
-        blocking_strength = positive_upslope * terrain_slope * mountain_factor
-        blocking_strength = np.clip(blocking_strength, 0, 0.9)
-        
-        # Apply mountain blocking to wind (vectorized)
-        wind_reduction = 1.0 - blocking_strength
-        # Only apply reduction over land
-        is_land = self.sim.elevation > 0
-        self.sim.u = np.where(is_land, self.sim.u * wind_reduction, self.sim.u)
-        self.sim.v = np.where(is_land, self.sim.v * wind_reduction, self.sim.v)
-        
-        # Apply terrain channeling effects (vectorized)
-        # Wind tends to follow valleys
-        valley_mask = (self.sim.elevation > 0) & (self.sim.elevation < mountain_height_threshold)
-        if np.any(valley_mask):
-            # Calculate valley direction (perpendicular to slope) (vectorized)
-            valley_direction_x = -terrain_gradient_y
-            valley_direction_y = terrain_gradient_x
-            
-            # Normalize valley direction vectors (vectorized)
-            valley_magnitude = np.sqrt(valley_direction_x**2 + valley_direction_y**2)
-            valley_direction_x = np.divide(valley_direction_x, valley_magnitude, 
-                                          out=np.zeros_like(valley_direction_x), where=valley_magnitude!=0)
-            valley_direction_y = np.divide(valley_direction_y, valley_magnitude, 
-                                          out=np.zeros_like(valley_direction_y), where=valley_magnitude!=0)
-            
-            # Calculate channeling effect (vectorized)
-            channeling_strength = terrain_slope * 0.5
-            channeling_strength = np.clip(channeling_strength, 0, 0.5)
-            
-            # Apply channeling only in valley areas (vectorized)
-            channeling_mask = valley_mask & (channeling_strength > 0.1)
-            if np.any(channeling_mask):
-                self.sim.u[channeling_mask] = ((1 - channeling_strength[channeling_mask]) * self.sim.u[channeling_mask] + 
-                                          channeling_strength[channeling_mask] * valley_direction_x[channeling_mask] * wind_magnitude[channeling_mask])
-                self.sim.v[channeling_mask] = ((1 - channeling_strength[channeling_mask]) * self.sim.v[channeling_mask] + 
-                                          channeling_strength[channeling_mask] * valley_direction_y[channeling_mask] * wind_magnitude[channeling_mask])
-
     def update(self):
         """Update wind speed and direction"""
         try:
