@@ -751,6 +751,13 @@ class Visualization:
             # Get current layer
             current_layer = self.sim.selected_layer.get()
             
+            # Check if layer has changed and force a cache clean
+            if hasattr(self, '_last_selected_layer') and self._last_selected_layer != current_layer:
+                self._clean_image_cache()
+            
+            # Update the last selected layer
+            self._last_selected_layer = current_layer
+            
             # If it's pressure and we have a cached image, use that
             if current_layer == "Pressure" and self._pressure_image is not None:
                 self.canvas.delete("all")
@@ -767,12 +774,18 @@ class Visualization:
             if current_layer == "Elevation":
                 rgb_data = self.map_to_grayscale(self.sim.elevation_normalized)
                 img = Image.fromarray(rgb_data)
+                photo_img = ImageTk.PhotoImage(image=img)
+                self.image_cache['elevation'] = photo_img
             elif current_layer == "Altitude":
                 rgb_data = self.map_altitude_to_color(self.sim.elevation)
                 img = Image.fromarray(rgb_data)
+                photo_img = ImageTk.PhotoImage(image=img)
+                self.image_cache['altitude'] = photo_img
             elif current_layer == "Temperature":
                 rgba_data = self.map_temperature_to_color(self.sim.temperature_celsius)
                 img = Image.fromarray(rgba_data, 'RGBA')
+                photo_img = ImageTk.PhotoImage(image=img)
+                self.image_cache['temperature'] = photo_img
             elif current_layer == "Ocean Temperature":
                 # Create normalized ocean temperature data
                 # Scale from -2°C to 30°C (typical ocean temperature range)
@@ -782,6 +795,8 @@ class Visualization:
                 np.clip(normalized_temp, 0, 1, out=normalized_temp)  # Ensure values are between 0-1
                 rgb_data = self.map_ocean_temperature_to_color(normalized_temp)
                 img = Image.fromarray(rgb_data)
+                photo_img = ImageTk.PhotoImage(image=img)
+                self.image_cache['ocean_temperature'] = photo_img
             elif current_layer == "Pressure":
                 # Generate the pressure visualization directly
                 rgba_data = self.map_pressure_to_color(self.sim.pressure)
@@ -805,7 +820,7 @@ class Visualization:
             photo_img = ImageTk.PhotoImage(image=img)
             
             # Store reference to prevent garbage collection
-            self.image_cache['map'] = photo_img
+            self.image_cache[current_layer] = photo_img
             
             # Clear canvas
             self.canvas.delete("all")
@@ -904,26 +919,42 @@ class Visualization:
     
     def _clean_image_cache(self):
         """Clean up the image cache to prevent memory leaks"""
-        # Keep only the most recent entries for each key
-        # This is particularly important for the "wind_vector" and "map" entries
-        # which are recreated each update cycle
-        if len(self.image_cache) > 10:  # Arbitrary threshold
-            # Keep only essential cache items
-            essential_keys = ['map', 'pressure', 'precipitation']
-            current_layer = self.sim._last_selected_layer if hasattr(self.sim, '_last_selected_layer') else None
-            
-            # Create a new cache with only the items we want to keep
-            new_cache = {}
-            for key in essential_keys:
+        # Keep only the current layer's image and a few essential ones
+        current_layer = getattr(self.sim, 'selected_layer', None)
+        if current_layer:
+            current_layer = current_layer.get()
+        
+        # Create a new cache with only the items we want to keep
+        new_cache = {}
+        
+        # Keep the current layer's image
+        if current_layer and current_layer in self.image_cache:
+            new_cache[current_layer] = self.image_cache[current_layer]
+        
+        # Also keep alternative maps for the same layer (like temperature variations)
+        # These specific combinations should be preserved for layer-switching performance
+        layer_combinations = {
+            'Temperature': ['temperature', 'temperature_with_clouds'],
+            'Wind': ['wind_bg', 'wind_vectors'],
+            'Pressure': ['pressure'],
+            'Precipitation': ['precipitation'],
+            'Elevation': ['elevation'],
+            'Altitude': ['altitude'],
+            'Ocean Temperature': ['ocean_temperature']
+        }
+        
+        # Preserve any related images for the current layer
+        if current_layer and current_layer in layer_combinations:
+            for key in layer_combinations[current_layer]:
                 if key in self.image_cache:
                     new_cache[key] = self.image_cache[key]
-            
-            # Also keep the current layer's image
-            if current_layer and current_layer in self.image_cache:
-                new_cache[current_layer] = self.image_cache[current_layer]
-                
-            # Replace the old cache with the new one
-            self.image_cache = new_cache
+        
+        # Preserve any special images that are actively used
+        if self._last_selected_layer and self._last_selected_layer in self.image_cache:
+            new_cache[self._last_selected_layer] = self.image_cache[self._last_selected_layer]
+        
+        # Replace the old cache with the new one
+        self.image_cache = new_cache
     
     def _update_visualization_safe(self):
         """Safely update visualization with error handling"""

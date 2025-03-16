@@ -12,6 +12,12 @@ class SystemStats:
         self.print_stats_enabled = getattr(simulation, 'show_stats', True)
         self.last_cycle_time = time.time()
         self.last_values = {}
+        # Set update frequency to 1 to update stats every cycle 
+        self.update_frequency = 1  # Update every cycle for better responsiveness
+        self.last_update_step = 0
+        
+        # Add debugging info
+        print(f"SystemStats initialized with print_stats_enabled={self.print_stats_enabled}")
         
     def _get_cloud_bias(self, day_factor):
         """Calculate cloud bias with safety check for cloud_cover attribute"""
@@ -28,28 +34,71 @@ class SystemStats:
     def print_stats(self):
         """Print system statistics with live updates on the same lines"""
         try:
+            # Add debug info about current state
+            debug_mode = False  # Set to True to enable debugging
+            if debug_mode:
+                print(f"\nprint_stats called: enabled={self.print_stats_enabled}, step={self.sim.time_step}, last_update={getattr(self, 'last_update_step', 0)}")
+                
             # Check if stats should be printed
             if not self.print_stats_enabled:
+                if debug_mode:
+                    print("Stats disabled, returning")
                 return
                 
+            # Selective calculation - only update stats every N cycles
+            # Include a special case to force update on first display after enabling
+            force_update = getattr(self, 'force_next_update', False)
+            if not force_update and self.sim.time_step % self.update_frequency != 0:
+                if debug_mode:
+                    print(f"Skipping update due to frequency: force={force_update}, step={self.sim.time_step}, freq={self.update_frequency}")
+                # Just print the previous stats without recalculating
+                # This significantly reduces CPU overhead of stats display
+                return
+            
+            # Reset force update flag if it was set
+            if hasattr(self, 'force_next_update'):
+                if self.force_next_update and debug_mode:
+                    print("Resetting force_next_update flag")
+                self.force_next_update = False
+            
             # Calculate cycle time
             current_time = time.time()
             cycle_time = max(current_time - self.last_cycle_time, 0.000001)  # Prevent division by zero
             self.last_cycle_time = current_time
             
-            # Get average/min/max values
-            avg_temp = np.mean(self.sim.temperature_celsius)
-            min_temp = np.min(self.sim.temperature_celsius)
-            max_temp = np.max(self.sim.temperature_celsius)
+            # Record last update step to track when stats were last calculated
+            self.last_update_step = self.sim.time_step
             
-            avg_pressure = np.mean(self.sim.pressure)
-            min_pressure = np.min(self.sim.pressure)
-            max_pressure = np.max(self.sim.pressure)
+            if debug_mode:
+                print(f"Calculating new stats for step {self.sim.time_step}")
             
+            # --- VECTORIZED STATISTICS CALCULATION ---
+            # Calculate multiple statistics in a single pass where possible
+            
+            # Temperature stats
+            temp_stats = np.array([
+                np.mean(self.sim.temperature_celsius),
+                np.min(self.sim.temperature_celsius),
+                np.max(self.sim.temperature_celsius)
+            ])
+            avg_temp, min_temp, max_temp = temp_stats
+            
+            # Pressure stats
+            pressure_stats = np.array([
+                np.mean(self.sim.pressure),
+                np.min(self.sim.pressure),
+                np.max(self.sim.pressure)
+            ])
+            avg_pressure, min_pressure, max_pressure = pressure_stats
+            
+            # Wind stats (calculate wind_speed once and reuse)
             wind_speed = np.sqrt(self.sim.u**2 + self.sim.v**2)
-            min_wind = np.min(wind_speed)
-            avg_wind = np.mean(wind_speed)
-            max_wind = np.max(wind_speed)
+            wind_stats = np.array([
+                np.mean(wind_speed),
+                np.min(wind_speed),
+                np.max(wind_speed)
+            ])
+            avg_wind, min_wind, max_wind = wind_stats
             
             # Get energy budget values
             solar_in = self.sim.energy_budget.get('solar_in', 0)
@@ -122,42 +171,67 @@ class SystemStats:
             is_land = self.sim.elevation > 0
             is_ocean = ~is_land
             
-            if np.any(is_land) and np.any(is_ocean):
-                land_temp = np.mean(self.sim.temperature_celsius[is_land])
-                ocean_temp = np.mean(self.sim.temperature_celsius[is_ocean])
-                temp_diff = land_temp - ocean_temp
-                
-                # Store and calculate change in differential
-                if 'temp_diff' not in self.last_values:
+            # --- SELECTIVE STAT CALCULATION BASED ON SIMULATION SPEED ---
+            # If in high-speed mode, calculate less frequently the more complex stats
+            high_speed = getattr(self.sim, 'high_speed_mode', False)
+            sim_speed = getattr(self.sim, 'simulation_speed', 0)
+            
+            # For very high speed, calculate complex stats only occasionally
+            calculate_complex_stats = not (high_speed and sim_speed >= 12) or (self.sim.time_step % 10 == 0)
+            
+            if calculate_complex_stats:
+                # Calculate land vs ocean temperature difference
+                if np.any(is_land) and np.any(is_ocean):
+                    land_temp = np.mean(self.sim.temperature_celsius[is_land])
+                    ocean_temp = np.mean(self.sim.temperature_celsius[is_ocean])
+                    temp_diff = land_temp - ocean_temp
+                    
+                    # Store and calculate change in differential
+                    if 'temp_diff' not in self.last_values:
+                        self.last_values['temp_diff'] = temp_diff
+                    diff_change = temp_diff - self.last_values['temp_diff']
                     self.last_values['temp_diff'] = temp_diff
-                diff_change = temp_diff - self.last_values['temp_diff']
-                self.last_values['temp_diff'] = temp_diff
+                    
+                    land_ocean_stats = f"Land-Ocean Temp   | Land: {land_temp:6.1f}°C | Ocean: {ocean_temp:6.1f}°C | Diff: {temp_diff:+6.1f}°C | Δ: {diff_change:+6.2f}°C"
+                else:
+                    land_ocean_stats = "Land-Ocean Temp   | No valid data"
                 
-                land_ocean_stats = f"Land-Ocean Temp   | Land: {land_temp:6.1f}°C | Ocean: {ocean_temp:6.1f}°C | Diff: {temp_diff:+6.1f}°C | Δ: {diff_change:+6.2f}°C"
-            else:
-                land_ocean_stats = "Land-Ocean Temp   | No valid data"
-            
-            # 3. Wind patterns - directional bias and correlation with pressure gradients
-            # Get predominant wind direction
-            u_mean = np.mean(self.sim.u)
-            v_mean = np.mean(self.sim.v)
-            mean_direction = self.sim.wind_system.calculate_direction(u_mean, v_mean)
-            
-            # Calculate wind vorticity (curl) - indicator of cyclonic/anticyclonic behavior
-            dy = self.sim.grid_spacing_y
-            dx = self.sim.grid_spacing_x
-            dvdx = np.gradient(self.sim.v, axis=1) / dx
-            dudy = np.gradient(self.sim.u, axis=0) / dy
-            vorticity = dvdx - dudy
-            mean_vorticity = np.mean(vorticity)
-            
-            # Store and calculate change
-            if 'vorticity' not in self.last_values:
+                # Calculate wind patterns - directional bias and vorticity
+                u_mean = np.mean(self.sim.u)
+                v_mean = np.mean(self.sim.v)
+                mean_direction = self.sim.wind_system.calculate_direction(u_mean, v_mean)
+                
+                # Calculate wind vorticity (curl) - indicator of cyclonic/anticyclonic behavior
+                dy = self.sim.grid_spacing_y
+                dx = self.sim.grid_spacing_x
+                dvdx = np.gradient(self.sim.v, axis=1) / dx
+                dudy = np.gradient(self.sim.u, axis=0) / dy
+                vorticity = dvdx - dudy
+                mean_vorticity = np.mean(vorticity)
+                
+                # Store and calculate change
+                if 'vorticity' not in self.last_values:
+                    self.last_values['vorticity'] = mean_vorticity
+                vorticity_change = mean_vorticity - self.last_values['vorticity']
                 self.last_values['vorticity'] = mean_vorticity
-            vorticity_change = mean_vorticity - self.last_values['vorticity']
-            self.last_values['vorticity'] = mean_vorticity
-            
-            wind_pattern_stats = f"Wind Patterns     | Dir: {mean_direction:5.1f}° | Vorticity: {mean_vorticity:+7.2e} | Δ: {vorticity_change:+7.2e}"
+                
+                # Cache the computed values for use when not calculating complex stats
+                self._cached_land_ocean_stats = f"Land-Ocean Temp   | Land: {land_temp:6.1f}°C | Ocean: {ocean_temp:6.1f}°C | Diff: {temp_diff:+6.1f}°C | Δ: {diff_change:+6.2f}°C"
+                self._cached_wind_pattern_stats = f"Wind Patterns     | Dir: {mean_direction:5.1f}° | Vorticity: {mean_vorticity:+7.2e} | Δ: {vorticity_change:+7.2e}"
+                
+                # Assign the wind_pattern_stats variable to use in output
+                wind_pattern_stats = self._cached_wind_pattern_stats
+            else:
+                # Use cached values for complex stats when in high-speed mode
+                if hasattr(self, '_cached_land_ocean_stats'):
+                    land_ocean_stats = self._cached_land_ocean_stats
+                else:
+                    land_ocean_stats = "Land-Ocean Temp   | [Calculating...]"
+                    
+                if hasattr(self, '_cached_wind_pattern_stats'):
+                    wind_pattern_stats = self._cached_wind_pattern_stats
+                else:
+                    wind_pattern_stats = "Wind Patterns     | [Calculating...]"
             
             # 4. Energy balance check (incoming vs outgoing)
             energy_in = solar_in + greenhouse
@@ -243,7 +317,6 @@ class SystemStats:
             extra_metrics.extend([
                 land_ocean_stats,
                 wind_pattern_stats,
-                energy_balance,
                 stability_stats,
                 
                 # 1. DIURNAL CYCLE TRACKING
@@ -253,6 +326,9 @@ class SystemStats:
                 # 2. ENERGY FLUX BREAKDOWN
                 # Calculate percentage contribution of each energy component
                 f"Energy Components  | Solar: {solar_in/max(energy_in, 1e-5)*100:4.1f}% | GHG: {greenhouse/max(energy_in, 1e-5)*100:4.1f}% | Cloud: {self.sim.energy_budget.get('cloud_effect', 0)/max(energy_in, 1e-5)*100:4.1f}% | Imbalance: {energy_imbalance/max(energy_in, 1e-5)*100:+4.1f}%",
+                
+                # Add the energy balance line here (moved from above)
+                energy_balance,
                 
                 # 3. HUMIDITY TRANSPORT METRICS
                 # Add moisture budget if humidity available
@@ -264,31 +340,39 @@ class SystemStats:
                 
                 hemisphere_stats
             ])
-            extra_lines += 9  # Added 4 new diagnostic lines
+            extra_lines += 9  # Added 9 new diagnostic lines
             
             total_lines = base_lines + extra_lines
             
-            # Only print these lines once at the start
+            # Clear screen and create space for stats on first run
             if self.sim.time_step == 1:
-                print("\n" * total_lines)  # Create blank lines
-                print(f"\033[{total_lines}A", end='')  # Move cursor up
+                # Clear screen and move to home position
+                print("\033[2J\033[H", end='')
+                # Print empty lines to reserve space for stats
+                print("\n" * total_lines)
+                # Move cursor back up to beginning of stats area
+                print(f"\033[{total_lines}A", end='')
             
-            # Update all lines in place
-            print(f"\033[K{cycle_str}", end='\r\n')      # Clear line and move to next
-            print(f"\033[K{temp_str}", end='\r\n')       # Clear line and move to next
-            print(f"\033[K{pres_str}", end='\r\n')       # Clear line and move to next
-            print(f"\033[K{wind_str}", end='\r\n')       # Clear line and move to next
-            print(f"\033[K{energy_in_str}", end='\r\n')  # Clear line and move to next
+            # Create list of all lines to print
+            all_stats_lines = [
+                cycle_str,
+                temp_str,
+                pres_str,
+                wind_str,
+                energy_in_str,
+            ] + extra_metrics
             
-            # Print extra metrics
-            for metric in extra_metrics:
-                print(f"\033[K{metric}", end='\r\n')     # Clear line and move to next
+            # Print each line with cursor control to update in place
+            for line in all_stats_lines:
+                print(f"\033[K{line}", end='\r\n')  # Clear line, print stats, move to next line
             
-            # Last line doesn't need newline
-            print(f"\033[K{energy_balance}", end='\r')
+            # Move cursor back up to start position for next update
+            print(f"\033[{total_lines}A", end='\r')
             
-            # Move cursor back up to the start position
-            print(f"\033[{total_lines}A", end='')
+            # Force flush stdout to ensure display updates immediately
+            import sys
+            sys.stdout.flush()
+            
         except Exception as e:
             print(f"Error in print_system_stats: {e}")
             traceback.print_exc() 

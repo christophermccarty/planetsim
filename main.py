@@ -40,7 +40,7 @@ class SimulationApp:
             self.map_height = self.map_size # Set default height until image is loaded
             
             # Add show_stats variable to control system stats display
-            self.show_stats = False  # Default to showing stats
+            self.show_stats = True  # Default to showing stats
             
             # Variable to track the selected layer - this needs to exist before setup_gui
             self.selected_layer = tk.StringVar(value="Elevation")
@@ -56,7 +56,7 @@ class SimulationApp:
             self.target_update_rate = 1.0  # Target updates per second
             self.min_simulation_hours_per_update = 1.0  # Minimum hours to simulate per update
             self.max_simulation_hours_per_update = 24.0  # Maximum hours to simulate per update
-            self.high_speed_mode = True  # Enable high-speed physics approximation
+            self.high_speed_mode = False  # Disable high-speed physics approximation by default
             self.physics_downsampling = 4  # Spatial downsampling factor for faster physics
             self._last_step_time = 0.1  # Initialize with a reasonable default value
             self.Omega = 7.2921159e-5
@@ -272,7 +272,7 @@ class SimulationApp:
             }
             
             # Flag to track if ocean data is available and calculated successfully
-            self.ocean_data_available = False
+            self.ocean_data_available = True
          
             # Initialize wind
             self.wind_system.initialize()
@@ -376,7 +376,7 @@ class SimulationApp:
         self.high_speed_check.pack(side=tk.RIGHT, padx=5)
         
         # Stats display toggle
-        self.stats_var = tk.BooleanVar(value=self.show_stats)
+        self.stats_var = tk.BooleanVar(value=True)  # Use True as default value
         self.stats_check = ttk.Checkbutton(
             perf_frame, 
             text="Show Stats", 
@@ -567,86 +567,119 @@ class SimulationApp:
             traceback.print_exc()
 
     def on_generate(self, elevation_data=None):
-        """Start generating the simulation"""
-        print("on_generate() method called")
-        # Cancel the previous simulation if running
-        if hasattr(self, 'simulation_after_id'):
-            print("Canceling previous simulation")
-            self.root.after_cancel(self.simulation_after_id)
-
-        # Reset time_step
-        self.time_step = 0
+        """Handle generating a simulation or starting a new simulation"""
+        # Don't restart if already running
+        if hasattr(self, 'simulation_running') and self.simulation_running:
+            print("Simulation is already running")
+            return
         
-        # Make sure simulation_running is False during initialization
-        self.simulation_running = False
-
-        # Generate coordinate arrays
-        x = np.linspace(0, 1, self.map_width, endpoint=False)
-        y = np.linspace(0, 1, self.map_height, endpoint=False)
-        x_coords, y_coords = np.meshgrid(x, y)
-
-        # Grid spacing in meters
-        earth_circumference = 40075000
-        self.grid_spacing_x = earth_circumference / self.map_width
-        self.grid_spacing_y = earth_circumference / (2 * self.map_height)
-
-        # Initialize humidity
-        self.humidity = np.full((self.map_height, self.map_width), 50, dtype=np.float32)
-
-        # Convert latitude to radians
-        self.latitudes_rad = np.deg2rad(self.latitude)
-
-        # Use fixed values instead of sliders
-        self.global_octaves = 6
-        self.global_frequency = 2.0
-        self.global_lacunarity = 2.0
-        self.global_persistence = 0.5
-
-        print("Initializing systems...")
-        # Initialize temperature
-        self.temperature.initialize()
-
-        # Initialize pressure system
-        print("Initializing pressure...")
-        self.pressure_system.initialize()
-
-        # Initialize wind
-        print("Initializing winds...")
-        self.wind_system.initialize()
-
-        # Initialize precipitation
-        print("Initializing precipitation...")
-        self.precipitation_system.initialize()
-
-        # Initialize ocean currents
-        print("Initializing ocean currents...")
-        self.temperature.initialize_ocean_currents()
-        
-        # Change the button text to "Stop" if simulation is starting
-        print("Configuring UI elements...")
-        self.sim_button.config(text="Stop", command=self.stop_simulation)
-        
-        # Make sure visualization is active
-        if not hasattr(self, 'visualization_active'):
-            self.visualization_active = threading.Event()
-        self.visualization_active.set()
-        
-        # Set simulation_running flag to True to start the simulation
-        print("Setting simulation_running = True")
-        self.simulation_running = True
-        
-        # Initialize _last_step_time if needed
-        if not hasattr(self, '_last_step_time') or self._last_step_time <= 0:
-            self._last_step_time = 0.1
-        
-        # Schedule first simulation step
-        print("Scheduling first simulation step")
-        self.simulation_after_id = self.root.after(100, self.simulate)
-        print("First simulation step scheduled")
-
-        # Resize window to match map dimensions
-        self._resize_window_to_map()
-        print("on_generate() method completed")
+        try:
+            print("on_generate() method called")
+            
+            # If elevation_data is provided, use it directly
+            if elevation_data is not None:
+                self.elevation = elevation_data
+                print("Using provided elevation data")
+            
+            # Initialize key systems
+            print("Initializing systems...")
+            
+            # Initialize temperature
+            if not hasattr(self, 'temperature_system') or self.temperature_system is None:
+                from temperature import Temperature
+                self.temperature_system = Temperature(self)
+                
+            self.temperature_system.initialize()
+            
+            # Initialize pressure
+            if not hasattr(self, 'pressure_system') or self.pressure_system is None:
+                from pressure import Pressure
+                self.pressure_system = Pressure(self)
+            
+            print("Initializing pressure...")
+            self.pressure_system.initialize()
+            
+            # Initialize winds
+            if not hasattr(self, 'wind_system') or self.wind_system is None:
+                from wind import Wind
+                self.wind_system = Wind(self)
+                
+            print("Initializing winds...")
+            self.wind_system.initialize()
+            
+            # Initialize precipitation
+            if not hasattr(self, 'precipitation_system') or self.precipitation_system is None:
+                from precipitation import Precipitation
+                self.precipitation_system = Precipitation(self)
+                
+            print("Initializing precipitation...")
+            self.precipitation_system.initialize()
+            
+            # Initialize ocean currents
+            if not hasattr(self, 'temperature_system') or self.temperature_system is None:
+                from temperature import Temperature
+                self.temperature_system = Temperature(self)
+                
+            print("Initializing ocean currents...")
+            self.temperature_system.initialize_ocean_currents()
+            
+            # Initialize energy budget if not already done
+            if not hasattr(self, 'energy_budget'):
+                self.energy_budget = {}
+            
+            # Setup system stats if not already done
+            if not hasattr(self, 'system_stats') or self.system_stats is None:
+                from system_stats import SystemStats
+                self.system_stats = SystemStats(self)
+                # Initialize the system stats with the current show_stats setting
+                self.system_stats.print_stats_enabled = self.show_stats
+            
+            # Ensure stats display is enabled if checkbox is checked
+            if hasattr(self, 'show_stats_var') and self.show_stats_var.get():
+                self.show_stats = True
+                self.system_stats.print_stats_enabled = True
+                # Force an immediate stats display update
+                self.system_stats.force_next_update = True
+                self.system_stats.print_stats()
+            else:
+                # Make sure system_stats respects the current setting
+                self.system_stats.print_stats_enabled = self.show_stats
+            
+            # Configure UI elements for a running simulation
+            print("Configuring UI elements...")
+            
+            # Disable generate/new/load during simulation
+            if hasattr(self, 'generate_button'):
+                self.generate_button.config(state=tk.DISABLED)
+            if hasattr(self, 'new_button'):
+                self.new_button.config(state=tk.DISABLED)
+            if hasattr(self, 'load_button'):
+                self.load_button.config(state=tk.DISABLED)
+                
+            # Change sim_button to Stop button instead of looking for stop_button
+            if hasattr(self, 'sim_button'):
+                self.sim_button.config(text="Stop", command=self.stop_simulation)
+            else:
+                print("Warning: sim_button not found!")
+                
+            # Mark simulation as running
+            self.simulation_running = True
+            print("Setting simulation_running = True")
+            
+            # Schedule first simulation step
+            print("Scheduling first simulation step")
+            self.time_step = 0
+            
+            if hasattr(self, 'root'):
+                self.root.after(10, self.simulate)
+                print("First simulation step scheduled")
+            
+            # Force an immediate stats display update if stats are enabled
+            if self.show_stats:
+                self.system_stats.print_stats()
+        except Exception as e:
+            print(f"Error in on_generate: {e}")
+            traceback.print_exc()
 
     def stop_simulation(self):
         """Stop the running simulation"""
@@ -665,7 +698,6 @@ class SimulationApp:
     def simulate(self):
         """Main simulation loop - manages physics update and visualization"""
         try:
-            print(f"simulate() called at time {time.time()}")
             # Make sure the simulation is running, or return immediately
             if not hasattr(self, 'simulation_running') or not self.simulation_running:
                 print("simulation_running is False, exiting simulate()")
@@ -676,7 +708,6 @@ class SimulationApp:
             
             # Update current step
             self.time_step += 1
-            print(f"Starting simulation step {self.time_step}")
             
             # Determine simulation time based on time since last update
             current_time = time.time()
@@ -719,7 +750,6 @@ class SimulationApp:
                     # Use more modest step count during transition
                     steps_needed = 1
                 else:
-                    print("Using standard simulation mode")
                     # In standard mode, adapt time steps based on system performance
                     steps_possible = max(1, int(target_seconds_per_update / (self._last_step_time or 0.1)))
                     steps_needed = max(1, min(steps_possible, int(self.max_simulation_hours_per_update * 3600 / self.time_step_seconds)))
@@ -744,11 +774,33 @@ class SimulationApp:
                 delattr(self, '_cached_pressure_data')
             
             # Schedule GUI updates to happen in the main thread
-            print("Scheduling GUI updates")
             self.root.after(0, self.visualization.update_map)
+
+            # Update stats display state from checkbox before printing stats
+            if hasattr(self, 'stats_var'):
+                # Get current setting from checkbox
+                current_stats_state = self.stats_var.get()
+                
+                # Detect if stats display was just enabled
+                stats_newly_enabled = (not self.show_stats) and current_stats_state
+                
+                # Update the show_stats value
+                self.show_stats = current_stats_state
+                
+                if hasattr(self, 'system_stats'):
+                    self.system_stats.print_stats_enabled = self.show_stats
+                    
+                    # Force immediate update if stats were just enabled
+                    if stats_newly_enabled:
+                        self.system_stats.force_next_update = True
+                        print(f"Stats newly enabled, forcing update at step {self.time_step}")
+
+            # Make system_stats update more reliable by setting force update periodically
+            if hasattr(self, 'system_stats') and self.time_step % 5 == 0:
+                self.system_stats.force_next_update = True
+                
+            # After scheduling the stats update with proper flags set
             self.root.after(0, self.system_stats.print_stats)
-            # Remove redundant call - we now have a periodic update system
-            # self.root.after(0, self.update_mouse_over)
             
             # Measure total elapsed time
             elapsed_time = time.time() - cycle_start
@@ -758,7 +810,6 @@ class SimulationApp:
             delay = max(min_delay, int((target_seconds_per_update - elapsed_time) * 1000))
             delay = max(min_delay, delay)  # Ensure delay is at least minimum
             
-            print(f"Scheduling next simulation step with delay {delay}ms")
             self.simulation_after_id = self.root.after(delay, self.simulate)
             
             # Mark simulation as active
@@ -779,7 +830,6 @@ class SimulationApp:
             
             # Update _last_step_time before exiting - use elapsed_time directly
             self._last_step_time = elapsed_time / max(1, steps_needed)
-            print(f"Completed simulation step {self.time_step}")
             
         except Exception as e:
             print(f"Error in simulation: {e}")
@@ -1111,6 +1161,28 @@ class SimulationApp:
         except Exception as e:
             print(f"Error in simplified wind update: {e}")
     
+
+    def update_ocean(self):
+        # Existing code...
+        
+        # Add at the end:
+        # Update ocean heat content tracking
+        ocean_heat_content = np.sum(self.temperature_celsius[self.elevation <= 0])
+        self.energy_budget['ocean_heat_content'] = float(ocean_heat_content)
+        self.energy_budget['ocean_flux'] = float(np.mean(self._net_flux[self.elevation <= 0]))
+        
+        # If we have previous content, calculate change
+        if 'prev_ocean_heat' in self.energy_budget:
+            prev = self.energy_budget['prev_ocean_heat']
+            change = (ocean_heat_content - prev) / max(abs(prev), 1e-5) * 100
+            self.energy_budget['ocean_heat_change'] = change
+        
+        # Store current for next comparison
+        self.energy_budget['prev_ocean_heat'] = ocean_heat_content
+        
+        # Set flag to indicate ocean data is available
+        self.ocean_data_available = True
+
     def _update_ocean_simplified(self):
         """Simplified ocean temperature update for high-speed mode with better stability"""
         try:
@@ -1338,13 +1410,22 @@ class SimulationApp:
                 if not is_ocean:
                     temp = self.temperature_celsius[y, x]
                     display_parts.append(f"Temp: {temp:.1f}°C")
-                # For ocean, show ocean temperature if available
-                elif hasattr(self, 'ocean_temperature') and self.ocean_temperature is not None:
-                    ocean_temp = self.ocean_temperature[y, x]
+                # For ocean, show ocean temperature from temperature_celsius (not ocean_temperature)
+                else:
+                    # Ocean temperature is stored in the same temperature_celsius array
+                    ocean_temp = self.temperature_celsius[y, x]
                     display_parts.append(f"Ocean Temp: {ocean_temp:.1f}°C")
-                    # Also show air temperature for ocean cells
-                    temp = self.temperature_celsius[y, x]
-                    display_parts.append(f"Air Temp: {temp:.1f}°C")
+                    
+                    # Show ocean layer temperatures if available
+                    if hasattr(self, 'ocean_layers') and self.ocean_layers is not None:
+                        # Show surface layer temperature explicitly
+                        surface_temp = self.ocean_layers[0][y, x]
+                        display_parts.append(f"Surface Ocean: {surface_temp:.1f}°C")
+                        
+                        # Optionally show deeper layer temps
+                        if len(self.ocean_layers) > 1:
+                            mixed_temp = self.ocean_layers[1][y, x]
+                            display_parts.append(f"Mixed Layer: {mixed_temp:.1f}°C")
             
             # Always show pressure if available
             if hasattr(self, 'pressure'):
@@ -1398,7 +1479,7 @@ class SimulationApp:
             self.visualization_thread.join(timeout=1.0)
 
     def toggle_stats_display(self, enabled=None):
-        """Toggle or set the system stats display"""
+        """Toggle or set the system statistics display"""
         if enabled is None:
             # Toggle current state
             self.show_stats = not self.show_stats
@@ -1407,6 +1488,21 @@ class SimulationApp:
             # Set to specified state
             self.show_stats = enabled
             self.system_stats.print_stats_enabled = enabled
+            
+        # Force an update when enabled
+        if self.show_stats and hasattr(self, 'system_stats'):
+            # Set flag to force update on next cycle regardless of timing
+            self.system_stats.force_next_update = True
+            
+            # Force update by directly calling print_stats
+            self.system_stats.print_stats()
+            
+            # Reset the last update step to ensure next cycle updates
+            self.system_stats.last_update_step = 0
+            
+            # Also update the checkbox if it exists to match the current state
+            if hasattr(self, 'stats_var'):
+                self.stats_var.set(self.show_stats)
 
     def toggle_high_speed_mode(self):
         """Toggle or set the high-speed approximation mode"""
@@ -1759,6 +1855,6 @@ if __name__ == "__main__":
     try:
         # Wait for a while to see output
         import time
-        time.sleep(10)
+        time.sleep(5)
     except KeyboardInterrupt:
         print("Sleep interrupted by user")
