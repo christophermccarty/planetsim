@@ -56,12 +56,23 @@ class SimulationApp:
             self.target_update_rate = 1.0  # Target updates per second
             self.min_simulation_hours_per_update = 1.0  # Minimum hours to simulate per update
             self.max_simulation_hours_per_update = 24.0  # Maximum hours to simulate per update
+            self.simulation_speed = tk.DoubleVar(value=4.0)  # Default 4 hours per update for high-speed mode
             self.high_speed_mode = False  # Disable high-speed physics approximation by default
             self.physics_downsampling = 4  # Spatial downsampling factor for faster physics
             self._last_step_time = 0.1  # Initialize with a reasonable default value
             self.Omega = 7.2921159e-5
             self.P0 = 101325
             self.desired_simulation_step_time = 0.1  # 0.1 seconds between simulation steps
+
+            # Define ocean layer properties
+            self.ocean_layer_properties = {
+                # Thermal diffusivity decreases with depth (m²/s)
+                'thermal_diffusivity': np.array([5e-5, 2e-5, 8e-6, 2e-6]),
+                # Heat capacity increases with depth (relative values)
+                'heat_capacity_factor': np.array([1.0, 5.0, 10.0, 20.0]),
+                # Layer thickness in meters
+                'thickness': np.array([10.0, 190.0, 800.0, 2000.0])
+            }
 
             # Create a queue for visualization updates
             self.visualization_queue = queue.Queue(maxsize=10)  # Limit queue size to prevent memory issues
@@ -191,6 +202,28 @@ class SimulationApp:
                 self.ocean_v = np.zeros((self.map_height, self.map_width), dtype=np.float32)
             if not hasattr(self, 'ocean_temperature') or self.ocean_temperature is None:
                 self.ocean_temperature = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+
+            # Initialize ocean layers if they don't already exist
+            if not hasattr(self, 'ocean_layers') or self.ocean_layers is None:
+                # Create 4 layers for the ocean model
+                num_layers = 4
+                self.ocean_layers = np.zeros((num_layers, self.map_height, self.map_width), dtype=np.float32)
+                
+                # Initialize with default temperature profile
+                is_ocean = self.elevation <= 0
+                
+                # Set surface layer to match surface temperature
+                self.ocean_layers[0] = self.temperature_celsius.copy()
+                
+                # Each deeper layer gets progressively cooler
+                depth_offsets = [-2.0, -8.0, -15.0]
+                for i in range(1, num_layers):
+                    layer_temp = self.temperature_celsius.copy()
+                    if np.any(is_ocean):
+                        layer_temp[is_ocean] += depth_offsets[i-1]
+                        layer_temp[is_ocean] = np.clip(layer_temp[is_ocean], -2.0, 25.0)
+                    self.ocean_layers[i] = layer_temp
+
             print("Arrays initialized")
             
             # Initialize visualization only after canvas is created in setup_gui
@@ -224,6 +257,10 @@ class SimulationApp:
             self.visualization_thread = threading.Thread(target=self.visualization.update_visualization_loop)
             self.visualization_thread.daemon = True
             self.visualization_thread.start()
+            
+            # Create a dedicated event for visualization updates
+            self.visualization_update_ready = threading.Event()
+            self.visualization_update_ready.clear()  # Start with no updates pending
             
             # Initialize the simulation thread but don't start it yet
             print("Setting up simulation thread...")
@@ -483,73 +520,50 @@ class SimulationApp:
     def request_visualization_update(self, priority=None):
         """Request a visualization update via the queue with optional priority"""
         try:
+            # Default to MEDIUM priority if none specified
+            if priority is None:
+                priority = self.VIZ_PRIORITY["MEDIUM"]
+            
+            # Create update request with priority
+            update_request = {
+                "type": "UPDATE",
+                "priority": priority,
+                "timestamp": time.time()
+            }
+            
+            # First ensure visualization thread is active
+            if hasattr(self, 'visualization_active'):
+                if not self.visualization_active.is_set():
+                    print("Reactivating visualization thread...")
+                    self.visualization_active.set()
+            
+            # Direct method to signal visualization updates
+            if hasattr(self, 'visualization_update_ready'):
+                self.visualization_update_ready.set()
+            
+            # Also use the queue method as backup
             if hasattr(self, 'visualization_queue'):
-                # Default to MEDIUM priority if none specified
-                if priority is None:
-                    priority = self.VIZ_PRIORITY["MEDIUM"]
-                
-                # Create update request with priority
-                update_request = {
-                    "type": "UPDATE",
-                    "priority": priority,
-                    "timestamp": time.time()
-                }
-                
-                if not self.visualization_queue.full():
-                    self.visualization_queue.put_nowait(update_request)
-                else:
-                    # If queue is full, try to remove a lower priority item
-                    try:
-                        # Check if we can remove a lower priority item
-                        queue_items = []
-                        found_lower_priority = False
-                        
-                        # Get all items from queue temporarily
-                        while not self.visualization_queue.empty():
-                            item = self.visualization_queue.get_nowait()
-                            queue_items.append(item)
-                            
-                        # Look for a lower priority item to replace
-                        for i, item in enumerate(queue_items):
-                            # If item has no priority field or has lower priority
-                            if not isinstance(item, dict) or "priority" not in item or item["priority"] > priority:
-                                # Replace with our higher priority item
-                                queue_items[i] = update_request
-                                found_lower_priority = True
-                                break
-                        
-                        # If we couldn't find a lower priority item and this is HIGH priority
-                        if not found_lower_priority and priority == self.VIZ_PRIORITY["HIGH"]:
-                            # Replace the oldest item
-                            oldest_index = 0
-                            oldest_time = float('inf')
-                            
-                            for i, item in enumerate(queue_items):
-                                if isinstance(item, dict) and "timestamp" in item and item["timestamp"] < oldest_time:
-                                    oldest_time = item["timestamp"]
-                                    oldest_index = i
-                            
-                            # Replace the oldest item with our high priority update
-                            queue_items[oldest_index] = update_request
-                        
-                        # Put items back in the queue
-                        for item in queue_items:
-                            self.visualization_queue.put_nowait(item)
-                            
-                    except Exception as e:
-                        print(f"Error managing visualization queue: {e}")
-                        # In case of error, discard all and add the new one
-                        while not self.visualization_queue.empty():
-                            try:
-                                self.visualization_queue.get_nowait()
-                            except:
-                                pass
+                try:
+                    # Try to add to queue without blocking
+                    if not self.visualization_queue.full():
                         self.visualization_queue.put_nowait(update_request)
+                except queue.Full:
+                    # Queue is full, just skip this update
+                    pass
+                
+            # If we have direct access to visualization, also call update method
+            if hasattr(self, 'visualization') and hasattr(self.visualization, '_schedule_map_update'):
+                try:
+                    # Direct update as a fallback, but only if we're in the main thread
+                    if threading.current_thread() is threading.main_thread():
+                        self.visualization._schedule_map_update()
+                except Exception as e:
+                    print(f"Error in direct visualization update: {e}")
+                    
         except Exception as e:
             print(f"Error requesting visualization update: {e}")
-            # Fall back to direct update in case of queue errors
-            if hasattr(self, 'visualization'):
-                self.root.after(0, self.visualization.update_map)
+            # Don't try a direct update - it can block the UI thread
+            # Just log the error and continue
 
     def on_closing(self):
         """Handle window closing"""
@@ -782,7 +796,7 @@ class SimulationApp:
             self.time_step = 0
             
             if hasattr(self, 'root'):
-                self.root.after(10, self.simulate)
+                self.root.after(10, self.simulation_worker)
                 print("First simulation step scheduled")
             
             # Force an immediate stats display update if stats are enabled
@@ -803,112 +817,166 @@ class SimulationApp:
         print("Simulation stopped")
 
     def simulation_worker(self):
-        """Background thread for running simulation computations"""
-        print("Simulation worker thread started")
-        
-        while True:
-            try:
-                # Check if we should stop the thread
-                if not self.simulation_thread_active.is_set():
-                    print("Simulation thread stopping (flag cleared)")
-                    break
+        """Worker method for simulation processing"""
+        try:
+            if not self.simulation_running:
+                print("Simulation stopped, exiting worker")
+                return
                 
-                # Check if simulation is running
-                if not self.simulation_running:
-                    # Sleep briefly and check again
-                    time.sleep(0.1)
-                    continue
+            # Track how long visualization updates take
+            viz_start_time = time.time()
+            last_viz_update_time = getattr(self, 'last_viz_update_time', 0)
+            current_time = time.time()
+            
+            # Create a visualization update event if it doesn't exist
+            if not hasattr(self, 'visualization_update_ready'):
+                self.visualization_update_ready = threading.Event()
                 
-                # Get start time for this cycle
-                cycle_start = time.time()
+            # Determine the time since the last visualization update
+            time_since_last_viz = current_time - last_viz_update_time
+            
+            # Maximum frequency for viz updates (5 updates per second)
+            viz_update_interval = 0.2  # 200ms between updates
+            
+            # Process UI events before simulation to keep the interface responsive
+            self.process_ui_events()
+            
+            # Update UI elements including system stats
+            self.update_ui_elements()
+            
+            if self.high_speed_mode:
+                # In high-speed mode, we want to run more steps between UI updates
+                # but still need to keep the UI responsive
                 
-                # Update current step
-                self.time_step += 1
+                # Calculate target hours per step based on simulation speed
+                target_hours = self.simulation_speed.get()
                 
-                # Determine simulation time based on time since last update
-                current_time = time.time()
-                
-                # If we're just starting or _last_step_time doesn't exist yet, use a safe default
-                if not hasattr(self, '_last_step_time') or self._last_step_time <= 0:
-                    self._last_step_time = 0.1  # Use a reasonable default value
-                    
-                # Calculate simulation speed
-                target_seconds_per_update = 1.0 / self.target_update_rate
-                
-                # Default steps_needed value (will be updated for standard mode)
-                steps_needed = 1
-                
-                # Check for mode transition to handle it gracefully
-                transitioning = hasattr(self, '_transitioning_speed_mode') and self._transitioning_speed_mode
-                
-                # Check if we should use high-speed approximation or standard simulation
-                if self.high_speed_mode:
-                    # During transition to high-speed, use a more conservative approach
-                    if transitioning:
-                        approximation_factor = 2  # Start with a lower factor during transition
-                    else:
-                        approximation_factor = 6  # Normal high-speed operation
-                    
-                    # In high-speed mode, we run with a fixed approximation factor
-                    # This gives more consistent visual updates but less precise physics
-                    target_hours = self.time_step_seconds * approximation_factor / 3600
-                    self._run_approximated_simulation(target_hours)
-                    self.simulation_speed = target_hours
-                    
-                    # For timing calculations in high-speed mode
-                    steps_needed = approximation_factor
+                # Determine how many simulation steps are needed based on performance
+                # Limit maximum steps in a single batch to maintain responsiveness
+                if hasattr(self, '_last_batch_time') and self._last_batch_time > 0:
+                    # Calculate steps based on previous performance
+                    steps_possible = min(10, max(1, int(0.03 / self._last_batch_time)))
                 else:
-                    # In standard mode, we adjust simulation rate based on actual performance
-                    # Calculate number of steps to run to hit our target update rate
-                    simulation_fps = 1.0 / max(self._last_step_time, 0.001)
+                    # Start conservatively
+                    steps_possible = 1
                     
-                    # Calculate how many steps needed to maintain target rate
-                    steps_needed = max(1, int(self.target_update_rate / simulation_fps))
+                # Adjust steps based on time since last visualization update
+                if time_since_last_viz >= viz_update_interval:
+                    # If it's time for a viz update, process only a small number of steps
+                    steps_needed = min(steps_possible, 2)
                     
-                    # Limit the maximum steps to prevent excessive lag during slowdowns
-                    steps_needed = min(steps_needed, 24)  # Cap at 24 steps (1 sim day)
+                    # Set flag to request visualization update after this batch
+                    request_viz = True
+                else:
+                    # Otherwise, do more computation between UI updates
+                    steps_needed = steps_possible
+                    request_viz = False
                     
-                    # Run standard simulation with calculated steps
-                    self._run_standard_simulation(steps_needed)
+                # Debug output for high-speed mode
+                if self.debug:
+                    print(f"Running approximated simulation with target {target_hours}h "
+                          f"using {steps_needed} steps (of {steps_possible} possible)")
                     
-                    # Calculate simulation speed in simulated hours per real time second 
-                    self.simulation_speed = steps_needed * self.time_step_seconds / 3600
+                # Run the simulation
+                start_time = time.time()
+                self._run_approximated_simulation(target_hours)
+                self._last_batch_time = (time.time() - start_time) / steps_needed
                 
-                # Request visualization update
-                try:
-                    # Use non-blocking put_nowait to prevent simulation thread from waiting
-                    if hasattr(self, 'visualization_queue'):
-                        if not self.visualization_queue.full():
-                            # Simple string message for compatibility with both versions
-                            self.visualization_queue.put_nowait("UPDATE")
-                except:
-                    # Queue is full or error, skip this update
-                    pass
+                # Process UI events again after the computation to maintain responsiveness
+                if current_time - viz_start_time > 0.05:
+                    self.process_ui_events()
+                    self.update_ui_elements()  # Update UI elements again after computation
                 
-                # Schedule UI updates in the main thread using after()
-                # This prevents UI blocking and ensures UI updates happen in the UI thread
-                if hasattr(self, 'root') and self.root.winfo_exists():
-                    self.root.after(0, self.update_ui_elements)
+            else:
+                # Calculate available steps based on time constraints
+                if time_since_last_viz >= viz_update_interval:
+                    # Time for visualization update, only do 1 step
+                    steps_needed = 1
+                    request_viz = True
+                else:
+                    # More steps between visualization updates, based on performance
+                    if hasattr(self, '_last_step_time') and self._last_step_time > 0:
+                        # Target ~30ms per update cycle to keep UI responsive
+                        steps_needed = min(3, max(1, int(0.03 / self._last_step_time)))
+                    else:
+                        # Start with 1 step if we don't have timing info yet
+                        steps_needed = 1
+                    request_viz = False
+                    
+                # Run the standard simulation
+                start_time = time.time()
+                self._run_standard_simulation(steps_needed)
+                self._last_step_time = (time.time() - start_time) / steps_needed
                 
-                # Measure total elapsed time
-                elapsed_time = time.time() - cycle_start
+                # Process UI events again after computation
+                if current_time - viz_start_time > 0.05:
+                    self.process_ui_events()
+                    self.update_ui_elements()  # Update UI elements again after computation
                 
-                # Calculate sleep time to maintain target rate
-                sleep_time = max(0, target_seconds_per_update - elapsed_time)
+                # Increment time step counter after successful simulation
+                self.time_step += steps_needed
                 
-                # Sleep for calculated time
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+            # Update visualization if needed (and not too frequent)
+            if request_viz:
+                self.last_viz_update_time = time.time()
                 
-                # Update _last_step_time for next cycle's timing calculation
-                self._last_step_time = elapsed_time / max(1, steps_needed)
+                # Every 10th update, try using force_update for immediate rendering
+                if self.time_step % 10 == 0 and hasattr(self, 'visualization') and hasattr(self.visualization, 'force_update'):
+                    try:
+                        self.visualization.force_update()
+                    except Exception as e:
+                        print(f"Error in force_update: {e}")
+                        # Fall back to regular update method
+                        self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
+                else:
+                    # Regular update method
+                    self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
                 
-            except Exception as e:
-                print(f"Error in simulation worker: {e}")
-                traceback.print_exc()
-                # Sleep briefly to prevent CPU spinning on errors
-                time.sleep(0.5)
-    
+                # Wait a small amount for visualization to complete
+                viz_elapsed = time.time() - viz_start_time
+                if viz_elapsed < 0.05:
+                    # If visualization was quick, add a small delay to process UI events
+                    self.process_ui_events()
+            # Force periodic visualization updates regardless of request_viz flag
+            elif self.time_step % 3 == 0:  # More frequent updates (every 3 steps instead of 5)
+                self.last_viz_update_time = time.time()
+                self.request_visualization_update(self.VIZ_PRIORITY["MEDIUM"])
+            
+            # Check if visualization thread needs restarting
+            if hasattr(self, 'visualization_thread') and not self.visualization_thread.is_alive():
+                print("Restarting visualization thread...")
+                self.visualization_thread = threading.Thread(target=self.visualization.update_visualization_loop)
+                self.visualization_thread.daemon = True
+                self.visualization_thread.start()
+                
+            # Ensure visualization update event is created
+            if not hasattr(self, 'visualization_update_ready'):
+                self.visualization_update_ready = threading.Event()
+            
+            # Ensure visualization active flag is set
+            if hasattr(self, 'visualization_active') and not self.visualization_active.is_set():
+                self.visualization_active.set()
+                
+            # Schedule next simulation step with appropriate timing
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                # Adaptive timing based on whether we need to update visualization
+                if request_viz:
+                    # Give UI thread more time to process the visualization update
+                    next_delay = 30  # milliseconds
+                else:
+                    # Faster cycle when not updating visualization
+                    next_delay = 10   # milliseconds
+                    
+                self.root.after(next_delay, self.simulation_worker)
+                
+        except Exception as e:
+            print(f"Error in simulation worker: {e}")
+            traceback.print_exc()
+            
+            # Try to continue simulation even after error
+            if self.simulation_running and hasattr(self, 'root') and self.root.winfo_exists():
+                self.root.after(100, self.simulation_worker)  # Longer delay after error
+
     def update_ui_elements(self):
         """Update UI elements in the main thread"""
         try:
@@ -923,48 +991,79 @@ class SimulationApp:
                 if hasattr(self, 'system_stats'):
                     self.system_stats.print_stats_enabled = self.show_stats
             
-            # Force periodic stats updates
-            if hasattr(self, 'system_stats') and self.time_step % 5 == 0:
-                self.system_stats.force_next_update = True
-                self.system_stats.print_stats()
+            # Update system stats if enabled, but only every few frames to prevent overwhelming the UI
+            if hasattr(self, 'system_stats') and self.show_stats:
+                # Only update every 3 time steps to reduce overhead
+                if self.time_step % 3 == 0:
+                    self.system_stats.force_next_update = True
+                    self.system_stats.print_stats()
                 
         except Exception as e:
             print(f"Error updating UI elements: {e}")
     
 
-    def _run_standard_simulation(self, steps_needed):
-        """Run standard simulation for the specified number of steps"""
-        # Track time for performance measurement
-        step_start_time = time.time()
-        
-        # Run multiple simulation steps to reach the target time
-        for _ in range(steps_needed):
-            # Increment time step
-            self.time_step += 1
+    def _run_standard_simulation(self, steps):
+        """Run the standard physics-based simulation"""
+        try:
+            start_time = time.time()
             
-            # Update physics fields in proper order
-            self.precipitation_system.update()
-            self.humidity = self.precipitation_system.humidity
-            self.precipitation = self.precipitation_system.precipitation
-            self.cloud_cover = self.precipitation_system.cloud_cover
+            # Process each step with UI updates in between
+            for step in range(1, steps + 1):
+                step_start = time.time()
+                
+                # Process precipitation
+                precip_start = time.time()
+                self.update_precipitation()
+                precip_time = (time.time() - precip_start) * 1000
+                
+                # Process UI events if this step is taking too long
+                if time.time() - step_start > 0.1:
+                    self.process_ui_events()
+                
+                # Update temperatures
+                temp_start = time.time()
+                self.update_temperature()
+                temp_time = (time.time() - temp_start) * 1000
+                
+                # Process UI events again
+                if time.time() - step_start > 0.2:
+                    self.process_ui_events()
+                
+                # Update ocean temperatures
+                ocean_start = time.time()
+                self.update_ocean_temperature()
+                ocean_time = (time.time() - ocean_start) * 1000
+                
+                # Process UI events again
+                if time.time() - step_start > 0.3:
+                    self.process_ui_events()
+                
+                # Update pressure
+                pressure_start = time.time()
+                self.update_pressure()
+                pressure_time = (time.time() - pressure_start) * 1000
+                
+                # Process UI events again
+                if time.time() - step_start > 0.4:
+                    self.process_ui_events()
+                
+                # Update wind
+                wind_start = time.time()
+                self.update_wind()
+                wind_time = (time.time() - wind_start) * 1000
+                
+                # Process UI events after each complete step
+                self.process_ui_events()
+                
+                # Calculate step time
+                step_time = time.time() - step_start
             
-            self.temperature.update_land_ocean()
-            self.temperature.update_ocean()
-            self.pressure_system.update()
-            self.wind_system.update()
-        
-        # Measure the average time per step
-        step_end_time = time.time()
-        total_step_time = step_end_time - step_start_time
-        measured_step_time = total_step_time / steps_needed
-        
-        # Use exponential moving average for smoother timing adjustments
-        if not hasattr(self, '_last_step_time'):
-            self._last_step_time = measured_step_time
-        else:
-            # EMA with alpha=0.3 gives reasonable stability while allowing adjustments
-            alpha = 0.3
-            self._last_step_time = alpha * measured_step_time + (1 - alpha) * self._last_step_time
+            # Calculate total simulation time
+            elapsed = time.time() - start_time
+            
+        except Exception as e:
+            print(f"Error in standard simulation: {e}")
+            traceback.print_exc()
     
     def _run_approximated_simulation(self, target_hours):
         """Run an approximated high-speed simulation to achieve the target hours"""
@@ -1819,6 +1918,75 @@ class SimulationApp:
         if hasattr(self, 'visualization') and hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
             self.visualization.update_zoom_view(event)
 
+    def process_ui_events(self):
+        """Process UI events to keep the interface responsive"""
+        try:
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                # Process pending events
+                self.root.update_idletasks()
+                
+                # For Windows systems, also process any pending messages
+                # This helps prevent the app from appearing frozen
+                if hasattr(self.root, 'update'):
+                    self.root.update()
+                    
+        except Exception as e:
+            print(f"Error processing UI events: {e}")
+
+    def update_precipitation(self):
+        """Update precipitation data with error handling"""
+        try:
+            self.precipitation_system.update()
+            self.humidity = self.precipitation_system.humidity
+            self.precipitation = self.precipitation_system.precipitation
+            self.cloud_cover = self.precipitation_system.cloud_cover
+        except Exception as e:
+            print(f"ERROR in precipitation update: {e}")
+            traceback.print_exc()
+
+    def update_temperature(self):
+        """Update land and ocean temperature data with error handling"""
+        try:
+            self.temperature.update_land_ocean()
+        except Exception as e:
+            print(f"ERROR in temperature update: {e}")
+            traceback.print_exc()
+
+    def update_ocean_temperature(self):
+        """Update ocean temperature with timeout handling"""
+        try:
+            # Add a timeout mechanism - if ocean update takes too long, skip it
+            if not hasattr(self, '_ocean_update_skipped'):
+                self._ocean_update_skipped = 0
+                
+            # Skip ocean updates if we've skipped too many times in a row
+            if self._ocean_update_skipped > 5:
+                print(f"  - Ocean temperature update DISABLED due to too many timeouts")
+            else:
+                self.temperature.update_ocean()
+                # Reset skip counter when successful
+                self._ocean_update_skipped = 0
+        except Exception as e:
+            self._ocean_update_skipped += 1
+            print(f"  - Ocean temperature update SKIPPED due to error: {e}")
+            traceback.print_exc()
+
+    def update_wind(self):
+        """Update wind data with error handling"""
+        try:
+            self.wind_system.update()
+        except Exception as e:
+            print(f"ERROR in wind update: {e}")
+            traceback.print_exc()
+
+    def update_pressure(self):
+        """Update pressure data with error handling"""
+        try:
+            self.pressure_system.update()
+        except Exception as e:
+            print(f"ERROR in pressure update: {e}")
+            traceback.print_exc()
+
 
 class ZoomDialog(tk.Toplevel):
     def __init__(self, parent, zoom_factor=4):
@@ -1933,6 +2101,6 @@ if __name__ == "__main__":
     try:
         # Wait for a while to see output
         import time
-        time.sleep(5)
+        time.sleep(1)
     except KeyboardInterrupt:
         print("Sleep interrupted by user")

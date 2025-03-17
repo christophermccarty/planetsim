@@ -174,7 +174,13 @@ class SystemStats:
             # --- SELECTIVE STAT CALCULATION BASED ON SIMULATION SPEED ---
             # If in high-speed mode, calculate less frequently the more complex stats
             high_speed = getattr(self.sim, 'high_speed_mode', False)
-            sim_speed = getattr(self.sim, 'simulation_speed', 0)
+            sim_speed = 0
+            if hasattr(self.sim, 'simulation_speed'):
+                # Handle both regular value and DoubleVar
+                if hasattr(self.sim.simulation_speed, 'get'):
+                    sim_speed = self.sim.simulation_speed.get()  # Get value from DoubleVar
+                else:
+                    sim_speed = self.sim.simulation_speed  # Direct value
             
             # For very high speed, calculate complex stats only occasionally
             calculate_complex_stats = not (high_speed and sim_speed >= 12) or (self.sim.time_step % 10 == 0)
@@ -286,7 +292,13 @@ class SystemStats:
             fps = min(1/cycle_time, 999.9)  # Cap FPS display at 999.9
             
             # Get simulation speed (hours per update)
-            sim_speed = getattr(self.sim, 'simulation_speed', 0)
+            sim_speed = 0
+            if hasattr(self.sim, 'simulation_speed'):
+                # Handle both regular value and DoubleVar
+                if hasattr(self.sim.simulation_speed, 'get'):
+                    sim_speed = self.sim.simulation_speed.get()  # Get value from DoubleVar
+                else:
+                    sim_speed = self.sim.simulation_speed  # Direct value
             
             # Check if high-speed mode is active
             high_speed = getattr(self.sim, 'high_speed_mode', False)

@@ -766,241 +766,474 @@ class Visualization:
             layer_changed = self._last_selected_layer != self.sim.selected_layer.get()
             self._last_selected_layer = self.sim.selected_layer.get()
             
-            # Defer expensive operations when switching layers
-            if layer_changed and self.sim.selected_layer.get() == "Pressure":
-                # When first switching to pressure, show a loading indicator
-                self.canvas.delete("all")
-                self.canvas.create_text(
-                    self.canvas.winfo_width() // 2, 
-                    self.canvas.winfo_height() // 2,
-                    text="Loading pressure map...",
-                    fill="white",
-                    font=("Arial", 14)
-                )
-                self.sim.root.after(100, self._delayed_pressure_update)
-                return
-                
-            # Same for precipitation
-            if layer_changed and self.sim.selected_layer.get() == "Precipitation":
+            # Use a multi-phase rendering approach to prevent UI blocking
+            current_layer = self.sim.selected_layer.get()
+            
+            # Phase 1: Clear canvas and show loading indicator for expensive operations
+            if layer_changed or current_layer in ["Pressure", "Wind", "Ocean Currents"]:
                 # Show loading indicator
                 self.canvas.delete("all")
                 self.canvas.create_text(
                     self.canvas.winfo_width() // 2, 
                     self.canvas.winfo_height() // 2,
-                    text="Loading precipitation map...",
+                    text=f"Loading {current_layer.lower()} map...",
                     fill="white",
                     font=("Arial", 14)
                 )
-                self.sim.root.after(100, self._delayed_precipitation_update)
-                return
-            
-            # Special case for Wind layer
-            if self.sim.selected_layer.get() == "Wind":
-                # Use altitude map as background for wind vectors
-                display_data = self.map_altitude_to_color(self.sim.elevation)
-                image = Image.fromarray(display_data.astype('uint8'))
-                photo_img = ImageTk.PhotoImage(image)
-                self.image_cache['wind_bg'] = photo_img
                 
-                # Update canvas with terrain background
-                self.canvas.delete("all")
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img)
+                # Schedule Phase 2 with a slight delay to allow UI to update
+                if current_layer == "Pressure":
+                    self.sim.root.after(20, self._delayed_pressure_update)
+                elif current_layer == "Precipitation":
+                    self.sim.root.after(20, self._delayed_precipitation_update)
+                else:
+                    # For other layers, proceed directly to final phase
+                    self.sim.root.after(20, self._complete_map_update)
                 
-                # Always redraw wind vectors for Wind layer to ensure they're current
-                self.draw_wind_vectors()
-                return
+                return  # Exit early, next phase will be called via after()
             
-            # Get current layer
+            # For simple layers, proceed directly to complete update
+            self._complete_map_update()
+            
+        except Exception as e:
+            print(f"Error in update_map: {e}")
+            traceback.print_exc()
+    
+    def _complete_map_update(self):
+        """Complete the map update - called as the final phase of updating"""
+        try:
+            # Process idle tasks to prevent UI freezing
+            if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                self.sim.root.update_idletasks()
+            
             current_layer = self.sim.selected_layer.get()
             
-            # Check if layer has changed and force a cache clean
-            if hasattr(self, '_last_selected_layer') and self._last_selected_layer != current_layer:
-                self._clean_image_cache()
+            # Schedule different parts of the rendering process with small delays in between
+            # This allows the UI thread to process events between render phases
             
-            # Update the last selected layer
-            self._last_selected_layer = current_layer
+            # Phase 1: Clear canvas and add loading indicator
+            self.canvas.delete("all")
             
-            # If it's pressure and we have a cached image, use that
-            if current_layer == "Pressure" and self._pressure_image is not None:
+            # For expensive layers, show loading indicator while rendering
+            if current_layer in ["Pressure", "Wind", "Ocean Currents", "Precipitation"]:
+                loading_id = self.canvas.create_text(
+                    self.canvas.winfo_width() // 2, 
+                    self.canvas.winfo_height() // 2,
+                    text=f"Rendering {current_layer}...",
+                    fill="white",
+                    font=("Arial", 14)
+                )
+                
+                # Update idle tasks to show loading indicator
+                if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                    self.sim.root.update_idletasks()
+                
+                # Schedule Phase 2 with a slight delay to allow UI to update
+                if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                    self.sim.root.after(10, lambda: self._render_layer_phase2(current_layer, loading_id))
+                return
+            else:
+                # For simpler layers, proceed directly
+                self._render_layer_direct(current_layer)
+            
+        except Exception as e:
+            print(f"Error completing map update: {e}")
+            traceback.print_exc()
+    
+    def _render_layer_phase2(self, current_layer, loading_id):
+        """Phase 2 of the layer rendering process"""
+        try:
+            # Handle based on the selected layer
+            if current_layer == "Elevation":
+                self._render_elevation_layer()
+            elif current_layer == "Temperature":
+                self._render_temperature_layer()
+            elif current_layer == "Pressure":
+                # For the most expensive layers, use separate phases with delays
+                if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                    self.sim.root.after(5, lambda: self._render_pressure_layer())
+            elif current_layer == "Wind":
+                # For wind layer, handle background first, then vectors separately
+                self._render_wind_background()
+                # Schedule vector drawing with a delay
+                if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                    self.sim.root.after(10, self.draw_wind_vectors)
+            elif current_layer == "Ocean Temperature":
+                self._render_ocean_temperature_layer()
+            elif current_layer == "Precipitation":
+                if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                    self.sim.root.after(5, lambda: self._render_precipitation_layer())
+            elif current_layer == "Ocean Currents":
+                # First render the ocean temperature background
+                self._render_ocean_temperature_layer()
+                # Then schedule current vectors with a delay
+                if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                    self.sim.root.after(10, self.draw_current_arrows)
+            elif current_layer == "Humidity":
+                self._render_humidity_layer()
+            elif current_layer == "Cloud Cover":
+                self._render_cloud_cover_layer()
+            else:
+                # Default to elevation if unknown layer
+                self._render_elevation_layer()
+            
+            # Remove loading indicator if it exists
+            if loading_id:
+                self.canvas.delete(loading_id)
+            
+        except Exception as e:
+            print(f"Error in rendering phase 2: {e}")
+            traceback.print_exc()
+    
+    def _render_layer_direct(self, current_layer):
+        """Direct rendering for simpler layers"""
+        try:
+            # Handle based on the selected layer
+            if current_layer == "Elevation":
+                self._render_elevation_layer()
+            elif current_layer == "Temperature":
+                self._render_temperature_layer()
+            elif current_layer == "Humidity":
+                self._render_humidity_layer()
+            elif current_layer == "Cloud Cover":
+                self._render_cloud_cover_layer()
+            else:
+                # Default to elevation if unknown layer
+                self._render_elevation_layer()
+        except Exception as e:
+            print(f"Error in direct rendering: {e}")
+            traceback.print_exc()
+    
+    def _render_wind_background(self):
+        """Render just the background for the wind layer"""
+        try:
+            # Use altitude map as background for wind vectors
+            display_data = self.map_altitude_to_color(self.sim.elevation)
+            image = Image.fromarray(display_data.astype('uint8'))
+            photo_img = ImageTk.PhotoImage(image)
+            self.image_cache['wind_bg'] = photo_img
+            
+            # Update canvas with terrain background
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img)
+        except Exception as e:
+            print(f"Error rendering wind background: {e}")
+            traceback.print_exc()
+    
+    def _render_elevation_layer(self):
+        """Render the elevation layer"""
+        # Generate grayscale elevation data
+        rgb_data = self.map_to_grayscale(self.sim.elevation_normalized)
+        img = Image.fromarray(rgb_data)
+        photo_img = ImageTk.PhotoImage(image=img)
+        self.image_cache['elevation'] = photo_img
+        
+        # Clear canvas and draw the image
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img, tags="map")
+    
+    def _render_temperature_layer(self):
+        """Render the temperature layer"""
+        # Generate the temperature visualization
+        rgba_data = self.map_temperature_to_color(self.sim.temperature_celsius)
+        img = Image.fromarray(rgba_data, 'RGBA')
+        photo_img = ImageTk.PhotoImage(image=img)
+        self.image_cache['temperature'] = photo_img
+        
+        # Clear canvas and draw the image
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img, tags="map")
+        
+        # Draw cloud overlay if enabled
+        if hasattr(self.sim, 'show_clouds') and self.sim.show_clouds.get():
+            # Get cloud RGBA data
+            cloud_rgba = self.map_clouds_to_color()
+            
+            # If we have cloud data with non-zero alpha channel
+            if np.any(cloud_rgba[:, :, 3] > 0):
+                cloud_img = Image.fromarray(cloud_rgba, 'RGBA')
+                cloud_photo = ImageTk.PhotoImage(image=cloud_img)
+                self.image_cache['clouds'] = cloud_photo
+                
+                # Draw cloud overlay
+                self.canvas.create_image(0, 0, anchor=tk.NW, image=cloud_photo, tags="clouds")
+        
+        # Draw wind vectors if wind overlay enabled
+        if hasattr(self.sim, 'show_wind') and self.sim.show_wind.get():
+            self.draw_wind_vectors()
+    
+    def _render_pressure_layer(self):
+        """Render the pressure layer in stages to prevent UI blocking"""
+        try:
+            # If we have a cached image, use it immediately
+            if self._pressure_image is not None:
                 self.canvas.delete("all")
                 self.canvas.create_image(0, 0, anchor=tk.NW, image=self._pressure_image, tags="map")
                 return
                 
-            # If it's precipitation and we have a cached image, use that  
-            if current_layer == "Precipitation" and self._cached_precip_image is not None:
-                self.canvas.delete("all")
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=self._cached_precip_image, tags="map")
-                return
-            
-            # Generate visualization data based on selected layer
-            if current_layer == "Elevation":
-                rgb_data = self.map_to_grayscale(self.sim.elevation_normalized)
-                img = Image.fromarray(rgb_data)
-                photo_img = ImageTk.PhotoImage(image=img)
-                self.image_cache['elevation'] = photo_img
-            elif current_layer == "Altitude":
-                rgb_data = self.map_altitude_to_color(self.sim.elevation)
-                img = Image.fromarray(rgb_data)
-                photo_img = ImageTk.PhotoImage(image=img)
-                self.image_cache['altitude'] = photo_img
-            elif current_layer == "Temperature":
-                rgba_data = self.map_temperature_to_color(self.sim.temperature_celsius)
-                img = Image.fromarray(rgba_data, 'RGBA')
-                photo_img = ImageTk.PhotoImage(image=img)
-                self.image_cache['temperature'] = photo_img
-            elif current_layer == "Ocean Temperature":
-                # Create normalized ocean temperature data
-                # Scale from -2°C to 30°C (typical ocean temperature range)
-                min_ocean_temp = -2
-                max_ocean_temp = 30
-                normalized_temp = (self.sim.temperature_celsius - min_ocean_temp) / (max_ocean_temp - min_ocean_temp)
-                np.clip(normalized_temp, 0, 1, out=normalized_temp)  # Ensure values are between 0-1
-                rgb_data = self.map_ocean_temperature_to_color(normalized_temp)
-                img = Image.fromarray(rgb_data)
-                photo_img = ImageTk.PhotoImage(image=img)
-                self.image_cache['ocean_temperature'] = photo_img
-            elif current_layer == "Pressure":
-                # Generate the pressure visualization directly
-                rgba_data = self.map_pressure_to_color(self.sim.pressure)
-                img = Image.fromarray(rgba_data, 'RGBA')
-                # Cache the image
-                self._pressure_image = ImageTk.PhotoImage(img)
-                self.image_cache['pressure'] = self._pressure_image
-                photo_img = self._pressure_image
-                self.canvas.delete("all")
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img, tags="map")
-                return
-            elif current_layer == "Precipitation" and hasattr(self.sim, 'precipitation'):
-                rgba_data = self.map_precipitation_to_color(self.sim.precipitation)
-                img = Image.fromarray(rgba_data, 'RGBA')
-            else:
-                # Default to elevation if layer not recognized
-                rgb_data = self.map_to_grayscale(self.sim.elevation_normalized)
-                img = Image.fromarray(rgb_data)
-            
-            # Convert to PhotoImage for Tkinter
-            photo_img = ImageTk.PhotoImage(image=img)
-            
-            # Store reference to prevent garbage collection
-            self.image_cache[current_layer] = photo_img
-            
-            # Clear canvas
+            # Create a placeholder to show the user something while rendering
             self.canvas.delete("all")
+            loading_text = self.canvas.create_text(
+                self.canvas.winfo_width() // 2, 
+                self.canvas.winfo_height() // 2,
+                text="Generating pressure map...",
+                fill="white",
+                font=("Arial", 14)
+            )
             
-            # Draw base map
-            self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img, tags="map")
-            
-            # Draw cloud overlay if enabled and we're on temperature layer
-            if current_layer in ["Temperature"] and hasattr(self.sim, 'show_clouds') and self.sim.show_clouds.get():
-                # Get cloud RGBA data
-                cloud_rgba = self.map_clouds_to_color()
+            # Update canvas to show loading message
+            if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                self.sim.root.update_idletasks()
                 
-                # If we have cloud data with non-zero alpha channel
-                if np.any(cloud_rgba[:, :, 3] > 0):
-                    cloud_img = Image.fromarray(cloud_rgba, 'RGBA')
-                    cloud_photo = ImageTk.PhotoImage(image=cloud_img)
-                    self.image_cache['clouds'] = cloud_photo
-                    
-                    # Draw cloud overlay
-                    self.canvas.create_image(0, 0, anchor=tk.NW, image=cloud_photo, tags="clouds")
-            
-            # Draw wind vectors if on temperature layer with wind overlay enabled
-            if current_layer == "Temperature" and hasattr(self.sim, 'show_wind') and self.sim.show_wind.get():
-                self.draw_wind_vectors()
-                
-            # Draw ocean currents if on ocean temperature layer
-            if current_layer == "Ocean Temperature" and hasattr(self.sim, 'show_currents') and self.sim.show_currents.get():
-                self.draw_current_arrows()
-                
+            # Schedule the actual pressure generation on a short delay
+            if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                self.sim.root.after(20, lambda: self._generate_pressure_viz(loading_text))
         except Exception as e:
-            print(f"Error in update_map: {e}")
+            print(f"Error starting pressure rendering: {e}")
             traceback.print_exc()
+        
+    def _generate_pressure_viz(self, loading_text):
+        """Generate pressure visualization in a non-blocking way"""
+        try:
+            # Generate the pressure visualization
+            rgba_data = self.map_pressure_to_color(self.sim.pressure)
+            
+            # Check if root still exists after the potentially long operation
+            if not hasattr(self.sim, 'root') or not self.sim.root.winfo_exists():
+                return
+                
+            # Update loading text to indicate progress
+            self.canvas.itemconfigure(loading_text, text="Creating pressure image...")
+            self.sim.root.update_idletasks()
+            
+            # Convert to image
+            img = Image.fromarray(rgba_data, 'RGBA')
+            
+            # Schedule the final display step
+            if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                self.sim.root.after(10, lambda: self._finish_pressure_render(img, loading_text))
+        except Exception as e:
+            print(f"Error generating pressure visualization: {e}")
+            traceback.print_exc()
+            
+            # Try to clear the loading text
+            try:
+                if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+                    self.canvas.delete(loading_text)
+            except:
+                pass
+            
+    def _finish_pressure_render(self, img, loading_text):
+        """Final stage of pressure rendering to display the image"""
+        try:
+            # Convert to tkinter image
+            self._pressure_image = ImageTk.PhotoImage(img)
+            self.image_cache['pressure'] = self._pressure_image
+            
+            # Clear canvas and draw the image
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self._pressure_image, tags="map")
+        except Exception as e:
+            print(f"Error finishing pressure render: {e}")
+            traceback.print_exc()
+    
+    def _render_wind_layer(self):
+        """Render the wind layer"""
+        # Use altitude map as background for wind vectors
+        display_data = self.map_altitude_to_color(self.sim.elevation)
+        image = Image.fromarray(display_data.astype('uint8'))
+        photo_img = ImageTk.PhotoImage(image)
+        self.image_cache['wind_bg'] = photo_img
+        
+        # Update canvas with terrain background
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img)
+        
+        # Draw wind vectors on top
+        # Use a timer to avoid UI blocking during vector drawing
+        self.sim.root.after(10, self.draw_wind_vectors)
+    
+    def _render_ocean_temperature_layer(self):
+        """Render the ocean temperature layer"""
+        # Create normalized ocean temperature data
+        # Scale from -2°C to 30°C (typical ocean temperature range)
+        min_ocean_temp = -2
+        max_ocean_temp = 30
+        normalized_temp = (self.sim.temperature_celsius - min_ocean_temp) / (max_ocean_temp - min_ocean_temp)
+        np.clip(normalized_temp, 0, 1, out=normalized_temp)  # Ensure values are between 0-1
+        
+        # Generate the visualization
+        rgb_data = self.map_ocean_temperature_to_color(normalized_temp)
+        img = Image.fromarray(rgb_data)
+        photo_img = ImageTk.PhotoImage(image=img)
+        self.image_cache['ocean_temperature'] = photo_img
+        
+        # Clear canvas and draw the image
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img, tags="map")
+        
+        # Draw ocean currents if enabled
+        if hasattr(self.sim, 'show_currents') and self.sim.show_currents.get():
+            # Draw currents in a separate after callback to prevent UI blocking
+            self.sim.root.after(10, self.draw_current_arrows)
+    
+    def _render_precipitation_layer(self):
+        """Render the precipitation layer"""
+        # If we have a cached image, use it
+        if hasattr(self, '_cached_precip_image') and self._cached_precip_image is not None:
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self._cached_precip_image, tags="map")
+            return
+        
+        # Otherwise generate the precipitation visualization
+        if hasattr(self.sim, 'precipitation'):
+            rgba_data = self.map_precipitation_to_color(self.sim.precipitation)
+            img = Image.fromarray(rgba_data, 'RGBA')
+            self._cached_precip_image = ImageTk.PhotoImage(img)
+            self.image_cache['precipitation'] = self._cached_precip_image
+            
+            # Clear canvas and draw the image
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self._cached_precip_image, tags="map")
+        else:
+            # If no precipitation data available, show a blank canvas
+            self.canvas.delete("all")
+            self.canvas.create_text(
+                self.canvas.winfo_width() // 2, 
+                self.canvas.winfo_height() // 2,
+                text="No precipitation data available",
+                fill="white",
+                font=("Arial", 14)
+            )
+    
+    def _render_ocean_currents_layer(self):
+        """Render the ocean currents layer"""
+        # Use ocean temperature as background
+        self._render_ocean_temperature_layer()
+        
+        # Draw ocean current vectors in a delayed callback
+        self.sim.root.after(10, self.draw_current_arrows)
+    
+    def _render_humidity_layer(self):
+        """Render the humidity layer"""
+        # Generate the humidity visualization
+        if hasattr(self.sim, 'humidity'):
+            rgba_data = self.map_humidity_to_color(self.sim.humidity)
+            img = Image.fromarray(rgba_data, 'RGBA')
+            photo_img = ImageTk.PhotoImage(image=img)
+            self.image_cache['humidity'] = photo_img
+            
+            # Clear canvas and draw the image
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img, tags="map")
+        else:
+            # If no humidity data available, show a blank canvas
+            self.canvas.delete("all")
+            self.canvas.create_text(
+                self.canvas.winfo_width() // 2, 
+                self.canvas.winfo_height() // 2,
+                text="No humidity data available",
+                fill="white",
+                font=("Arial", 14)
+            )
+    
+    def _render_cloud_cover_layer(self):
+        """Render the cloud cover layer"""
+        if hasattr(self.sim, 'cloud_cover'):
+            rgba_data = self.map_cloud_cover_to_color(self.sim.cloud_cover)
+            img = Image.fromarray(rgba_data, 'RGBA')
+            photo_img = ImageTk.PhotoImage(image=img)
+            self.image_cache['cloud_cover'] = photo_img
+            
+            # Clear canvas and draw the image
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=photo_img, tags="map")
+        else:
+            # If no cloud cover data available, show a blank canvas
+            self.canvas.delete("all")
+            self.canvas.create_text(
+                self.canvas.winfo_width() // 2, 
+                self.canvas.winfo_height() // 2,
+                text="No cloud cover data available",
+                fill="white",
+                font=("Arial", 14)
+            )
     
     def update_visualization_loop(self):
         """Continuous loop for updating visualization in separate thread"""
         try:
             print("Visualization thread started")
             
+            # Track timing for performance analysis
+            last_update_time = 0
+            update_count = 0
+            idle_count = 0
+            
             # Run continuously until thread is explicitly stopped
             while True:
-                # Check if we should continue running
-                if hasattr(self.sim, 'visualization_active'):
-                    if not self.sim.visualization_active.is_set():
-                        print("Visualization thread stopping (flag cleared)")
-                        break
-                else:
-                    # If visualization_active doesn't exist, create it
-                    print("Creating missing visualization_active attribute")
-                    self.sim.visualization_active = threading.Event()
-                    self.sim.visualization_active.set()
-                
-                # Check for visualization update requests in the queue
                 try:
-                    if hasattr(self.sim, 'visualization_queue'):
-                        # Process all available updates, prioritizing high-priority ones
-                        updates_by_priority = {}
-                        
-                        # Try to collect all available updates without blocking
-                        while True:
-                            try:
-                                # Get an update request with a short timeout
-                                update_request = self.sim.visualization_queue.get_nowait()
-                                
-                                # Determine priority level
-                                priority = 1  # Default to medium priority
-                                if isinstance(update_request, dict) and "priority" in update_request:
-                                    priority = update_request["priority"]
-                                elif update_request == "UPDATE":
-                                    # Legacy string-based updates
-                                    priority = 1
-                                
-                                # Store in priority-based dictionary
-                                if priority not in updates_by_priority:
-                                    updates_by_priority[priority] = []
-                                updates_by_priority[priority].append(update_request)
-                                
-                                # Mark task as done
-                                self.sim.visualization_queue.task_done()
-                            except queue.Empty:
-                                # No more updates available
-                                break
-                        
-                        # Process updates in priority order (lower number = higher priority)
-                        if updates_by_priority:
-                            # Sort priorities (lowest number first)
-                            priorities = sorted(updates_by_priority.keys())
-                            
-                            # Get highest priority update (only process one per cycle)
-                            highest_priority = priorities[0]
-                            update = updates_by_priority[highest_priority][0]
-                            
-                            # Handle the update based on its type
-                            if isinstance(update, dict) and "type" in update:
-                                update_type = update["type"]
-                                
-                                if update_type == "UPDATE":
-                                    # Schedule standard map update
-                                    self._schedule_map_update()
-                                elif update_type == "ZOOM_UPDATE" and "event_x" in update and "event_y" in update:
-                                    # Schedule zoom update
-                                    self._schedule_zoom_update(update["event_x"], update["event_y"])
-                                else:
-                                    # Unknown update type, default to map update
-                                    self._schedule_map_update()
-                            else:
-                                # Legacy or simple update request
-                                self._schedule_map_update()
+                    # Check if we should continue running
+                    if hasattr(self.sim, 'visualization_active'):
+                        if not self.sim.visualization_active.is_set():
+                            print("Visualization thread stopping (flag cleared)")
+                            break
                     else:
-                        # If queue doesn't exist, sleep a bit longer
-                        time.sleep(0.1)
+                        # If visualization_active doesn't exist, create it
+                        print("Creating missing visualization_active attribute")
+                        self.sim.visualization_active = threading.Event()
+                        self.sim.visualization_active.set()
+                    
+                    # Wait for a visualization update event instead of polling
+                    # This significantly reduces CPU usage and prevents UI thread blocking
+                    update_available = False
+                    if hasattr(self.sim, 'visualization_update_ready'):
+                        # Wait efficiently with a timeout to allow checking stop flag
+                        update_available = self.sim.visualization_update_ready.wait(0.05)  # 50ms timeout
+                        
+                        if update_available:
+                            # Clear the event for the next update
+                            self.sim.visualization_update_ready.clear()
+                            # Reset idle counter when we get an update
+                            idle_count = 0
+                    else:
+                        # Use a sleep if event not available (fallback)
+                        time.sleep(0.05)
+                    
+                    # Only process updates at most 10 times per second to prevent UI thread overload
+                    current_time = time.time()
+                    time_since_last_update = current_time - last_update_time
+                    
+                    # Calculate if it's time for an update (max 10 FPS)
+                    update_ready = update_available and time_since_last_update >= 0.1
+                    
+                    # Force an update periodically even if not signaled
+                    # This ensures visualization continues even if signaling mechanism fails
+                    force_update = idle_count > 50  # Force update after ~2.5 seconds of inactivity
+                    if force_update and time_since_last_update >= 1.0:  # At most once per second
+                        update_ready = True
+                        print("Forcing visualization update after inactivity")
+                        idle_count = 0
+                    else:
+                        idle_count += 1
+                    
+                    # Check queue only when an update is signaled to reduce contention
+                    if update_ready:
+                        # Update last update time immediately to prevent race conditions
+                        last_update_time = current_time
+                        update_count += 1
+                        
+                        # Process the update through the UI thread
+                        self._schedule_map_update()
+                        
+                        # Add a small sleep after scheduling to reduce thread contention
+                        time.sleep(0.01)
+                        
                 except Exception as e:
-                    print(f"Error checking visualization queue: {e}")
-                    time.sleep(0.1)  # Sleep on error to prevent CPU spinning
-                
-                # Sleep briefly before checking again
-                # This prevents excessive CPU usage when no updates are needed
-                time.sleep(0.03)  # ~33 FPS max
-            
+                    print(f"Error in visualization loop iteration: {e}")
+                    traceback.print_exc()
+                    # Continue loop despite error
+                    time.sleep(0.1)  # Short delay before retry
+        
             print("Visualization thread ended")
         except Exception as e:
             print(f"Error in visualization loop: {e}")
@@ -1016,8 +1249,32 @@ class Visualization:
                 except:
                     pass  # Ignore errors if the scheduled update no longer exists
             
-            # Schedule a new update
-            self._update_after_id = self.sim.root.after(0, self.update_visualization)
+            # Use a longer delay (25ms) to give the UI thread time to process events
+            # This prevents UI freezing by allowing input events to be processed between visualization updates
+            self._update_after_id = self.sim.root.after(25, self._deferred_update_visualization)
+    
+    def _deferred_update_visualization(self):
+        """Deferred update method with safety checks to prevent blocking the UI thread"""
+        try:
+            # Reset the after ID since this update is now running
+            if hasattr(self, '_update_after_id'):
+                self._update_after_id = None
+            
+            # Check if update is still needed
+            if not hasattr(self.sim, 'root') or not self.sim.root.winfo_exists():
+                return
+            
+            # Process UI events before rendering to keep UI responsive
+            self.sim.root.update_idletasks()
+            
+            # Update the visualization
+            self.update_visualization()
+            
+            # Process UI events again after rendering
+            self.sim.root.update_idletasks()
+        except Exception as e:
+            print(f"Error in deferred visualization update: {e}")
+            traceback.print_exc()
     
     def _schedule_zoom_update(self, x, y):
         """Schedule a zoom view update in the main thread"""
@@ -1211,8 +1468,10 @@ class Visualization:
         except Exception as e:
             print(f"Error scheduling zoom update: {e}")
             traceback.print_exc()
-            self._zoom_update_pending = False  # Ensure flag is reset on errors
             
+            # Reset pending state to allow future updates
+            self._zoom_update_pending = False
+    
     def _update_zoom_view_debounced(self, event):
         """Actual implementation of zoom view update with debouncing"""
         try:
@@ -1514,3 +1773,54 @@ class Visualization:
         except Exception as e:
             print(f"Error drawing zoom current vectors: {e}")
             traceback.print_exc() 
+    
+    def force_update(self):
+        """Force an immediate update of the visualization in the current thread"""
+        try:
+            # Only proceed if root still exists
+            if not hasattr(self.sim, 'root') or not self.sim.root.winfo_exists():
+                return
+                
+            # Process UI events to ensure UI is responsive
+            self.sim.root.update_idletasks()
+            
+            # Get the current selected layer
+            current_layer = self.sim.selected_layer.get()
+            
+            # Clear the canvas
+            self.canvas.delete("all")
+            
+            # Process main rendering based on layer
+            if current_layer == "Elevation":
+                self._render_elevation_layer()
+            elif current_layer == "Temperature":
+                self._render_temperature_layer()
+            elif current_layer == "Pressure":
+                self._render_pressure_layer()
+            elif current_layer == "Wind":
+                self._render_wind_layer()
+            elif current_layer == "Ocean Temperature":
+                self._render_ocean_temperature_layer()
+            elif current_layer == "Precipitation":
+                self._render_precipitation_layer()
+            elif current_layer == "Ocean Currents":
+                self._render_ocean_currents_layer()
+            elif current_layer == "Humidity":
+                self._render_humidity_layer()
+            elif current_layer == "Cloud Cover":
+                self._render_cloud_cover_layer()
+            
+            # Update mouse-over info if available
+            if hasattr(self.sim, 'update_mouse_over'):
+                self.sim.update_mouse_over()
+                
+            # Update zoom view if it exists
+            if hasattr(self.sim, 'zoom_dialog') and self.sim.zoom_dialog and self.sim.zoom_dialog.winfo_exists():
+                self.update_zoom_view(None)
+                
+            # Process UI events again after rendering
+            self.sim.root.update_idletasks()
+            
+        except Exception as e:
+            print(f"Error in force_update: {e}")
+            traceback.print_exc()
