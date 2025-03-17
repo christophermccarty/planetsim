@@ -13,6 +13,7 @@ from PIL import Image, ImageTk
 from scipy.ndimage import gaussian_filter
 import pickle
 import random
+import queue
 
 from temperature import Temperature
 from pressure import Pressure
@@ -48,6 +49,9 @@ class SimulationApp:
             # Mouse tracking
             self.last_mouse_x = 0
             self.last_mouse_y = 0
+            self.last_mouse_update_time = 0  # Track when we last updated mouse info
+            self.mouse_position_changed = False  # Flag to track if mouse has moved since last update
+            self.mouse_debounce_delay = 50  # Milliseconds to wait before updating after mouse movement
             
             # Time and simulation variables
             self.time_step = 0
@@ -62,6 +66,23 @@ class SimulationApp:
             self.Omega = 7.2921159e-5
             self.P0 = 101325
             self.desired_simulation_step_time = 0.1  # 0.1 seconds between simulation steps
+
+            # Create a queue for visualization updates
+            self.visualization_queue = queue.Queue(maxsize=10)  # Limit queue size to prevent memory issues
+            
+            # Create a dedicated simulation thread event to control simulation
+            self.simulation_thread_active = threading.Event()
+            self.simulation_thread_active.set()
+            
+            # Initialize state flag
+            self.simulation_running = False  # Start with simulation off
+            
+            # Define visualization update priority levels
+            self.VIZ_PRIORITY = {
+                "HIGH": 0,     # Critical updates (layer changes, initial display)
+                "MEDIUM": 1,   # Important updates (simulation step completed)
+                "LOW": 2       # Less important updates (mouse movements, small data changes)
+            }
 
             # Master switch for system stats printing is now in SystemStats class
 
@@ -208,9 +229,11 @@ class SimulationApp:
             self.visualization_thread.daemon = True
             self.visualization_thread.start()
             
-            # Start simulation using Tkinter's after method instead of a thread
-            print("Scheduling first simulation run...")
-            self.root.after(100, self.simulate)
+            # Initialize the simulation thread but don't start it yet
+            print("Setting up simulation thread...")
+            self.simulation_thread = threading.Thread(target=self.simulation_worker)
+            self.simulation_thread.daemon = True
+            self.simulation_thread.start()
             
             # Create simulation control flags
             self.simulation_active = threading.Event()
@@ -425,16 +448,27 @@ class SimulationApp:
         """Start periodic updates for mouse-over information"""
         # Update mouse-over info every 200ms even without mouse movement
         self.update_mouse_over()  # Initial update
-        self.root.after(200, self._periodic_mouse_update)
+        self.root.after(500, self._periodic_mouse_update)  # Changed from 200ms to 500ms
     
     def _periodic_mouse_update(self):
         """Update mouse-over information periodically"""
         try:
-            # Update the information
-            self.update_mouse_over()
+            # Only update if significant time has passed or mouse has moved
+            current_time = time.time() * 1000  # Convert to milliseconds
+            time_since_update = current_time - self.last_mouse_update_time
             
-            # Schedule the next update
-            self.root.after(200, self._periodic_mouse_update)
+            if self.mouse_position_changed or time_since_update > 1000:  # Force update after 1 second
+                self.update_mouse_over()
+                self.mouse_position_changed = False
+            
+            # Schedule the next update with variable frequency
+            # More frequent checks if we're actively moving the mouse, less frequent otherwise
+            if self.mouse_position_changed:
+                next_update = 200  # More responsive when moving
+            else:
+                next_update = 500  # Less frequent when idle
+                
+            self.root.after(next_update, self._periodic_mouse_update)
         except Exception as e:
             print(f"Error in periodic mouse update: {e}")
             # Try to reschedule despite error
@@ -444,10 +478,82 @@ class SimulationApp:
         """Handle layer change event"""
         try:
             if hasattr(self, 'visualization'):
-                self.visualization.update_map()
+                # Layer changes are high priority
+                self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
         except Exception as e:
             print(f"Error changing layer: {e}")
             traceback.print_exc()
+    
+    def request_visualization_update(self, priority=None):
+        """Request a visualization update via the queue with optional priority"""
+        try:
+            if hasattr(self, 'visualization_queue'):
+                # Default to MEDIUM priority if none specified
+                if priority is None:
+                    priority = self.VIZ_PRIORITY["MEDIUM"]
+                
+                # Create update request with priority
+                update_request = {
+                    "type": "UPDATE",
+                    "priority": priority,
+                    "timestamp": time.time()
+                }
+                
+                if not self.visualization_queue.full():
+                    self.visualization_queue.put_nowait(update_request)
+                else:
+                    # If queue is full, try to remove a lower priority item
+                    try:
+                        # Check if we can remove a lower priority item
+                        queue_items = []
+                        found_lower_priority = False
+                        
+                        # Get all items from queue temporarily
+                        while not self.visualization_queue.empty():
+                            item = self.visualization_queue.get_nowait()
+                            queue_items.append(item)
+                            
+                        # Look for a lower priority item to replace
+                        for i, item in enumerate(queue_items):
+                            # If item has no priority field or has lower priority
+                            if not isinstance(item, dict) or "priority" not in item or item["priority"] > priority:
+                                # Replace with our higher priority item
+                                queue_items[i] = update_request
+                                found_lower_priority = True
+                                break
+                        
+                        # If we couldn't find a lower priority item and this is HIGH priority
+                        if not found_lower_priority and priority == self.VIZ_PRIORITY["HIGH"]:
+                            # Replace the oldest item
+                            oldest_index = 0
+                            oldest_time = float('inf')
+                            
+                            for i, item in enumerate(queue_items):
+                                if isinstance(item, dict) and "timestamp" in item and item["timestamp"] < oldest_time:
+                                    oldest_time = item["timestamp"]
+                                    oldest_index = i
+                            
+                            # Replace the oldest item with our high priority update
+                            queue_items[oldest_index] = update_request
+                        
+                        # Put items back in the queue
+                        for item in queue_items:
+                            self.visualization_queue.put_nowait(item)
+                            
+                    except Exception as e:
+                        print(f"Error managing visualization queue: {e}")
+                        # In case of error, discard all and add the new one
+                        while not self.visualization_queue.empty():
+                            try:
+                                self.visualization_queue.get_nowait()
+                            except:
+                                pass
+                        self.visualization_queue.put_nowait(update_request)
+        except Exception as e:
+            print(f"Error requesting visualization update: {e}")
+            # Fall back to direct update in case of queue errors
+            if hasattr(self, 'visualization'):
+                self.root.after(0, self.visualization.update_map)
 
     def on_closing(self):
         """Handle window closing"""
@@ -462,6 +568,8 @@ class SimulationApp:
                 self.zoom_dialog = ZoomDialog(self.root)
                 # Position the zoom dialog in the bottom right initially
                 self.zoom_dialog.geometry(f"+{self.root.winfo_rootx() + self.map_width - 250}+{self.root.winfo_rooty() + self.map_height - 250}")
+                # Request a visualization update to show the zoom view - medium priority
+                self.request_visualization_update(self.VIZ_PRIORITY["MEDIUM"])
         else:
             # Destroy zoom window if it exists
             if hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
@@ -469,7 +577,6 @@ class SimulationApp:
                 self.zoom_dialog = None
 
     def on_new(self):
-        # [Implement as in the original code...]
         try:
             # Generate new random terrain data and then start simulation
             self.on_generate()
@@ -477,11 +584,12 @@ class SimulationApp:
             # Reset to default view
             self.selected_layer.set("Elevation")
             if hasattr(self, 'visualization'):
-                self.visualization.update_map()
+                # High priority for initial display
+                self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
         except Exception as e:
             print(f"Error in on_new: {e}")
             traceback.print_exc()
-
+            
     def on_load(self, file_path=None):
         """Load and process elevation image"""
         if file_path:
@@ -568,6 +676,7 @@ class SimulationApp:
 
     def on_generate(self, elevation_data=None):
         """Handle generating a simulation or starting a new simulation"""
+        
         # Don't restart if already running
         if hasattr(self, 'simulation_running') and self.simulation_running:
             print("Simulation is already running")
@@ -666,6 +775,12 @@ class SimulationApp:
             self.simulation_running = True
             print("Setting simulation_running = True")
             
+            # Signal the simulation thread to process
+            if hasattr(self, 'simulation_thread_active'):
+                self.simulation_thread_active.set()
+            
+            print("Simulation started")
+            
             # Schedule first simulation step
             print("Scheduling first simulation step")
             self.time_step = 0
@@ -683,10 +798,6 @@ class SimulationApp:
 
     def stop_simulation(self):
         """Stop the running simulation"""
-        # Cancel any pending simulation
-        if hasattr(self, 'simulation_after_id'):
-            self.root.after_cancel(self.simulation_after_id)
-            
         # Set flag to stop simulation
         self.simulation_running = False
         
@@ -695,146 +806,139 @@ class SimulationApp:
         
         print("Simulation stopped")
 
-    def simulate(self):
-        """Main simulation loop - manages physics update and visualization"""
-        try:
-            # Make sure the simulation is running, or return immediately
-            if not hasattr(self, 'simulation_running') or not self.simulation_running:
-                print("simulation_running is False, exiting simulate()")
-                return
+    def simulation_worker(self):
+        """Background thread for running simulation computations"""
+        print("Simulation worker thread started")
+        
+        while True:
+            try:
+                # Check if we should stop the thread
+                if not self.simulation_thread_active.is_set():
+                    print("Simulation thread stopping (flag cleared)")
+                    break
                 
-            # Get start time for this cycle
-            cycle_start = time.time()
-            
-            # Update current step
-            self.time_step += 1
-            
-            # Determine simulation time based on time since last update
-            current_time = time.time()
-            
-            # If we're just starting or _last_step_time doesn't exist yet, use a safe default
-            if not hasattr(self, '_last_step_time') or self._last_step_time <= 0:
-                self._last_step_time = 0.1  # Use a reasonable default value
+                # Check if simulation is running
+                if not self.simulation_running:
+                    # Sleep briefly and check again
+                    time.sleep(0.1)
+                    continue
                 
-            # Calculate simulation speed
-            target_seconds_per_update = 1.0 / self.target_update_rate
-            
-            # Default steps_needed value (will be updated for standard mode)
-            steps_needed = 1
-            
-            # Check for mode transition to handle it gracefully
-            transitioning = hasattr(self, '_transitioning_speed_mode') and self._transitioning_speed_mode
-            
-            # Check if we should use high-speed approximation or standard simulation
-            if self.high_speed_mode:
-                # During transition to high-speed, use a more conservative approach
-                if transitioning:
-                    print("Transitioning to high-speed mode - using conservative settings")
-                    approximation_factor = 2  # Start with a lower factor during transition
-                else:
-                    print("Using high-speed approximation mode")
-                    approximation_factor = 6  # Normal high-speed operation
+                # Get start time for this cycle
+                cycle_start = time.time()
                 
-                # In high-speed mode, we run with a fixed approximation factor
-                # This gives more consistent visual updates but less precise physics
-                target_hours = self.time_step_seconds * approximation_factor / 3600
-                self._run_approximated_simulation(target_hours)
-                self.simulation_speed = target_hours
+                # Update current step
+                self.time_step += 1
                 
-                # For timing calculations in high-speed mode
-                steps_needed = approximation_factor
-            else:
-                # During transition from high-speed, use more stable settings
-                if transitioning:
-                    print("Transitioning to standard mode - using stable settings")
-                    # Use more modest step count during transition
-                    steps_needed = 1
-                else:
-                    # In standard mode, adapt time steps based on system performance
-                    steps_possible = max(1, int(target_seconds_per_update / (self._last_step_time or 0.1)))
-                    steps_needed = max(1, min(steps_possible, int(self.max_simulation_hours_per_update * 3600 / self.time_step_seconds)))
+                # Determine simulation time based on time since last update
+                current_time = time.time()
+                
+                # If we're just starting or _last_step_time doesn't exist yet, use a safe default
+                if not hasattr(self, '_last_step_time') or self._last_step_time <= 0:
+                    self._last_step_time = 0.1  # Use a reasonable default value
                     
-                    # Always simulate at least the minimum hours even if it means going slower than target rate
-                    min_steps = max(1, int(self.min_simulation_hours_per_update * 3600 / self.time_step_seconds))
-                    steps_needed = max(steps_needed, min_steps)
+                # Calculate simulation speed
+                target_seconds_per_update = 1.0 / self.target_update_rate
                 
-                # Run the standard simulation with the calculated steps
-                self._run_standard_simulation(steps_needed)
+                # Default steps_needed value (will be updated for standard mode)
+                steps_needed = 1
                 
-                # Calculate actual simulation speed
-                self.simulation_speed = steps_needed * self.time_step_seconds / 3600
-            
-            # Clear the pressure image cache after updating pressure to force redraw
-            if hasattr(self, '_pressure_image'):
-                delattr(self, '_pressure_image')
-            # Also clear the cached pressure visualization data to force a fresh redraw
-            if hasattr(self, '_cached_pressure_viz'):
-                delattr(self, '_cached_pressure_viz')
-            if hasattr(self, '_cached_pressure_data'):
-                delattr(self, '_cached_pressure_data')
-            
-            # Schedule GUI updates to happen in the main thread
-            self.root.after(0, self.visualization.update_map)
-
-            # Update stats display state from checkbox before printing stats
+                # Check for mode transition to handle it gracefully
+                transitioning = hasattr(self, '_transitioning_speed_mode') and self._transitioning_speed_mode
+                
+                # Check if we should use high-speed approximation or standard simulation
+                if self.high_speed_mode:
+                    # During transition to high-speed, use a more conservative approach
+                    if transitioning:
+                        approximation_factor = 2  # Start with a lower factor during transition
+                    else:
+                        approximation_factor = 6  # Normal high-speed operation
+                    
+                    # In high-speed mode, we run with a fixed approximation factor
+                    # This gives more consistent visual updates but less precise physics
+                    target_hours = self.time_step_seconds * approximation_factor / 3600
+                    self._run_approximated_simulation(target_hours)
+                    self.simulation_speed = target_hours
+                    
+                    # For timing calculations in high-speed mode
+                    steps_needed = approximation_factor
+                else:
+                    # In standard mode, we adjust simulation rate based on actual performance
+                    # Calculate number of steps to run to hit our target update rate
+                    simulation_fps = 1.0 / max(self._last_step_time, 0.001)
+                    
+                    # Calculate how many steps needed to maintain target rate
+                    steps_needed = max(1, int(self.target_update_rate / simulation_fps))
+                    
+                    # Limit the maximum steps to prevent excessive lag during slowdowns
+                    steps_needed = min(steps_needed, 24)  # Cap at 24 steps (1 sim day)
+                    
+                    # Run standard simulation with calculated steps
+                    self._run_standard_simulation(steps_needed)
+                    
+                    # Calculate simulation speed in simulated hours per real time second 
+                    self.simulation_speed = steps_needed * self.time_step_seconds / 3600
+                
+                # Request visualization update
+                try:
+                    # Use non-blocking put_nowait to prevent simulation thread from waiting
+                    if hasattr(self, 'visualization_queue'):
+                        if not self.visualization_queue.full():
+                            # Simple string message for compatibility with both versions
+                            self.visualization_queue.put_nowait("UPDATE")
+                except:
+                    # Queue is full or error, skip this update
+                    pass
+                
+                # Schedule UI updates in the main thread using after()
+                # This prevents UI blocking and ensures UI updates happen in the UI thread
+                if hasattr(self, 'root') and self.root.winfo_exists():
+                    self.root.after(0, self.update_ui_elements)
+                
+                # Measure total elapsed time
+                elapsed_time = time.time() - cycle_start
+                
+                # Calculate sleep time to maintain target rate
+                sleep_time = max(0, target_seconds_per_update - elapsed_time)
+                
+                # Sleep for calculated time
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                
+                # Update _last_step_time for next cycle's timing calculation
+                self._last_step_time = elapsed_time / max(1, steps_needed)
+                
+            except Exception as e:
+                print(f"Error in simulation worker: {e}")
+                traceback.print_exc()
+                # Sleep briefly to prevent CPU spinning on errors
+                time.sleep(0.5)
+    
+    def update_ui_elements(self):
+        """Update UI elements in the main thread"""
+        try:
+            # Update stats display state from checkbox
             if hasattr(self, 'stats_var'):
                 # Get current setting from checkbox
                 current_stats_state = self.stats_var.get()
-                
-                # Detect if stats display was just enabled
-                stats_newly_enabled = (not self.show_stats) and current_stats_state
                 
                 # Update the show_stats value
                 self.show_stats = current_stats_state
                 
                 if hasattr(self, 'system_stats'):
                     self.system_stats.print_stats_enabled = self.show_stats
-                    
-                    # Force immediate update if stats were just enabled
-                    if stats_newly_enabled:
-                        self.system_stats.force_next_update = True
-                        print(f"Stats newly enabled, forcing update at step {self.time_step}")
-
-            # Make system_stats update more reliable by setting force update periodically
+            
+            # Force periodic stats updates
             if hasattr(self, 'system_stats') and self.time_step % 5 == 0:
                 self.system_stats.force_next_update = True
+                self.system_stats.print_stats()
                 
-            # After scheduling the stats update with proper flags set
-            self.root.after(0, self.system_stats.print_stats)
-            
-            # Measure total elapsed time
-            elapsed_time = time.time() - cycle_start
-            
-            # Schedule next simulation step with a minimum delay
-            min_delay = 1  # milliseconds
-            delay = max(min_delay, int((target_seconds_per_update - elapsed_time) * 1000))
-            delay = max(min_delay, delay)  # Ensure delay is at least minimum
-            
-            self.simulation_after_id = self.root.after(delay, self.simulate)
-            
-            # Mark simulation as active
-            if hasattr(self, 'simulation_active'):
-                self.simulation_active.set()
-            
-            # Ensure visualization flag is set
-            if hasattr(self, 'visualization_active'):
-                self.visualization_active.set()
-            
-            # Start visualization in another thread if not already running
-            # We should only start this once, not every simulation step
-            if not hasattr(self, 'visualization_thread') or not self.visualization_thread.is_alive():
-                print("Starting new visualization thread")
-                self.visualization_thread = threading.Thread(target=self.visualization.update_visualization_loop)
-                self.visualization_thread.daemon = True
-                self.visualization_thread.start()
-            
-            # Update _last_step_time before exiting - use elapsed_time directly
-            self._last_step_time = elapsed_time / max(1, steps_needed)
-            
         except Exception as e:
-            print(f"Error in simulation: {e}")
-            traceback.print_exc()  # Print the full stack trace for better debugging
-            
+            print(f"Error updating UI elements: {e}")
+    
+    def simulate(self):
+        """No longer used - simulation now runs in background thread"""
+        pass
+
     def _run_standard_simulation(self, steps_needed):
         """Run standard simulation for the specified number of steps"""
         # Track time for performance measurement
@@ -1361,6 +1465,10 @@ class SimulationApp:
     def update_mouse_over(self, event=None):
         """Update mouse-over information display"""
         try:
+            # Track when this update happens
+            self.last_mouse_update_time = time.time() * 1000  # Convert to milliseconds
+            self.mouse_position_changed = False  # Reset change flag
+            
             # Get mouse coordinates
             if event is not None:
                 # Update from event if available
@@ -1473,10 +1581,19 @@ class SimulationApp:
 
     def cleanup(self):
         """Clean up threads before closing"""
+        # Stop the simulation thread
+        self.simulation_thread_active.clear()
+        self.simulation_running = False
+        
+        # Stop the visualization thread
         self.visualization_active.clear()
         
+        # Wait for threads to terminate
         if hasattr(self, 'visualization_thread'):
             self.visualization_thread.join(timeout=1.0)
+            
+        if hasattr(self, 'simulation_thread'):
+            self.simulation_thread.join(timeout=1.0)
 
     def toggle_stats_display(self, enabled=None):
         """Toggle or set the system statistics display"""
@@ -1734,12 +1851,71 @@ class SimulationApp:
 
     def on_mouse_move(self, event):
         """Handle mouse movement by updating both cell info and zoom view"""
-        # Update the cell information display first
-        self.update_mouse_over(event)
+        # Mark that mouse position has changed
+        current_x, current_y = event.x, event.y
         
-        # Then update the zoom view if needed
+        # Only consider it a change if position is actually different
+        if current_x != self.last_mouse_x or current_y != self.last_mouse_y:
+            self.mouse_position_changed = True
+            
+            # Store last position for reference
+            self.last_mouse_x = current_x
+            self.last_mouse_y = current_y
+            
+            # Also store in zoom dialog if it exists
+            if hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
+                self.zoom_dialog.last_main_x = current_x
+                self.zoom_dialog.last_main_y = current_y
+        
+            # Debounced update - update immediately if it's been a while
+            current_time = time.time() * 1000  # Convert to milliseconds
+            time_since_update = current_time - self.last_mouse_update_time
+            
+            if time_since_update > self.mouse_debounce_delay:
+                # Enough time has passed, update immediately
+                self.update_mouse_over(event)
+            else:
+                # Otherwise, let the periodic update handle it
+                pass
+        
+        # Always update zoom view for responsiveness, but with low priority
         if hasattr(self, 'visualization'):
             self.visualization.update_zoom_view(event)
+
+    def update_zoom_view(self, event):
+        """Update the zoom view if it exists"""
+        if hasattr(self, 'visualization') and hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
+            self.visualization.update_zoom_view(event)
+            
+    def on_new(self):
+        try:
+            # Generate new random terrain data and then start simulation
+            self.on_generate()
+
+            # Reset to default view
+            self.selected_layer.set("Elevation")
+            if hasattr(self, 'visualization'):
+                # High priority for initial display
+                self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
+        except Exception as e:
+            print(f"Error in on_new: {e}")
+            traceback.print_exc()
+            
+    def toggle_zoom_window(self):
+        """Toggle the zoom window on/off"""
+        if self.zoom_enabled.get():
+            # Create zoom window if it doesn't exist
+            if not hasattr(self, 'zoom_dialog') or self.zoom_dialog is None or not self.zoom_dialog.winfo_exists():
+                self.zoom_dialog = ZoomDialog(self.root)
+                # Position the zoom dialog in the bottom right initially
+                self.zoom_dialog.geometry(f"+{self.root.winfo_rootx() + self.map_width - 250}+{self.root.winfo_rooty() + self.map_height - 250}")
+                # Request a visualization update to show the zoom view - medium priority
+                self.request_visualization_update(self.VIZ_PRIORITY["MEDIUM"])
+        else:
+            # Destroy zoom window if it exists
+            if hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
+                self.zoom_dialog.destroy()
+                self.zoom_dialog = None
 
 
 class ZoomDialog(tk.Toplevel):

@@ -6,6 +6,7 @@ from PIL import Image, ImageTk
 from scipy.ndimage import gaussian_filter
 from map_generation import MapGenerator
 import threading
+import queue
 
 class Visualization:
     """Class responsible for visualization of simulation data"""
@@ -26,6 +27,11 @@ class Visualization:
         # Cache for pressure and precipitation images
         self._pressure_image = None
         self._cached_precip_image = None
+        
+        # Zoom view update tracking
+        self._last_zoom_update_time = 0
+        self._zoom_update_pending = False
+        self._zoom_debounce_delay = 100  # Milliseconds between zoom updates
         
     def map_to_grayscale(self, data):
         """Convert data to grayscale values"""
@@ -403,14 +409,72 @@ class Visualization:
         # Set alpha channel based on cloud cover (0 = fully transparent, 255 = fully opaque)
         alpha = (self.sim.cloud_cover * 255).astype(np.uint8)
         
-        # Apply minimum visibility threshold for clouds
-        cloud_threshold = 0.1  # Minimum cloud coverage to be visible
-        alpha[self.sim.cloud_cover < cloud_threshold] = 0
+        # Scale down the alpha a bit to avoid completely white areas
+        max_alpha = 200
+        alpha = np.clip(alpha, 0, max_alpha)
         
-        # Store alpha in the 4th channel
+        # Set alpha channel
         rgba[:, :, 3] = alpha
         
         return rgba
+    
+    def map_humidity_to_color(self, humidity_data):
+        """Map humidity data to RGB colors"""
+        try:
+            # Create output array for RGB
+            rgb = np.zeros((humidity_data.shape[0], humidity_data.shape[1], 3), dtype=np.uint8)
+            
+            # Define colors for humidity gradient (pale blue to deep blue)
+            # Format: low_humidity_color, high_humidity_color
+            humidity_colors = np.array([
+                [220, 230, 255],  # Pale blue (low humidity)
+                [20, 80, 180]     # Deep blue (high humidity)
+            ])
+            
+            # Normalize humidity data to 0-1 range if it's not already
+            humidity_normalized = np.clip(humidity_data, 0, 1)
+            
+            # Apply color gradient based on humidity
+            # For each RGB channel
+            for c in range(3):
+                # Interpolate between low and high humidity colors
+                rgb[:, :, c] = humidity_colors[0, c] + humidity_normalized * (humidity_colors[1, c] - humidity_colors[0, c])
+            
+            return rgb.astype(np.uint8)
+        except Exception as e:
+            print(f"Error in map_humidity_to_color: {e}")
+            traceback.print_exc()
+            # Return a safe fallback
+            return self.map_elevation_to_color(self.sim.elevation)
+            
+    def map_cloud_cover_to_color(self, cloud_cover_data):
+        """Map cloud cover data to RGB colors for direct visualization"""
+        try:
+            # Create output array for RGB
+            rgb = np.zeros((cloud_cover_data.shape[0], cloud_cover_data.shape[1], 3), dtype=np.uint8)
+            
+            # Define colors for cloud gradient (light gray to white)
+            # Format: clear_sky_color, full_cloud_color
+            cloud_colors = np.array([
+                [135, 206, 235],  # Sky blue (clear sky)
+                [255, 255, 255]   # White (full cloud cover)
+            ])
+            
+            # Normalize cloud cover data to 0-1 range if it's not already
+            cloud_normalized = np.clip(cloud_cover_data, 0, 1)
+            
+            # Apply color gradient based on cloud cover
+            # For each RGB channel
+            for c in range(3):
+                # Interpolate between clear and cloudy colors
+                rgb[:, :, c] = cloud_colors[0, c] + cloud_normalized * (cloud_colors[1, c] - cloud_colors[0, c])
+            
+            return rgb.astype(np.uint8)
+        except Exception as e:
+            print(f"Error in map_cloud_cover_to_color: {e}")
+            traceback.print_exc()
+            # Return a safe fallback
+            return self.map_elevation_to_color(self.sim.elevation)
     
     def map_elevation_to_color(self, elevation_data):
         """Map elevation to color with improved coloring"""
@@ -736,8 +800,6 @@ class Visualization:
                 display_data = self.map_altitude_to_color(self.sim.elevation)
                 image = Image.fromarray(display_data.astype('uint8'))
                 photo_img = ImageTk.PhotoImage(image)
-                
-                # Store reference to prevent garbage collection
                 self.image_cache['wind_bg'] = photo_img
                 
                 # Update canvas with terrain background
@@ -872,29 +934,129 @@ class Visualization:
                     self.sim.visualization_active = threading.Event()
                     self.sim.visualization_active.set()
                 
-                # Schedule update in the main thread
+                # Check for visualization update requests in the queue
                 try:
-                    if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
-                        # Cancel any existing scheduled update
-                        if hasattr(self, '_update_after_id'):
-                            try:
-                                self.sim.root.after_cancel(self._update_after_id)
-                            except:
-                                pass  # Ignore errors if the scheduled update no longer exists
+                    if hasattr(self.sim, 'visualization_queue'):
+                        # Process all available updates, prioritizing high-priority ones
+                        updates_by_priority = {}
                         
-                        # Schedule a new update
-                        self._update_after_id = self.sim.root.after(0, self.update_visualization)
+                        # Try to collect all available updates without blocking
+                        while True:
+                            try:
+                                # Get an update request with a short timeout
+                                update_request = self.sim.visualization_queue.get_nowait()
+                                
+                                # Determine priority level
+                                priority = 1  # Default to medium priority
+                                if isinstance(update_request, dict) and "priority" in update_request:
+                                    priority = update_request["priority"]
+                                elif update_request == "UPDATE":
+                                    # Legacy string-based updates
+                                    priority = 1
+                                
+                                # Store in priority-based dictionary
+                                if priority not in updates_by_priority:
+                                    updates_by_priority[priority] = []
+                                updates_by_priority[priority].append(update_request)
+                                
+                                # Mark task as done
+                                self.sim.visualization_queue.task_done()
+                            except queue.Empty:
+                                # No more updates available
+                                break
+                        
+                        # Process updates in priority order (lower number = higher priority)
+                        if updates_by_priority:
+                            # Sort priorities (lowest number first)
+                            priorities = sorted(updates_by_priority.keys())
+                            
+                            # Get highest priority update (only process one per cycle)
+                            highest_priority = priorities[0]
+                            update = updates_by_priority[highest_priority][0]
+                            
+                            # Handle the update based on its type
+                            if isinstance(update, dict) and "type" in update:
+                                update_type = update["type"]
+                                
+                                if update_type == "UPDATE":
+                                    # Schedule standard map update
+                                    self._schedule_map_update()
+                                elif update_type == "ZOOM_UPDATE" and "event_x" in update and "event_y" in update:
+                                    # Schedule zoom update
+                                    self._schedule_zoom_update(update["event_x"], update["event_y"])
+                                else:
+                                    # Unknown update type, default to map update
+                                    self._schedule_map_update()
+                            else:
+                                # Legacy or simple update request
+                                self._schedule_map_update()
+                    else:
+                        # If queue doesn't exist, sleep a bit longer
+                        time.sleep(0.1)
                 except Exception as e:
-                    print(f"Error scheduling visualization update: {e}")
+                    print(f"Error checking visualization queue: {e}")
+                    time.sleep(0.1)  # Sleep on error to prevent CPU spinning
                 
-                # Sleep for a short time to prevent excessive CPU usage
-                time.sleep(0.033)  # ~30 FPS
+                # Sleep briefly before checking again
+                # This prevents excessive CPU usage when no updates are needed
+                time.sleep(0.03)  # ~33 FPS max
             
             print("Visualization thread ended")
         except Exception as e:
             print(f"Error in visualization loop: {e}")
             traceback.print_exc()
-
+    
+    def _schedule_map_update(self):
+        """Schedule a standard map update in the main thread"""
+        if hasattr(self.sim, 'root') and self.sim.root.winfo_exists():
+            # Cancel any existing scheduled update
+            if hasattr(self, '_update_after_id'):
+                try:
+                    self.sim.root.after_cancel(self._update_after_id)
+                except:
+                    pass  # Ignore errors if the scheduled update no longer exists
+            
+            # Schedule a new update
+            self._update_after_id = self.sim.root.after(0, self.update_visualization)
+    
+    def _schedule_zoom_update(self, x, y):
+        """Schedule a zoom view update in the main thread"""
+        if not hasattr(self.sim, 'root') or not self.sim.root.winfo_exists():
+            self._zoom_update_pending = False
+            return
+            
+        try:
+            # Create a synthetic event with the necessary coordinates
+            class SyntheticEvent:
+                def __init__(self, x, y):
+                    self.x = x
+                    self.y = y
+                    
+            event = SyntheticEvent(int(x), int(y))
+            
+            # Schedule the zoom update with a short timeout
+            update_id = self.sim.root.after(10, lambda: self._update_zoom_view_debounced(event))
+            
+            # Store the after ID to allow cancellation if needed
+            if not hasattr(self, '_zoom_update_ids'):
+                self._zoom_update_ids = []
+                
+            # Remove any old update IDs to prevent memory leaks
+            while len(self._zoom_update_ids) > 5:  # Keep only the 5 most recent
+                old_id = self._zoom_update_ids.pop(0)
+                try:
+                    self.sim.root.after_cancel(old_id)
+                except:
+                    pass
+                    
+            # Add this update ID to the list
+            self._zoom_update_ids.append(update_id)
+                
+        except Exception as e:
+            print(f"Error in _schedule_zoom_update: {e}")
+            traceback.print_exc()
+            self._zoom_update_pending = False  # Reset pending flag on error
+    
     def update_visualization(self):
         """Update the map display with current data"""
         try:
@@ -983,199 +1145,372 @@ class Visualization:
             traceback.print_exc()
             
     def update_zoom_view(self, event):
-        """
-        Update the zoom window display when the user moves the mouse over the main map or zoomed view.
-        
-        This method:
-        1. Takes mouse coordinates from the event
-        2. Determines the region around the cursor to display in the zoom window
-        3. Creates a magnified view of that region
-        4. Updates the zoom dialog with the new view
-        
-        When the mouse is over the zoom window itself, the coordinates are translated
-        back to the main map coordinates by the zoom window's event handler.
-        """
+        """Update the zoom window with a magnified view around the mouse cursor"""
+        # Skip if there's no zoom dialog
+        if not hasattr(self.sim, 'zoom_dialog') or not self.sim.zoom_dialog or not self.sim.zoom_dialog.winfo_exists():
+            return
+            
         try:
-            # Skip if zoom_dialog doesn't exist
-            if not hasattr(self.sim, 'zoom_dialog') or self.sim.zoom_dialog is None:
+            # Add debouncing to prevent too frequent zoom updates
+            current_time = time.time() * 1000  # Convert to milliseconds
+            time_since_last = current_time - self._last_zoom_update_time
+            
+            # If an update is already scheduled or it's too soon since the last update, skip
+            if self._zoom_update_pending and time_since_last < 1000:  # Allow retrying after 1 second even if pending
                 return
                 
-            if not self.sim.zoom_dialog or not hasattr(self.sim, 'zoom_dialog') or not self.sim.zoom_dialog.winfo_exists():
+            # Reset stale pending updates that might have been forgotten
+            if self._zoom_update_pending and time_since_last > 2000:  # If pending for more than 2 seconds
+                print("Resetting stale zoom update request")
+                self._zoom_update_pending = False
+                
+            # If still a pending update, skip
+            if self._zoom_update_pending or time_since_last < self._zoom_debounce_delay:
                 return
-                
-            # Get current layer
-            current_layer = self.sim.selected_layer.get()
             
-            # Get map dimensions
-            map_height, map_width = self.sim.map_height, self.sim.map_width
-            
-            # Get mouse coordinates
-            x, y = event.x, event.y
-            
-            # Skip if out of bounds
-            if x < 0 or y < 0 or x >= map_width or y >= map_height:
-                return
-                
-            # Get view size
-            view_size = self.sim.zoom_dialog.view_size
-            
-            # Calculate the region to display
-            half_view = view_size // 2
-            x_start = max(0, x - half_view)
-            y_start = max(0, y - half_view)
-            x_end = min(map_width, x + half_view + 1)
-            y_end = min(map_height, y + half_view + 1)
-            
-            # Ensure we get exactly view_size pixels
-            if x_end - x_start < view_size:
-                if x_start == 0:
-                    x_end = min(map_width, x_start + view_size)
-                else:
-                    x_start = max(0, x_end - view_size)
-            
-            if y_end - y_start < view_size:
-                if y_start == 0:
-                    y_end = min(map_height, y_start + view_size)
-                else:
-                    y_start = max(0, y_end - view_size)
-            
-            # Get data based on selected layer
-            if current_layer == "Elevation":
-                view_data = self.map_elevation_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-            elif current_layer == "Temperature":
-                view_data = self.map_temperature_to_color(self.sim.temperature_celsius)[y_start:y_end, x_start:x_end]
-            elif current_layer == "Pressure":
-                view_data = self.map_pressure_to_color(self.sim.pressure)[y_start:y_end, x_start:x_end]
-            elif current_layer == "Wind":
-                view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-                # We'll add wind vectors separately
-            elif current_layer == "Biomes":
-                if hasattr(self.sim, 'biomes') and self.sim.biomes is not None:
-                    # Implement biome color mapping when available
-                    view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-                else:
-                    view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-            elif current_layer == "Ocean Temperature":
-                # Normalize ocean temps to 0-1 range for better visualization
-                ocean_temp_normalized = MapGenerator.normalize_data(self.sim.ocean_temperature)
-                view_data = self.map_ocean_temperature_to_color(ocean_temp_normalized)[y_start:y_end, x_start:x_end]
-            elif current_layer == "Precipitation":
-                view_data = self.map_precipitation_to_color(self.sim.precipitation)[y_start:y_end, x_start:x_end]
-            elif current_layer == "Ocean Currents":
-                # For ocean currents, still use elevation as background
-                view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-            else:
-                # Default to terrain
-                view_data = self.map_altitude_to_color(self.sim.elevation)[y_start:y_end, x_start:x_end]
-            
-            # Create zoomed image
-            img = Image.fromarray(view_data)
-            img = img.resize((self.sim.zoom_dialog.view_size * self.sim.zoom_dialog.zoom_factor,) * 2, 
-                            Image.Resampling.NEAREST)
-            
-            # Convert to PhotoImage
-            photo = ImageTk.PhotoImage(img)
-            self.sim.zoom_dialog.canvas.delete("image")  # Only delete image, keep crosshair
-            self.sim.zoom_dialog.canvas.create_image(0, 0, anchor="nw", image=photo, tags="image")
-            self.sim.zoom_dialog.canvas.tag_raise('crosshair')  # Ensure crosshair stays on top
-            self.sim.zoom_dialog.image = photo  # Keep reference
-            
-            # Position dialog near cursor but not under it
-            dialog_x = self.sim.root.winfo_rootx() + event.x + 20
-            dialog_y = self.sim.root.winfo_rooty() + event.y + 20
-            
-            # Ensure dialog stays within screen bounds
-            screen_width = self.sim.root.winfo_screenwidth()
-            screen_height = self.sim.root.winfo_screenheight()
-            dialog_width = self.sim.zoom_dialog.view_size * self.sim.zoom_dialog.zoom_factor
-            dialog_height = dialog_width
-            
-            # Adjust position if would be off-screen
-            if dialog_x + dialog_width > screen_width:
-                dialog_x = screen_width - dialog_width - 20
-            if dialog_y + dialog_height > screen_height:
-                dialog_y = screen_height - dialog_height - 20
-            
-            # Position the dialog
-            self.sim.zoom_dialog.geometry(f"{dialog_width}x{dialog_height}+{dialog_x}+{dialog_y}")
-            
-            # Add wind vectors if showing wind layer
-            if current_layer == "Wind":
-                # Clear existing vectors
-                self.sim.zoom_dialog.canvas.delete("vector")
-                
-                # Draw wind vectors on the zoomed view
-                vector_spacing = 5  # Draw vectors every N pixels
-                vector_scale = 3.0  # Scale factor for vectors
-                
-                for i in range(0, view_size, vector_spacing):
-                    for j in range(0, view_size, vector_spacing):
-                        if y_start + i < map_height and x_start + j < map_width:
-                            u_val = self.sim.u[y_start + i, x_start + j]
-                            v_val = self.sim.v[y_start + i, x_start + j]
-                            
-                            # Scale vectors based on wind strength
-                            magnitude = np.sqrt(u_val**2 + v_val**2)
-                            if magnitude > 0:
-                                # Scale vector length by zoom factor
-                                dx = -u_val / magnitude * vector_scale * self.sim.zoom_dialog.zoom_factor
-                                dy = -v_val / magnitude * vector_scale * self.sim.zoom_dialog.zoom_factor
-                                
-                                # Calculate pixel positions
-                                x1 = j * self.sim.zoom_dialog.zoom_factor
-                                y1 = i * self.sim.zoom_dialog.zoom_factor
-                                x2 = x1 + dx
-                                y2 = y1 + dy
-                                
-                                # Draw the vector
-                                self.sim.zoom_dialog.canvas.create_line(
-                                    x1, y1, x2, y2, 
-                                    fill="white", 
-                                    arrow=tk.LAST,
-                                    width=1,
-                                    tags="vector"
-                                )
-            
-            # Draw ocean currents if showing ocean current layer
-            elif current_layer == "Ocean Currents":
-                # Clear existing vectors
-                self.sim.zoom_dialog.canvas.delete("vector")
-                
-                if hasattr(self.sim, 'current_u') and hasattr(self.sim, 'current_v'):
-                    # Draw current vectors on the zoomed view
-                    vector_spacing = 7  # Draw vectors every N pixels
-                    vector_scale = 5.0  # Scale factor for current vectors
+            # Try the queue approach for prioritized updates
+            success = False
+            if hasattr(self.sim, 'visualization_queue') and hasattr(self.sim, 'VIZ_PRIORITY'):
+                # Request a low-priority zoom update
+                try:
+                    # Create a copy of event x and y to avoid reference issues
+                    update_request = {
+                        "type": "ZOOM_UPDATE",
+                        "priority": self.sim.VIZ_PRIORITY["LOW"],
+                        "timestamp": time.time(),
+                        "event_x": int(event.x),
+                        "event_y": int(event.y)
+                    }
                     
-                    for i in range(0, view_size, vector_spacing):
-                        for j in range(0, view_size, vector_spacing):
-                            if y_start + i < map_height and x_start + j < map_width:
-                                # Only draw vectors in ocean areas
-                                if self.sim.elevation[y_start + i, x_start + j] <= 0:
-                                    u_val = self.sim.current_u[y_start + i, x_start + j]
-                                    v_val = self.sim.current_v[y_start + i, x_start + j]
-                                    
-                                    # Scale vectors based on current strength
-                                    magnitude = np.sqrt(u_val**2 + v_val**2)
-                                    if magnitude > 0.01:  # Only draw if magnitude is significant
-                                        # Scale vector length by zoom factor
-                                        dx = -u_val / magnitude * vector_scale * self.sim.zoom_dialog.zoom_factor
-                                        dy = -v_val / magnitude * vector_scale * self.sim.zoom_dialog.zoom_factor
-                                        
-                                        # Calculate pixel positions
-                                        x1 = j * self.sim.zoom_dialog.zoom_factor
-                                        y1 = i * self.sim.zoom_dialog.zoom_factor
-                                        x2 = x1 + dx
-                                        y2 = y1 + dy
-                                        
-                                        # Draw the vector
-                                        self.sim.zoom_dialog.canvas.create_line(
-                                            x1, y1, x2, y2, 
-                                            fill="#00AAFF",  # Light blue for ocean currents
-                                            arrow=tk.LAST,
-                                            width=1,
-                                            tags="vector"
-                                        )
+                    # Only add to queue if not full
+                    if not self.sim.visualization_queue.full():
+                        self.sim.visualization_queue.put_nowait(update_request)
+                        self._zoom_update_pending = True
+                        success = True
+                except Exception as e:
+                    print(f"Error queueing zoom update: {e}")
+                    # Fall through to direct update
+            
+            # If queue approach failed, use direct update
+            if not success:
+                # Schedule the update with a small delay (direct approach if queue failed)
+                self._zoom_update_pending = True
+                try:
+                    # Make a copy of the event to avoid reference issues
+                    class SyntheticEvent:
+                        def __init__(self, x, y):
+                            self.x = x
+                            self.y = y
+                            
+                    event_copy = SyntheticEvent(int(event.x), int(event.y))
+                    self.root.after(10, lambda: self._update_zoom_view_debounced(event_copy))
+                except Exception as e:
+                    print(f"Error scheduling direct zoom update: {e}")
+                    self._zoom_update_pending = False  # Reset flag on error
             
         except Exception as e:
-            print(f"Error updating zoom view: {e}")
+            print(f"Error scheduling zoom update: {e}")
+            traceback.print_exc()
+            self._zoom_update_pending = False  # Ensure flag is reset on errors
+            
+    def _update_zoom_view_debounced(self, event):
+        """Actual implementation of zoom view update with debouncing"""
+        try:
+            # Mark that we're processing this update
+            self._zoom_update_pending = False
+            self._last_zoom_update_time = time.time() * 1000  # Convert to milliseconds
+            
+            # Get dialog and parameters
+            zoom_dialog = self.sim.zoom_dialog
+            if not zoom_dialog or not zoom_dialog.winfo_exists():
+                return
+                
+            view_size = zoom_dialog.view_size
+            zoom_factor = zoom_dialog.zoom_factor
+            
+            # Get coordinates
+            x, y = event.x, event.y
+            
+            # Get current layer for visualization
+            current_layer = self.sim.selected_layer.get()
+            
+            # Ensure x and y are within map bounds
+            map_width = self.sim.map_width
+            map_height = self.sim.map_height
+            x = max(0, min(x, map_width - 1))
+            y = max(0, min(y, map_height - 1))
+            
+            # Calculate view boundaries
+            half_size = view_size // 2
+            x_start = max(0, x - half_size)
+            y_start = max(0, y - half_size)
+            x_end = min(map_width, x_start + view_size)
+            y_end = min(map_height, y_start + view_size)
+            
+            # Ensure we get exactly view_size pixels if possible
+            if x_end - x_start < view_size and x_start == 0:
+                x_end = min(map_width, view_size)
+            elif x_end - x_start < view_size:
+                x_start = max(0, x_end - view_size)
+                
+            if y_end - y_start < view_size and y_start == 0:
+                y_end = min(map_height, view_size)
+            elif y_end - y_start < view_size:
+                y_start = max(0, y_end - view_size)
+            
+            # Get the current layer data from the appropriate source
+            try:
+                if current_layer == "Elevation":
+                    img_data = self.map_elevation_to_color(self.sim.elevation)
+                elif current_layer == "Temperature":
+                    img_data = self.map_temperature_to_color(self.sim.temperature_celsius)
+                elif current_layer == "Pressure":
+                    img_data = self.map_pressure_to_color(self.sim.pressure)
+                elif current_layer == "Wind":
+                    img_data = self.map_altitude_to_color(self.sim.elevation)
+                elif current_layer == "Ocean Temperature":
+                    img_data = self.map_ocean_temperature_to_color(self.sim.temperature_celsius)
+                elif current_layer == "Precipitation" and hasattr(self.sim, 'precipitation') and self.sim.precipitation is not None:
+                    img_data = self.map_precipitation_to_color(self.sim.precipitation)
+                elif current_layer == "Ocean Currents":
+                    img_data = self.map_ocean_temperature_to_color(self.sim.temperature_celsius)
+                elif current_layer == "Humidity" and hasattr(self.sim, 'humidity') and self.sim.humidity is not None:
+                    img_data = self.map_humidity_to_color(self.sim.humidity)
+                elif current_layer == "Cloud Cover" and hasattr(self.sim, 'cloud_cover') and self.sim.cloud_cover is not None:
+                    img_data = self.map_cloud_cover_to_color(self.sim.cloud_cover)
+                else:
+                    # Default to elevation if layer not recognized
+                    img_data = self.map_elevation_to_color(self.sim.elevation)
+            except Exception as e:
+                print(f"Error getting layer data: {e}")
+                # Use a fallback - create a blank image
+                img_data = np.zeros((view_size, view_size, 3), dtype=np.uint8)
+                img_data.fill(200)  # Light gray
+                
+            # Check if zoom dialog still exists after potentially long img_data processing
+            if not hasattr(self.sim, 'zoom_dialog') or not self.sim.zoom_dialog or not self.sim.zoom_dialog.winfo_exists():
+                return
+                
+            # Extract the view region
+            try:
+                # Make sure we don't exceed bounds
+                if y_start >= img_data.shape[0] or x_start >= img_data.shape[1]:
+                    print("Warning: View region out of bounds")
+                    return
+                    
+                # Get the maximum bounds we can extract
+                y_end = min(y_end, img_data.shape[0])
+                x_end = min(x_end, img_data.shape[1])
+                
+                view_data = img_data[y_start:y_end, x_start:x_end]
+                
+                # Verify dimensions - ensure we have at least a 1x1 pixel area
+                if view_data.shape[0] == 0 or view_data.shape[1] == 0:
+                    print("Warning: Empty zoom view region")
+                    return
+            except Exception as e:
+                print(f"Error extracting view region: {e}, shape={img_data.shape}, bounds=({x_start}:{x_end}, {y_start}:{y_end})")
+                return
+                
+            # Determine if we're dealing with RGB or RGBA data
+            is_rgba = len(view_data.shape) > 2 and view_data.shape[2] == 4
+            
+            # Convert to a PIL image with the appropriate mode
+            try:
+                if is_rgba:
+                    img = Image.fromarray(view_data.astype(np.uint8), 'RGBA')
+                else:
+                    img = Image.fromarray(view_data.astype(np.uint8), 'RGB')
+            except Exception as e:
+                print(f"Error creating image from array: {e}, shape={view_data.shape}, dtype={view_data.dtype}")
+                # Try a fallback approach
+                if len(view_data.shape) <= 2:
+                    # If we have a 2D array, convert to RGB
+                    rgb_data = np.stack([view_data]*3, axis=-1)
+                    img = Image.fromarray(rgb_data.astype(np.uint8), 'RGB')
+                else:
+                    # Create a blank image as last resort
+                    img = Image.new('RGB', (view_size, view_size), color=(200, 200, 200))
+            
+            # Check zoom dialog again before creating PhotoImage
+            if not hasattr(self.sim, 'zoom_dialog') or not self.sim.zoom_dialog or not self.sim.zoom_dialog.winfo_exists():
+                return
+                
+            # Scale up the image for zoom effect
+            canvas_size = view_size * zoom_factor
+            img = img.resize((canvas_size, canvas_size), Image.NEAREST)
+            
+            # Convert to PhotoImage for display
+            try:
+                photo = ImageTk.PhotoImage(img)
+                
+                # Store reference to prevent garbage collection
+                zoom_dialog.photo = photo
+                
+                # Clear canvas and display the new image
+                zoom_dialog.canvas.delete("all")
+                zoom_dialog.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+                
+                # Add crosshairs again (as they were deleted)
+                crosshair_size = zoom_dialog.crosshair_size
+                center = canvas_size // 2
+                
+                # Draw the crosshairs
+                # Main crosshair in red
+                zoom_dialog.canvas.create_line(center - crosshair_size, center, 
+                                      center + crosshair_size, center, 
+                                      fill='red', width=2, tags='crosshair')
+                zoom_dialog.canvas.create_line(center, center - crosshair_size, 
+                                      center, center + crosshair_size, 
+                                      fill='red', width=2, tags='crosshair')
+                
+                # White outline for contrast
+                outline_offset = 1
+                zoom_dialog.canvas.create_line(center - crosshair_size, center - outline_offset, 
+                                      center + crosshair_size, center - outline_offset, 
+                                      fill='white', width=1, tags='crosshair')
+                zoom_dialog.canvas.create_line(center - crosshair_size, center + outline_offset, 
+                                      center + crosshair_size, center + outline_offset, 
+                                      fill='white', width=1, tags='crosshair')
+                zoom_dialog.canvas.create_line(center - outline_offset, center - crosshair_size, 
+                                      center - outline_offset, center + crosshair_size, 
+                                      fill='white', width=1, tags='crosshair')
+                zoom_dialog.canvas.create_line(center + outline_offset, center - crosshair_size, 
+                                      center + outline_offset, center + crosshair_size, 
+                                      fill='white', width=1, tags='crosshair')
+                
+                # Add wind vectors if on Wind layer
+                if current_layer == "Wind" and hasattr(self.sim, 'u') and hasattr(self.sim, 'v'):
+                    self._draw_zoom_wind_vectors(zoom_dialog, x_start, y_start, x_end, y_end)
+                    
+                # Add ocean current vectors if on Ocean Currents layer
+                if current_layer == "Ocean Currents" and hasattr(self.sim, 'ocean_u') and hasattr(self.sim, 'ocean_v'):
+                    self._draw_zoom_current_vectors(zoom_dialog, x_start, y_start, x_end, y_end)
+            except Exception as e:
+                print(f"Error rendering zoom view: {e}")
+                traceback.print_exc()
+                
+        except Exception as e:
+            print(f"Error in _update_zoom_view_debounced: {e}")
+            traceback.print_exc()
+            
+            # Reset pending state to allow future updates
+            self._zoom_update_pending = False
+    
+    def _draw_zoom_wind_vectors(self, zoom_dialog, x_start, y_start, x_end, y_end):
+        """Draw wind vector overlay on zoom view"""
+        try:
+            # Get wind data
+            u_data = self.sim.u[y_start:y_end, x_start:x_end]
+            v_data = self.sim.v[y_start:y_end, x_start:x_end]
+            
+            # Skip if data is invalid
+            if u_data.shape[0] == 0 or v_data.shape[0] == 0:
+                return
+                
+            # Calculate grid spacing for vectors
+            grid_size = 8  # Display a vector every 8 pixels
+            zoom_factor = zoom_dialog.zoom_factor
+            view_size = zoom_dialog.view_size
+            
+            # Scale factor for vector length
+            scale = 0.2 * zoom_factor
+            
+            # Use just enough vectors to avoid clutter
+            for y in range(0, view_size, grid_size):
+                for x in range(0, view_size, grid_size):
+                    if y < u_data.shape[0] and x < u_data.shape[1]:
+                        # Get wind components
+                        u = u_data[y, x]
+                        v = v_data[y, x]
+                        
+                        # Skip negligible wind
+                        if abs(u) < 0.5 and abs(v) < 0.5:
+                            continue
+                            
+                        # Calculate vector length
+                        speed = (u**2 + v**2)**0.5
+                        
+                        # Normalize components
+                        if speed > 0:
+                            u_norm = u / speed
+                            v_norm = v / speed
+                        else:
+                            continue
+                            
+                        # Calculate scaled vector length
+                        length = min(10, speed) * scale
+                        
+                        # Calculate vector endpoints
+                        x1 = (x + 0.5) * zoom_factor
+                        y1 = (y + 0.5) * zoom_factor
+                        x2 = x1 + u_norm * length
+                        y2 = y1 + v_norm * length
+                        
+                        # Draw the vector line
+                        zoom_dialog.canvas.create_line(x1, y1, x2, y2, fill='cyan', width=1, arrow=tk.LAST)
+                        
+        except Exception as e:
+            print(f"Error drawing zoom wind vectors: {e}")
+            
+    def _draw_zoom_current_vectors(self, zoom_dialog, x_start, y_start, x_end, y_end):
+        """Draw ocean current vector overlay on zoom view"""
+        try:
+            # Get current data
+            u_data = self.sim.ocean_u[y_start:y_end, x_start:x_end]
+            v_data = self.sim.ocean_v[y_start:y_end, x_start:x_end]
+            
+            # Skip if data is invalid
+            if u_data.shape[0] == 0 or v_data.shape[0] == 0:
+                return
+                
+            # Calculate grid spacing for vectors
+            grid_size = 8  # Display a vector every 8 pixels  
+            zoom_factor = zoom_dialog.zoom_factor
+            view_size = zoom_dialog.view_size
+            
+            # Scale factor for vector length
+            scale = 0.5 * zoom_factor
+            
+            # Use just enough vectors to avoid clutter
+            for y in range(0, view_size, grid_size):
+                for x in range(0, view_size, grid_size):
+                    if y < u_data.shape[0] and x < u_data.shape[1]:
+                        # Check if this is ocean (only show currents in ocean)
+                        if y+y_start < self.sim.elevation.shape[0] and x+x_start < self.sim.elevation.shape[1]:
+                            if self.sim.elevation[y+y_start, x+x_start] > 0:
+                                continue  # Skip land
+                        
+                        # Get current components
+                        u = u_data[y, x]
+                        v = v_data[y, x]
+                        
+                        # Skip negligible current
+                        if abs(u) < 0.05 and abs(v) < 0.05:
+                            continue
+                            
+                        # Calculate vector length
+                        speed = (u**2 + v**2)**0.5
+                        
+                        # Normalize components
+                        if speed > 0:
+                            u_norm = u / speed
+                            v_norm = v / speed
+                        else:
+                            continue
+                            
+                        # Calculate scaled vector length
+                        length = min(5, speed * 10) * scale
+                        
+                        # Calculate vector endpoints
+                        x1 = (x + 0.5) * zoom_factor
+                        y1 = (y + 0.5) * zoom_factor
+                        x2 = x1 + u_norm * length
+                        y2 = y1 + v_norm * length
+                        
+                        # Draw the vector line
+                        zoom_dialog.canvas.create_line(x1, y1, x2, y2, fill='yellow', width=1, arrow=tk.LAST)
+                        
+        except Exception as e:
+            print(f"Error drawing zoom current vectors: {e}")
             traceback.print_exc() 
