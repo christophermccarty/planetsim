@@ -1161,7 +1161,7 @@ class Visualization:
                 
             # Reset stale pending updates that might have been forgotten
             if self._zoom_update_pending and time_since_last > 2000:  # If pending for more than 2 seconds
-                print("Resetting stale zoom update request")
+                #print("Resetting stale zoom update request")
                 self._zoom_update_pending = False
                 
             # If still a pending update, skip

@@ -1,8 +1,5 @@
-import os
 import sys
 import time
-import math
-import json
 import numpy as np
 import tkinter as tk
 import threading
@@ -11,7 +8,6 @@ import traceback
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from scipy.ndimage import gaussian_filter
-import pickle
 import random
 import queue
 
@@ -935,9 +931,6 @@ class SimulationApp:
         except Exception as e:
             print(f"Error updating UI elements: {e}")
     
-    def simulate(self):
-        """No longer used - simulation now runs in background thread"""
-        pass
 
     def _run_standard_simulation(self, steps_needed):
         """Run standard simulation for the specified number of steps"""
@@ -1264,28 +1257,7 @@ class SimulationApp:
                 
         except Exception as e:
             print(f"Error in simplified wind update: {e}")
-    
 
-    def update_ocean(self):
-        # Existing code...
-        
-        # Add at the end:
-        # Update ocean heat content tracking
-        ocean_heat_content = np.sum(self.temperature_celsius[self.elevation <= 0])
-        self.energy_budget['ocean_heat_content'] = float(ocean_heat_content)
-        self.energy_budget['ocean_flux'] = float(np.mean(self._net_flux[self.elevation <= 0]))
-        
-        # If we have previous content, calculate change
-        if 'prev_ocean_heat' in self.energy_budget:
-            prev = self.energy_budget['prev_ocean_heat']
-            change = (ocean_heat_content - prev) / max(abs(prev), 1e-5) * 100
-            self.energy_budget['ocean_heat_change'] = change
-        
-        # Store current for next comparison
-        self.energy_budget['prev_ocean_heat'] = ocean_heat_content
-        
-        # Set flag to indicate ocean data is available
-        self.ocean_data_available = True
 
     def _update_ocean_simplified(self):
         """Simplified ocean temperature update for high-speed mode with better stability"""
@@ -1731,46 +1703,6 @@ class SimulationApp:
             
         return fixed_count
 
-    def update_stability_tracking(self, fixed_count, severe_count):
-        """Update stability tracking metrics"""
-        # Add current counts to history (keep last 10 values)
-        self.stability_history['fixed_counts'].append(fixed_count)
-        if len(self.stability_history['fixed_counts']) > 10:
-            self.stability_history['fixed_counts'].pop(0)
-            
-        self.stability_history['severe_counts'].append(severe_count)
-        if len(self.stability_history['severe_counts']) > 10:
-            self.stability_history['severe_counts'].pop(0)
-        
-        # Update stable/unstable cycle counts
-        if fixed_count > 1000 or severe_count > 0:
-            self.stability_history['unstable_cycles'] += 1
-            self.stability_history['stable_cycles'] = 0
-        else:
-            self.stability_history['stable_cycles'] += 1
-            self.stability_history['unstable_cycles'] = 0
-            
-        # Check if we need adaptive measures
-        current_time = time.time()
-        time_since_last_reset = current_time - self.stability_history['last_reset_time']
-        
-        # If we've been unstable for several cycles and it's been at least 60 seconds since last reset
-        if self.stability_history['unstable_cycles'] >= 5 and time_since_last_reset > 60:
-            print("STABILITY WARNING: Multiple consecutive unstable cycles detected")
-            
-            # Take adaptive measures based on severity
-            if self.stability_history['unstable_cycles'] >= 10:
-                print("STABILITY ACTION: Performing emergency stability reset")
-                self._emergency_stability_reset()
-                self.stability_history['last_reset_time'] = current_time
-                
-        # Update system label with stability info if severe enough
-        if fixed_count > 100 or severe_count > 0:
-            if hasattr(self, 'system_label') and self.system_label:
-                current_text = self.system_label.cget("text")
-                if not "STABILITY" in current_text:
-                    stability_info = f"\nSTABILITY: {fixed_count} fixes, {severe_count} severe issues"
-                    self.system_label.config(text=current_text + stability_info)
                     
     def _emergency_stability_reset(self):
         """Perform emergency reset of simulation state to recover stability"""
@@ -1886,36 +1818,6 @@ class SimulationApp:
         """Update the zoom view if it exists"""
         if hasattr(self, 'visualization') and hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
             self.visualization.update_zoom_view(event)
-            
-    def on_new(self):
-        try:
-            # Generate new random terrain data and then start simulation
-            self.on_generate()
-
-            # Reset to default view
-            self.selected_layer.set("Elevation")
-            if hasattr(self, 'visualization'):
-                # High priority for initial display
-                self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
-        except Exception as e:
-            print(f"Error in on_new: {e}")
-            traceback.print_exc()
-            
-    def toggle_zoom_window(self):
-        """Toggle the zoom window on/off"""
-        if self.zoom_enabled.get():
-            # Create zoom window if it doesn't exist
-            if not hasattr(self, 'zoom_dialog') or self.zoom_dialog is None or not self.zoom_dialog.winfo_exists():
-                self.zoom_dialog = ZoomDialog(self.root)
-                # Position the zoom dialog in the bottom right initially
-                self.zoom_dialog.geometry(f"+{self.root.winfo_rootx() + self.map_width - 250}+{self.root.winfo_rooty() + self.map_height - 250}")
-                # Request a visualization update to show the zoom view - medium priority
-                self.request_visualization_update(self.VIZ_PRIORITY["MEDIUM"])
-        else:
-            # Destroy zoom window if it exists
-            if hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
-                self.zoom_dialog.destroy()
-                self.zoom_dialog = None
 
 
 class ZoomDialog(tk.Toplevel):
