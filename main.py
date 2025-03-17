@@ -22,6 +22,11 @@ from map_generation import MapGenerator
 
 
 class SimulationApp:
+    # Define visualization update priority constants
+    VIZ_PRIORITY_HIGH = 0     # Critical updates (layer changes, initial display)
+    VIZ_PRIORITY_MEDIUM = 1   # Important updates (simulation step completed)
+    VIZ_PRIORITY_LOW = 2      # Less important updates (mouse movements, small data changes)
+    
     def __init__(self):
         """Initialize the simulation"""
         try:
@@ -84,11 +89,11 @@ class SimulationApp:
             # Initialize state flag
             self.simulation_running = False  # Start with simulation off
             
-            # Define visualization update priority levels
+            # Define visualization update priority levels - use class constants
             self.VIZ_PRIORITY = {
-                "HIGH": 0,     # Critical updates (layer changes, initial display)
-                "MEDIUM": 1,   # Important updates (simulation step completed)
-                "LOW": 2       # Less important updates (mouse movements, small data changes)
+                "HIGH": self.VIZ_PRIORITY_HIGH,
+                "MEDIUM": self.VIZ_PRIORITY_MEDIUM,
+                "LOW": self.VIZ_PRIORITY_LOW
             }
 
             # Master switch for system stats printing is now in SystemStats class
@@ -510,7 +515,7 @@ class SimulationApp:
     def on_layer_change(self, layer):
         """Handle layer change event"""
         try:
-            if hasattr(self, 'visualization'):
+            if self._has_valid_visualization():
                 # Layer changes are high priority
                 self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
         except Exception as e:
@@ -531,39 +536,34 @@ class SimulationApp:
                 "timestamp": time.time()
             }
             
-            # First ensure visualization thread is active
-            if hasattr(self, 'visualization_active'):
-                if not self.visualization_active.is_set():
-                    print("Reactivating visualization thread...")
-                    self.visualization_active.set()
-            
-            # Direct method to signal visualization updates
-            if hasattr(self, 'visualization_update_ready'):
+            # Primary method: Use the event mechanism if available
+            if self._has_valid_attribute('visualization_update_ready'):
                 self.visualization_update_ready.set()
-            
-            # Also use the queue method as backup
-            if hasattr(self, 'visualization_queue'):
-                try:
-                    # Try to add to queue without blocking
-                    if not self.visualization_queue.full():
-                        self.visualization_queue.put_nowait(update_request)
-                except queue.Full:
-                    # Queue is full, just skip this update
-                    pass
                 
-            # If we have direct access to visualization, also call update method
-            if hasattr(self, 'visualization') and hasattr(self.visualization, '_schedule_map_update'):
+                # Also ensure visualization thread is active
+                if self._has_valid_attribute('visualization_active'):
+                    self.visualization_active.set()
+                    
+                return  # Exit after successful event set
+            
+            # Fallback method: Use the queue if the event fails
+            if self._has_valid_attribute('visualization_queue') and not self.visualization_queue.full():
                 try:
-                    # Direct update as a fallback, but only if we're in the main thread
-                    if threading.current_thread() is threading.main_thread():
-                        self.visualization._schedule_map_update()
+                    self.visualization_queue.put_nowait(update_request)
+                    return  # Exit after successful queue update
+                except queue.Full:
+                    pass  # Queue is full, continue to last resort
+                    
+            # Last resort: Direct update if we're in the main thread and have visualization object
+            if self._has_valid_visualization() and self._is_main_thread():
+                try:
+                    self.visualization._schedule_map_update()
                 except Exception as e:
                     print(f"Error in direct visualization update: {e}")
                     
         except Exception as e:
             print(f"Error requesting visualization update: {e}")
             # Don't try a direct update - it can block the UI thread
-            # Just log the error and continue
 
     def on_closing(self):
         """Handle window closing"""
@@ -828,10 +828,6 @@ class SimulationApp:
             last_viz_update_time = getattr(self, 'last_viz_update_time', 0)
             current_time = time.time()
             
-            # Create a visualization update event if it doesn't exist
-            if not hasattr(self, 'visualization_update_ready'):
-                self.visualization_update_ready = threading.Event()
-                
             # Determine the time since the last visualization update
             time_since_last_viz = current_time - last_viz_update_time
             
@@ -921,7 +917,7 @@ class SimulationApp:
                 self.last_viz_update_time = time.time()
                 
                 # Every 10th update, try using force_update for immediate rendering
-                if self.time_step % 10 == 0 and hasattr(self, 'visualization') and hasattr(self.visualization, 'force_update'):
+                if self.time_step % 10 == 0 and self._has_valid_visualization() and hasattr(self.visualization, 'force_update'):
                     try:
                         self.visualization.force_update()
                     except Exception as e:
@@ -942,23 +938,11 @@ class SimulationApp:
                 self.last_viz_update_time = time.time()
                 self.request_visualization_update(self.VIZ_PRIORITY["MEDIUM"])
             
-            # Check if visualization thread needs restarting
-            if hasattr(self, 'visualization_thread') and not self.visualization_thread.is_alive():
-                print("Restarting visualization thread...")
-                self.visualization_thread = threading.Thread(target=self.visualization.update_visualization_loop)
-                self.visualization_thread.daemon = True
-                self.visualization_thread.start()
-                
-            # Ensure visualization update event is created
-            if not hasattr(self, 'visualization_update_ready'):
-                self.visualization_update_ready = threading.Event()
-            
-            # Ensure visualization active flag is set
-            if hasattr(self, 'visualization_active') and not self.visualization_active.is_set():
-                self.visualization_active.set()
+            # Check if visualization thread needs maintenance
+            self._ensure_visualization_thread_active()
                 
             # Schedule next simulation step with appropriate timing
-            if hasattr(self, 'root') and self.root.winfo_exists():
+            if self._has_valid_attribute('root') and self.root.winfo_exists():
                 # Adaptive timing based on whether we need to update visualization
                 if request_viz:
                     # Give UI thread more time to process the visualization update
@@ -974,7 +958,7 @@ class SimulationApp:
             traceback.print_exc()
             
             # Try to continue simulation even after error
-            if self.simulation_running and hasattr(self, 'root') and self.root.winfo_exists():
+            if self.simulation_running and self._has_valid_attribute('root') and self.root.winfo_exists():
                 self.root.after(100, self.simulation_worker)  # Longer delay after error
 
     def update_ui_elements(self):
@@ -1910,28 +1894,33 @@ class SimulationApp:
                 pass
         
         # Always update zoom view for responsiveness, but with low priority
-        if hasattr(self, 'visualization'):
+        if self._has_valid_visualization():
             self.visualization.update_zoom_view(event)
 
     def update_zoom_view(self, event):
         """Update the zoom view if it exists"""
-        if hasattr(self, 'visualization') and hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
+        if self._has_valid_visualization() and hasattr(self, 'zoom_dialog') and self.zoom_dialog and self.zoom_dialog.winfo_exists():
             self.visualization.update_zoom_view(event)
 
-    def process_ui_events(self):
-        """Process UI events to keep the interface responsive"""
+    def process_ui_events(self, force_update=False):
+        """Process UI events to keep the interface responsive
+        
+        Args:
+            force_update: If True, will call the full update() method instead of just update_idletasks()
+        """
         try:
-            if hasattr(self, 'root') and self.root.winfo_exists():
+            if self._has_valid_attribute('root') and self.root.winfo_exists():
                 # Process pending events
                 self.root.update_idletasks()
                 
-                # For Windows systems, also process any pending messages
+                # For force_update or Windows systems, also process any pending messages
                 # This helps prevent the app from appearing frozen
-                if hasattr(self.root, 'update'):
+                if force_update and hasattr(self.root, 'update'):
                     self.root.update()
                     
         except Exception as e:
             print(f"Error processing UI events: {e}")
+            # Don't propagate the exception - UI errors shouldn't crash the simulation
 
     def update_precipitation(self):
         """Update precipitation data with error handling"""
@@ -1986,6 +1975,35 @@ class SimulationApp:
         except Exception as e:
             print(f"ERROR in pressure update: {e}")
             traceback.print_exc()
+
+    def _has_valid_attribute(self, attr_name):
+        """Helper method to check if an attribute exists and is not None"""
+        return hasattr(self, attr_name) and getattr(self, attr_name) is not None
+        
+    def _has_valid_visualization(self):
+        """Helper method to check if visualization object exists and is usable"""
+        return self._has_valid_attribute('visualization')
+
+    def _is_main_thread(self):
+        """Helper method to check if the current thread is the main thread"""
+        return threading.current_thread() is threading.main_thread()
+
+    def _ensure_visualization_thread_active(self):
+        """Ensure the visualization thread is active, restarting it if necessary"""
+        if not self._has_valid_attribute('visualization_thread') or not self.visualization_thread.is_alive():
+            print("Restarting visualization thread...")
+            if self._has_valid_visualization():
+                self.visualization_thread = threading.Thread(target=self.visualization.update_visualization_loop)
+                self.visualization_thread.daemon = True
+                self.visualization_thread.start()
+                
+        # Ensure visualization update event is created
+        if not self._has_valid_attribute('visualization_update_ready'):
+            self.visualization_update_ready = threading.Event()
+            
+        # Ensure visualization active flag is set
+        if self._has_valid_attribute('visualization_active') and not self.visualization_active.is_set():
+            self.visualization_active.set()
 
 
 class ZoomDialog(tk.Toplevel):
