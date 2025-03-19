@@ -1175,7 +1175,6 @@ class Visualization:
                     # Check if we should continue running
                     if hasattr(self.sim, 'visualization_active'):
                         if not self.sim.visualization_active.is_set():
-                            print("Visualization thread stopping (flag cleared)")
                             break
                     else:
                         # If visualization_active doesn't exist, create it
@@ -1211,7 +1210,6 @@ class Visualization:
                     force_update = idle_count > 50  # Force update after ~2.5 seconds of inactivity
                     if force_update and time_since_last_update >= 1.0:  # At most once per second
                         update_ready = True
-                        print("Forcing visualization update after inactivity")
                         idle_count = 0
                     else:
                         idle_count += 1
@@ -1234,7 +1232,6 @@ class Visualization:
                     # Continue loop despite error
                     time.sleep(0.1)  # Short delay before retry
         
-            print("Visualization thread ended")
         except Exception as e:
             print(f"Error in visualization loop: {e}")
             traceback.print_exc()

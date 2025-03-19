@@ -4,7 +4,22 @@ from scipy.ndimage import gaussian_filter, zoom
 import time
 
 class Precipitation:
-    """Class responsible for managing precipitation, humidity, and cloud dynamics"""
+    """
+    Manages precipitation, humidity, and cloud dynamics in the simulation.
+    
+    This class handles the water cycle including:
+    - Humidity calculation and transport
+    - Cloud formation
+    - Precipitation events
+    - Ocean-atmosphere water exchange
+    
+    The implementation includes both full physics and statistical update modes
+    with enhanced stability mechanisms to prevent oscillation in humidity and cloud cover:
+    - Stronger humidity reduction from precipitation (factor of 2.0)
+    - Robust temporal smoothing of cloud cover (persistence factor of 0.85)
+    - Day-night cycle modulation of evaporation rates (60% reduction at night)
+    - Consistent handling across both physics models
+    """
     
     def __init__(self, sim):
         """Initialize the precipitation system with reference to main simulation"""
@@ -206,8 +221,35 @@ class Precipitation:
         temp_factor = 1.0 + 0.07 * (T - T_ref)
         np.clip(temp_factor, 0.2, 5.0, out=temp_factor)  # In-place clipping
         
-        # Combine factors into evaporation rate - mm/hour
-        evaporation_rate = evaporation_base_rate * temp_factor
+        # ADDED: Day-night cycle effect on evaporation
+        # Get day-night factor from solar angle (0=night, 1=full day)
+        day_night_factor = 0.6  # Default if not available
+        if hasattr(self.sim, 'latitudes_rad'):
+            # Calculate solar angle effect (vectorized) - same calculation as in temperature module
+            cos_phi = np.cos(self.sim.latitudes_rad).astype(np.float32)
+            day_night_factor = np.clip(cos_phi, 0, 1)  # Day/night cycle
+            
+            # Calculate average day-night factor across the map
+            avg_day_factor = np.mean(day_night_factor)
+            
+            # Reduce evaporation at night, but don't stop it completely
+            # During night (avg_day_factor < 0.3), reduce evaporation to 40-60% of daytime values
+            # During day (avg_day_factor > 0.7), use 90-100% of calculated values
+            # Apply smoothly in between for dawn/dusk
+            night_reduction = 0.6  # Night evaporation is 40-60% of daytime (increased from complete reduction)
+            if avg_day_factor < 0.3:  # Night
+                day_night_multiplier = night_reduction + (1.0 - night_reduction) * (avg_day_factor / 0.3)
+            elif avg_day_factor > 0.7:  # Day
+                day_night_multiplier = 0.9 + 0.1 * ((avg_day_factor - 0.7) / 0.3)
+            else:  # Dawn/dusk
+                transition_factor = (avg_day_factor - 0.3) / 0.4
+                day_night_multiplier = night_reduction + (1.0 - night_reduction) * transition_factor
+            
+            # Apply day-night effect to evaporation
+            evaporation_rate = evaporation_base_rate * temp_factor * day_night_multiplier
+        else:
+            # If day-night cycle data isn't available, proceed without adjustment
+            evaporation_rate = evaporation_base_rate * temp_factor
         
         # --- PRECIPITATION ---
         # Calculate relative humidity
@@ -268,7 +310,9 @@ class Precipitation:
         # --- UPDATE HUMIDITY ---
         # Use actual precipitation for humidity changes (not smoothed precipitation)
         total_factor = time_step_seconds
-        humidity_change = (evaporation_rate - new_precipitation_rate) * total_factor
+        # MODIFIED: Add a stronger precipitation reduction coefficient to fix oscillation issue
+        precipitation_humidity_reduction_factor = 2.0  # Increase this to remove more humidity when it rains
+        humidity_change = (evaporation_rate - new_precipitation_rate * precipitation_humidity_reduction_factor) * total_factor
         self.humidity += humidity_change
         
         # Apply diffusion and constraints
@@ -317,6 +361,30 @@ class Precipitation:
                 
             # Calculate final evaporation rate
             evaporation_rate = evaporation_base * evap_map
+            
+            # ADDED: Day-night cycle effect on evaporation
+            # Apply the same day-night cycle effect as in the full physics version
+            day_night_factor = 0.6  # Default if not available
+            if hasattr(self.sim, 'latitudes_rad'):
+                # Calculate solar angle effect (vectorized)
+                cos_phi = np.cos(self.sim.latitudes_rad).astype(np.float32)
+                day_night_factor = np.clip(cos_phi, 0, 1)  # Day/night cycle
+                
+                # Calculate average day-night factor across the map
+                avg_day_factor = np.mean(day_night_factor)
+                
+                # Same reductions as in the full physics version
+                night_reduction = 0.6  # Night evaporation is 60% of daytime
+                if avg_day_factor < 0.3:  # Night
+                    day_night_multiplier = night_reduction + (1.0 - night_reduction) * (avg_day_factor / 0.3)
+                elif avg_day_factor > 0.7:  # Day
+                    day_night_multiplier = 0.9 + 0.1 * ((avg_day_factor - 0.7) / 0.3)
+                else:  # Dawn/dusk
+                    transition_factor = (avg_day_factor - 0.3) / 0.4
+                    day_night_multiplier = night_reduction + (1.0 - night_reduction) * transition_factor
+                
+                # Apply day-night effect to evaporation
+                evaporation_rate = evaporation_rate * day_night_multiplier
             
             # --- 2. STATISTICAL PRECIPITATION ---
             # Use humidity-precipitation relation
@@ -392,7 +460,9 @@ class Precipitation:
             
             # --- 5. UPDATE HUMIDITY ---
             # Calculate humidity change
-            humidity_change = (evaporation_rate - precip_rate) * time_step_seconds
+            # MODIFIED: Apply same precipitation humidity reduction factor
+            precipitation_humidity_reduction_factor = 2.0  # Match the factor in _update_full_physics
+            humidity_change = (evaporation_rate - precip_rate * precipitation_humidity_reduction_factor) * time_step_seconds
             self.humidity += humidity_change
             
             # Apply diffusion and constraints
@@ -688,8 +758,19 @@ class Precipitation:
                 self.cloud_cover = np.zeros_like(self.sim.temperature_celsius)
                 return
             
+            # Store previous cloud cover for temporal smoothing
+            if not hasattr(self, '_prev_cloud_cover') or self._prev_cloud_cover is None:
+                self._prev_cloud_cover = np.copy(self.cloud_cover) if self.cloud_cover is not None else np.zeros_like(self.sim.temperature_celsius)
+            
             # Scale humidity 0.5-1.0 to cloud cover 0-1
-            self.cloud_cover = np.clip(self.humidity - 0.5, 0, 1) * 2
+            target_cloud_cover = np.clip(self.humidity - 0.5, 0, 1) * 2
+            
+            # Apply temporal smoothing to reduce oscillations
+            cloud_persistence = 0.85  # Increased from 0.7 to 0.85 for stronger persistence
+            self.cloud_cover = cloud_persistence * self._prev_cloud_cover + (1 - cloud_persistence) * target_cloud_cover
+            
+            # Store current cloud cover for next update
+            self._prev_cloud_cover = np.copy(self.cloud_cover)
             
             # Additional cloud formation factors could be added here
             # For example, temperature effects, altitude effects, etc.

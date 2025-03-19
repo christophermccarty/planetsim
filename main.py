@@ -61,8 +61,24 @@ class SimulationApp:
             self.target_update_rate = 1.0  # Target updates per second
             self.min_simulation_hours_per_update = 1.0  # Minimum hours to simulate per update
             self.max_simulation_hours_per_update = 24.0  # Maximum hours to simulate per update
-            self.simulation_speed = tk.DoubleVar(value=4.0)  # Default 4 hours per update for high-speed mode
-            self.high_speed_mode = False  # Disable high-speed physics approximation by default
+            self.high_speed_mode = False  # This variable now ignored - standard simulation always used
+            
+            # Added time tracking for proper day/night cycle
+            self.hour_of_day = 12  # Start at noon (0-23)
+            self.simulation_day = 0  # Count how many days have been simulated
+            self.day_complete = False  # Flag to track if a full day has been completed
+            self.hours_per_simulation_step = 6  # Number of hours to simulate in each step
+            self.total_simulated_hours = 0  # Track total hours simulated
+
+            # Create system_stats early so we can use it for logging during init
+            from system_stats import SystemStats
+            self.system_stats = SystemStats(self)
+            self.system_stats.print_stats_enabled = False  # Start with stats off until fully initialized
+            
+            self.log_message("Created system stats - logging ready")
+            
+            # Now most initialization messages will go through the logger
+            
             self.physics_downsampling = 4  # Spatial downsampling factor for faster physics
             self._last_step_time = 0.1  # Initialize with a reasonable default value
             self.Omega = 7.2921159e-5
@@ -192,7 +208,40 @@ class SimulationApp:
             
             # Initialize basic arrays if they don't already exist
             if not hasattr(self, 'humidity') or self.humidity is None:
-                self.humidity = np.full((self.map_height, self.map_width), 0.5, dtype=np.float32)
+                self.humidity = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+                # Initialize with latitude-dependent values (higher near equator, lower near poles)
+                for y in range(self.map_height):
+                    latitude_factor = 1.0 - abs(y - self.map_height//2) / (self.map_height//2)
+                    self.humidity[y, :] = 0.4 + 0.3 * latitude_factor
+                # Higher humidity over oceans
+                is_ocean = self.elevation <= 0
+                if np.any(is_ocean):
+                    self.humidity[is_ocean] += 0.15
+                # Add some random variation
+                self.humidity += np.random.uniform(-0.05, 0.05, size=(self.map_height, self.map_width))
+                # Ensure bounds
+                self.humidity = np.clip(self.humidity, 0.1, 0.9)
+                
+            # Initialize cloud cover based on humidity if it doesn't exist
+            if not hasattr(self, 'cloud_cover') or self.cloud_cover is None:
+                # Create initial cloud cover from humidity
+                base_cloud_threshold = 0.65
+                self.cloud_cover = np.clip((self.humidity - base_cloud_threshold) * 2.5, 0, 1)
+                # Apply smoothing
+                self.cloud_cover = gaussian_filter(self.cloud_cover, sigma=1.5)
+                # Ensure reasonable initial cover (not too much)
+                self.cloud_cover = np.clip(self.cloud_cover, 0, 0.8)
+                
+            # Initialize precipitation if it doesn't exist
+            if not hasattr(self, 'precipitation') or self.precipitation is None:
+                self.precipitation = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+                # Add minimal rain where clouds are thickest
+                rain_mask = self.cloud_cover > 0.6
+                if np.any(rain_mask):
+                    self.precipitation[rain_mask] = (self.cloud_cover[rain_mask] - 0.6) * 0.03
+                # Apply smoothing
+                self.precipitation = gaussian_filter(self.precipitation, sigma=1.5)
+            
             if not hasattr(self, 'temperature_celsius') or self.temperature_celsius is None:
                 self.temperature_celsius = np.zeros((self.map_height, self.map_width), dtype=np.float32)
             if not hasattr(self, 'pressure') or self.pressure is None:
@@ -357,6 +406,11 @@ class SimulationApp:
             
             print("SimulationApp initialization complete")
 
+            # Enable stats display now that initialization is complete
+            if hasattr(self, 'system_stats'):
+                self.system_stats.print_stats_enabled = self.show_stats
+                self.log_message("Initialization complete - stats display enabled")
+
         except Exception as e:
             print(f"Critical error in initialization: {e}")
             traceback.print_exc()
@@ -422,19 +476,13 @@ class SimulationApp:
         self.sim_button = ttk.Button(sim_frame, text="Start", command=self.on_generate)
         self.sim_button.pack(side=tk.RIGHT, padx=2)
         
+        # Add Full Day button
+        self.day_button = ttk.Button(sim_frame, text="Run Full Day", command=self.run_full_day)
+        self.day_button.pack(side=tk.RIGHT, padx=2)
+        
         # Add performance optimization frame
         perf_frame = ttk.Frame(self.controls_frame)
         perf_frame.pack(side=tk.RIGHT, padx=10)
-        
-        # High-speed approximation toggle
-        self.high_speed_var = tk.BooleanVar(value=self.high_speed_mode)
-        self.high_speed_check = ttk.Checkbutton(
-            perf_frame, 
-            text="High-Speed Mode", 
-            variable=self.high_speed_var,
-            command=self.toggle_high_speed_mode
-        )
-        self.high_speed_check.pack(side=tk.RIGHT, padx=5)
         
         # Stats display toggle
         self.stats_var = tk.BooleanVar(value=True)  # Use True as default value
@@ -815,12 +863,107 @@ class SimulationApp:
         self.sim_button.config(text="Start", command=self.on_generate)
         
         print("Simulation stopped")
+        
+    def run_full_day(self):
+        """Run a full 24-hour simulation cycle in one go"""
+        if self.simulation_running:
+            self.log_message("Simulation already running. Stop it first.")
+            return
+            
+        try:
+            # Check if system_stats exists, or create it if needed
+            if not hasattr(self, 'system_stats') or self.system_stats is None:
+                from system_stats import SystemStats
+                self.system_stats = SystemStats(self)
+                
+            # Log the start of simulation
+            self.log_message("Starting full day simulation (24 hours)")
+            
+            # Make sure simulation is initialized
+            if not hasattr(self, 'temperature') or self.temperature is None:
+                self.on_generate()
+                
+            # Set the simulation running flag
+            self.simulation_running = True
+            
+            # Configure the day button to be disabled while running
+            self.day_button.config(state=tk.DISABLED)
+            
+            # Reset day tracking if needed
+            if self.hour_of_day >= 24:
+                self.hour_of_day = 0
+                self.simulation_day += 1
+                
+            # Setup for a full 24-hour cycle
+            hours_remaining = 24
+            
+            # Show initial status
+            self.log_message(f"Starting Day {self.simulation_day} at Hour {self.hour_of_day}")
+            if hasattr(self, 'system_stats'):
+                self.system_stats.force_next_update = True
+                self.system_stats.print_stats()
+                
+            # Run the simulation in chunks
+            while hours_remaining > 0 and self.simulation_running:
+                # Process UI events to keep responsive
+                self.process_ui_events(True)
+                
+                # Calculate hours to simulate in this chunk (4 hours per chunk)
+                hours_per_chunk = min(self.hours_per_simulation_step, hours_remaining)
+                
+                # Update simulation time
+                current_solar_factor = self.calculate_solar_factor()
+                self.log_message(f"Simulating hour {self.hour_of_day}-{self.hour_of_day + hours_per_chunk}, solar factor: {current_solar_factor:.2f}")
+                
+                # Run the standard simulation
+                self._run_standard_simulation(hours_per_chunk)
+                
+                # Update our time tracking
+                self.hour_of_day = (self.hour_of_day + hours_per_chunk) % 24
+                self.total_simulated_hours += hours_per_chunk
+                hours_remaining -= hours_per_chunk
+                
+                # Update UI and stats
+                if hasattr(self, 'system_stats'):
+                    self.system_stats.force_next_update = True
+                    self.system_stats.print_stats()
+                    
+                # Update visualization after each chunk
+                self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
+                self.process_ui_events(True)
+                
+            # Complete the day
+            if self.hour_of_day == 0:
+                self.simulation_day += 1
+                
+            self.log_message(f"Completed full day simulation. Now at Day {self.simulation_day}, Hour {self.hour_of_day}")
+            
+            # Reset simulation running flag
+            self.simulation_running = False
+            
+            # Re-enable the day button
+            self.day_button.config(state=tk.NORMAL)
+            
+            # Request final visualization update
+            self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
+            
+        except Exception as e:
+            # Log the error
+            self.log_message(f"Error in full day simulation: {e}")
+            traceback.print_exc()
+            
+            # Reset simulation running flag
+            self.simulation_running = False
+            
+            # Re-enable the day button
+            self.day_button.config(state=tk.NORMAL)
 
     def simulation_worker(self):
         """Worker method for simulation processing"""
         try:
             if not self.simulation_running:
-                print("Simulation stopped, exiting worker")
+                # Log that the simulation has stopped
+                self.log_message("Simulation stopped, exiting worker")
                 return
                 
             # Track how long visualization updates take
@@ -840,93 +983,62 @@ class SimulationApp:
             # Update UI elements including system stats
             self.update_ui_elements()
             
-            if self.high_speed_mode:
-                # In high-speed mode, we want to run more steps between UI updates
-                # but still need to keep the UI responsive
-                
-                # Calculate target hours per step based on simulation speed
-                target_hours = self.simulation_speed.get()
-                
-                # Determine how many simulation steps are needed based on performance
-                # Limit maximum steps in a single batch to maintain responsiveness
-                if hasattr(self, '_last_batch_time') and self._last_batch_time > 0:
-                    # Calculate steps based on previous performance
-                    steps_possible = min(10, max(1, int(0.03 / self._last_batch_time)))
-                else:
-                    # Start conservatively
-                    steps_possible = 1
-                    
-                # Adjust steps based on time since last visualization update
-                if time_since_last_viz >= viz_update_interval:
-                    # If it's time for a viz update, process only a small number of steps
-                    steps_needed = min(steps_possible, 2)
-                    
-                    # Set flag to request visualization update after this batch
-                    request_viz = True
-                else:
-                    # Otherwise, do more computation between UI updates
-                    steps_needed = steps_possible
-                    request_viz = False
-                    
-                # Debug output for high-speed mode
-                if self.debug:
-                    print(f"Running approximated simulation with target {target_hours}h "
-                          f"using {steps_needed} steps (of {steps_possible} possible)")
-                    
-                # Run the simulation
-                start_time = time.time()
-                self._run_approximated_simulation(target_hours)
-                self._last_batch_time = (time.time() - start_time) / steps_needed
-                
-                # Process UI events again after the computation to maintain responsiveness
-                if current_time - viz_start_time > 0.05:
-                    self.process_ui_events()
-                    self.update_ui_elements()  # Update UI elements again after computation
-                
+            # Determine if we need to update visualization
+            if time_since_last_viz >= viz_update_interval:
+                request_viz = True
             else:
-                # Calculate available steps based on time constraints
-                if time_since_last_viz >= viz_update_interval:
-                    # Time for visualization update, only do 1 step
-                    steps_needed = 1
-                    request_viz = True
-                else:
-                    # More steps between visualization updates, based on performance
-                    if hasattr(self, '_last_step_time') and self._last_step_time > 0:
-                        # Target ~30ms per update cycle to keep UI responsive
-                        steps_needed = min(3, max(1, int(0.03 / self._last_step_time)))
-                    else:
-                        # Start with 1 step if we don't have timing info yet
-                        steps_needed = 1
-                    request_viz = False
-                    
-                # Run the standard simulation
+                request_viz = False
+            
+            # Check if we have completed a full day (24 hours)
+            if self.day_complete:
+                # Reset for next day
+                self.day_complete = False
+                self.hour_of_day = 0
+                self.simulation_day += 1
+                self.log_message(f"Starting simulation day: {self.simulation_day}")
+            
+            # Calculate hours to simulate in this step
+            hours_to_simulate = min(self.hours_per_simulation_step, 24 - self.hour_of_day)
+            
+            if hours_to_simulate > 0:
+                # Run simulation for the specified number of hours
                 start_time = time.time()
+                
+                # Convert hours to steps (1 step = 1 hour currently)
+                steps_needed = hours_to_simulate
+                
+                # Log simulation time information
+                self.log_message(f"Simulating {hours_to_simulate} hours (Day {self.simulation_day}, Hour {self.hour_of_day}-{self.hour_of_day + hours_to_simulate})")
+                
+                # Set solar factor for this time period
+                current_solar_factor = self.calculate_solar_factor()
+                
+                # Run the standard simulation
                 self._run_standard_simulation(steps_needed)
                 self._last_step_time = (time.time() - start_time) / steps_needed
                 
-                # Process UI events again after computation
-                if current_time - viz_start_time > 0.05:
-                    self.process_ui_events()
-                    self.update_ui_elements()  # Update UI elements again after computation
+                # Update our time tracking
+                self.hour_of_day += hours_to_simulate
+                self.total_simulated_hours += hours_to_simulate
                 
-                # Increment time step counter after successful simulation
-                self.time_step += steps_needed
-                
+                # Check if we've completed a day
+                if self.hour_of_day >= 24:
+                    self.hour_of_day = 0
+                    self.day_complete = True
+                    self.log_message(f"Completed simulation day {self.simulation_day}")
+            
+            # Process UI events again after computation
+            if current_time - viz_start_time > 0.05:
+                self.process_ui_events()
+                self.update_ui_elements()
+            
+            # Increment time step counter after successful simulation
+            self.time_step += 1
+            
             # Update visualization if needed (and not too frequent)
             if request_viz:
                 self.last_viz_update_time = time.time()
-                
-                # Every 10th update, try using force_update for immediate rendering
-                if self.time_step % 10 == 0 and self._has_valid_visualization() and hasattr(self.visualization, 'force_update'):
-                    try:
-                        self.visualization.force_update()
-                    except Exception as e:
-                        print(f"Error in force_update: {e}")
-                        # Fall back to regular update method
-                        self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
-                else:
-                    # Regular update method
-                    self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
+                self.request_visualization_update(self.VIZ_PRIORITY["HIGH"])
                 
                 # Wait a small amount for visualization to complete
                 viz_elapsed = time.time() - viz_start_time
@@ -954,7 +1066,7 @@ class SimulationApp:
                 self.root.after(next_delay, self.simulation_worker)
                 
         except Exception as e:
-            print(f"Error in simulation worker: {e}")
+            self.log_message(f"Error in simulation worker: {e}")
             traceback.print_exc()
             
             # Try to continue simulation even after error
@@ -1235,34 +1347,48 @@ class SimulationApp:
             # 1. Update humidity based on temperature and terrain
             is_ocean = self.elevation <= 0
             
+            # Store previous precipitation for comparison
+            previous_precipitation = self.precipitation.copy()
+            
             # Ocean evaporation adds humidity
             if np.any(is_ocean):
-                ocean_humidity = 0.7 + 0.2 * np.cos(np.radians(self.latitude[is_ocean]))
-                # Relaxation toward target
-                self.humidity[is_ocean] += (ocean_humidity - self.humidity[is_ocean]) * 0.1
+                # Temperature affects evaporation rate (warmer = more evaporation)
+                temp_factor = np.clip(self.temperature_celsius[is_ocean] / 30.0, 0.1, 1.5)
+                ocean_humidity = 0.6 + 0.15 * np.cos(np.radians(self.latitude[is_ocean]))
+                # Reduce relaxation rate for more stability
+                relaxation_rate = 0.05 * temp_factor
+                self.humidity[is_ocean] += (ocean_humidity - self.humidity[is_ocean]) * relaxation_rate
             
             # Land has lower equilibrium humidity
             if np.any(~is_ocean):
-                land_humidity = 0.5 + 0.3 * np.cos(np.radians(self.latitude[~is_ocean]))
-                self.humidity[~is_ocean] += (land_humidity - self.humidity[~is_ocean]) * 0.05
+                land_humidity = 0.4 + 0.25 * np.cos(np.radians(self.latitude[~is_ocean]))
+                # Smaller relaxation rate for land
+                self.humidity[~is_ocean] += (land_humidity - self.humidity[~is_ocean]) * 0.02
             
-            # 2. Cloud formation based on humidity
-            cloud_threshold = 0.6
-            self.cloud_cover = np.clip((self.humidity - cloud_threshold) * 2.0, 0, 1)
+            # 2. Cloud formation based on humidity with adjustable threshold
+            # Higher humidity needed for clouds at higher temperatures
+            base_cloud_threshold = 0.65
+            self.cloud_cover = np.clip((self.humidity - base_cloud_threshold) * 2.5, 0, 1)
             
             # 3. Precipitation based on clouds and stability
             self.precipitation = np.zeros_like(self.cloud_cover)
-            rain_mask = self.cloud_cover > 0.4
+            rain_mask = self.cloud_cover > 0.45
             if np.any(rain_mask):
-                self.precipitation[rain_mask] = (self.cloud_cover[rain_mask] - 0.4) * 0.05
+                self.precipitation[rain_mask] = (self.cloud_cover[rain_mask] - 0.45) * 0.04
+            
+            # 4. CRITICAL FIX: Precipitation reduces humidity
+            if np.any(self.precipitation > 0):
+                # Stronger rain removes more humidity
+                humidity_reduction = self.precipitation * 2.0
+                self.humidity -= humidity_reduction
             
             # Apply simple smoothing for stability
-            self.humidity = gaussian_filter(self.humidity, sigma=1.0)
-            self.cloud_cover = gaussian_filter(self.cloud_cover, sigma=1.0)
-            self.precipitation = gaussian_filter(self.precipitation, sigma=1.0)
+            self.humidity = gaussian_filter(self.humidity, sigma=0.8)
+            self.cloud_cover = gaussian_filter(self.cloud_cover, sigma=0.8)
+            self.precipitation = gaussian_filter(self.precipitation, sigma=0.8)
             
             # Ensure bounds
-            self.humidity = np.clip(self.humidity, 0.1, 1.0)
+            self.humidity = np.clip(self.humidity, 0.05, 0.95)  # Avoid extreme values
             self.cloud_cover = np.clip(self.cloud_cover, 0, 1.0)
             self.precipitation = np.clip(self.precipitation, 0, 0.1)
                 
@@ -1505,11 +1631,12 @@ class SimulationApp:
             # Take emergency actions if severe issues detected
             if severe_count > 100 or fixed_count > 50000:
                 print(f"STABILITY: Fixed {fixed_count} issues, including {severe_count} severe problems")
-                if self.high_speed_mode and fixed_count > 500000:  # Increased from 100,000 to 500,000
-                    print("EMERGENCY: Disabling high-speed mode due to severe instability")
-                    self.high_speed_mode = False
-                    if hasattr(self, 'high_speed_var'):
-                        self.high_speed_var.set(False)
+                # Disabled high-speed mode functionality
+                # if self.high_speed_mode and fixed_count > 500000:  # Increased from 100,000 to 500,000
+                #     print("EMERGENCY: Disabling high-speed mode due to severe instability")
+                #     self.high_speed_mode = False
+                #     if hasattr(self, 'high_speed_var'):
+                #         self.high_speed_var.set(False)
                     
             return fixed_count
                         
@@ -2004,6 +2131,45 @@ class SimulationApp:
         # Ensure visualization active flag is set
         if self._has_valid_attribute('visualization_active') and not self.visualization_active.is_set():
             self.visualization_active.set()
+
+    def calculate_solar_factor(self, hour=None):
+        """
+        Calculate the solar factor (0-1) for the current hour of day.
+        
+        This simulates the position of the sun in the sky:
+        - 0.0 = night (sun below horizon)
+        - 0.5 = sun at 45° angle
+        - 1.0 = sun directly overhead
+        
+        Args:
+            hour: Hour to calculate for (0-23), or None to use current hour_of_day
+            
+        Returns:
+            float: Solar factor between 0.0 and 1.0
+        """
+        if hour is None:
+            hour = self.hour_of_day
+            
+        # Convert hour to angle (24 hours = 360 degrees, starting at midnight)
+        # At midnight (0), the sun is at its lowest point
+        # At noon (12), the sun is at its highest point
+        angle_rad = np.pi * ((hour - 12) / 12.0)
+        
+        # Calculate solar factor using cosine function
+        # This creates a smooth day/night cycle with:
+        # - Factor = 1.0 at noon
+        # - Factor = 0.0 at midnight and stays 0 during night hours
+        solar_factor = max(0.0, np.cos(angle_rad))
+        
+        return solar_factor
+
+    def log_message(self, message):
+        """Log a message through system_stats if available, fall back to print otherwise"""
+        if hasattr(self, 'system_stats') and self.system_stats is not None:
+            self.system_stats.log_message(message)
+        else:
+            # Fall back to direct print only if system_stats not available
+            print(message)
 
 
 class ZoomDialog(tk.Toplevel):

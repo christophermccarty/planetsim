@@ -1,20 +1,40 @@
 import numpy as np
 import time
 import traceback
+import os
+import sys
 
 class SystemStats:
     """Class to handle system statistics printing and tracking for simulation"""
     
-    def __init__(self, simulation):
-        """Initialize the system stats object with reference to simulation app"""
-        self.sim = simulation
-        # Initialize using the simulation's show_stats setting
-        self.print_stats_enabled = getattr(simulation, 'show_stats', True)
+    def __init__(self, sim):
+        """Initialize statistics tracker with reference to main simulation"""
+        self.sim = sim
         self.last_cycle_time = time.time()
         self.last_values = {}
-        # Set update frequency to 1 to update stats every cycle 
-        self.update_frequency = 1  # Update every cycle for better responsiveness
-        self.last_update_step = 0
+        self.print_stats_enabled = True  # Enable by default
+        self.force_next_update = True  # Force first update
+        self.last_update_step = 0  # Track when last stats were calculated
+        self.update_frequency = 1  # Update stats every step by default
+        
+        # Check if terminal supports ANSI escape codes for clear screen
+        self.supports_ansi = False
+        if sys.platform != 'win32' or 'ANSICON' in os.environ:
+            self.supports_ansi = True
+            
+        # Performance tracking
+        self.fps_history = []
+        self.last_step_timing = {
+            'total': 0,
+            'temperature': 0,
+            'pressure': 0,
+            'wind': 0,
+            'precipitation': 0
+        }
+        
+        # Add simulation log tracking (recent messages)
+        self.simulation_logs = []
+        self.max_log_entries = 5  # Keep last 5 log entries
         
         # Add debugging info
         print(f"SystemStats initialized with print_stats_enabled={self.print_stats_enabled}")
@@ -31,48 +51,100 @@ class SystemStats:
         except Exception:
             return 0.0  # Safe fallback on error
     
+    def log_message(self, message):
+        """Add a message to the simulation log and optionally print it immediately"""
+        # Add timestamp to message
+        timestamp = time.strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        
+        # Add to logs
+        self.simulation_logs.append(log_entry)
+        
+        # Trim logs if they exceed the maximum
+        if len(self.simulation_logs) > self.max_log_entries:
+            self.simulation_logs = self.simulation_logs[-self.max_log_entries:]
+            
+        # Only force an immediate update if it's been a while since the last update
+        # This prevents too many updates when multiple log messages come in quickly
+        current_time = time.time()
+        last_update_time = getattr(self, 'last_log_update_time', 0)
+        
+        # Only print directly if stats are disabled, otherwise queue for stats update
+        if not self.print_stats_enabled:
+            # If stats aren't being displayed, print log messages directly
+            print(log_entry)
+        elif current_time - last_update_time > 0.5:  # Limit to one update per 0.5 second for logs
+            # Store time of update and force a stats refresh that will include the log
+            self.last_log_update_time = current_time
+            self.force_next_update = True
+            self.print_stats()
+    
     def print_stats(self):
-        """Print system statistics with live updates on the same lines"""
+        """Print detailed statistics about the simulation"""
         try:
-            # Add debug info about current state
-            debug_mode = False  # Set to True to enable debugging
-            if debug_mode:
-                print(f"\nprint_stats called: enabled={self.print_stats_enabled}, step={self.sim.time_step}, last_update={getattr(self, 'last_update_step', 0)}")
-                
-            # Check if stats should be printed
-            if not self.print_stats_enabled:
-                if debug_mode:
-                    print("Stats disabled, returning")
+            if not self.print_stats_enabled and not self.force_next_update:
                 return
                 
-            # Selective calculation - only update stats every N cycles
-            # Include a special case to force update on first display after enabling
-            force_update = getattr(self, 'force_next_update', False)
-            if not force_update and self.sim.time_step % self.update_frequency != 0:
-                if debug_mode:
-                    print(f"Skipping update due to frequency: force={force_update}, step={self.sim.time_step}, freq={self.update_frequency}")
-                # Just print the previous stats without recalculating
-                # This significantly reduces CPU overhead of stats display
+            # Only update every few steps to reduce console spam
+            if self.sim.time_step <= self.last_update_step and not self.force_next_update:
                 return
             
-            # Reset force update flag if it was set
-            if hasattr(self, 'force_next_update'):
-                if self.force_next_update and debug_mode:
-                    print("Resetting force_next_update flag")
-                self.force_next_update = False
+            self.last_update_step = self.sim.time_step
+            self.force_next_update = False
             
+            # If not running, just skip stats update
+            if not hasattr(self.sim, 'simulation_running') or not self.sim.simulation_running:
+                return
+            
+            # Clear the previous output if supported
+            if self.supports_ansi:
+                print("\033[H\033[J", end="")  # Clear screen and home cursor
+            else:
+                if sys.platform == 'win32':
+                    # Windows-specific clear (but only if detected)
+                    try:
+                        os.system('cls')
+                    except:
+                        # If that fails, print separator
+                        print("\n" + "="*80 + "\n")
+                else:
+                    # Just print a separator on other platforms
+                    print("\n" + "="*80 + "\n")
+                    
+            # --- SIMULATION IDENTIFICATION ---
+            # Print header text in cyan if color supported
+            if self.supports_ansi:
+                print("\033[96m===== PLANET SIMULATION STATISTICS =====\033[0m")
+            else:
+                print("===== PLANET SIMULATION STATISTICS =====")
+            
+            # --- SIMULATION TIME INFO ---
+            # Add simulation time information
+            time_info = []
+            time_info.append(f"Time Step: {self.sim.time_step}")
+            
+            # If the simulation has day/hour tracking
+            if hasattr(self.sim, 'simulation_day') and hasattr(self.sim, 'hour_of_day'):
+                time_info.append(f"Simulation Day: {self.sim.simulation_day}")
+                time_info.append(f"Hour of Day: {self.sim.hour_of_day}")
+                
+                # Print solar factor if available
+                if hasattr(self.sim, 'calculate_solar_factor'):
+                    solar_factor = self.sim.calculate_solar_factor()
+                    time_info.append(f"Solar Factor: {solar_factor:.2f}")
+                    
+                # Total hours simulated
+                if hasattr(self.sim, 'total_simulated_hours'):
+                    time_info.append(f"Total Hours: {self.sim.total_simulated_hours}")
+            
+            print(" | ".join(time_info))
+            
+            # --- PERFORMANCE METRICS ---
             # Calculate cycle time
             current_time = time.time()
             cycle_time = max(current_time - self.last_cycle_time, 0.000001)  # Prevent division by zero
             self.last_cycle_time = current_time
             
-            # Record last update step to track when stats were last calculated
-            self.last_update_step = self.sim.time_step
-            
-            if debug_mode:
-                print(f"Calculating new stats for step {self.sim.time_step}")
-            
-            # --- VECTORIZED STATISTICS CALCULATION ---
             # Calculate multiple statistics in a single pass where possible
             
             # Temperature stats
@@ -356,16 +428,7 @@ class SystemStats:
             
             total_lines = base_lines + extra_lines
             
-            # Clear screen and create space for stats on first run
-            if self.sim.time_step == 1:
-                # Clear screen and move to home position
-                print("\033[2J\033[H", end='')
-                # Print empty lines to reserve space for stats
-                print("\n" * total_lines)
-                # Move cursor back up to beginning of stats area
-                print(f"\033[{total_lines}A", end='')
-            
-            # Create list of all lines to print
+            # Print each line without cursor repositioning
             all_stats_lines = [
                 cycle_str,
                 temp_str,
@@ -374,15 +437,28 @@ class SystemStats:
                 energy_in_str,
             ] + extra_metrics
             
-            # Print each line with cursor control to update in place
+            # Print each line normally - no repositioning
             for line in all_stats_lines:
-                print(f"\033[K{line}", end='\r\n')  # Clear line, print stats, move to next line
+                print(line)
             
-            # Move cursor back up to start position for next update
-            print(f"\033[{total_lines}A", end='\r')
+            # Include other energy exchanges if available
+            if 'land_atmosphere_exchange' in self.sim.energy_budget:
+                land_atm = self.sim.energy_budget['land_atmosphere_exchange']
+                other_str = f"Land-Atm Flux: {land_atm:+.2f} W/m²"
+                print(other_str)
+            
+            # --- SIMULATION LOGS ---
+            if hasattr(self, 'simulation_logs') and self.simulation_logs:
+                if self.supports_ansi:
+                    print("\033[96m----- SIMULATION LOGS -----\033[0m")
+                else:
+                    print("----- SIMULATION LOGS -----")
+                
+                # Print each log entry
+                for log in self.simulation_logs:
+                    print(log)
             
             # Force flush stdout to ensure display updates immediately
-            import sys
             sys.stdout.flush()
             
         except Exception as e:

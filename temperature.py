@@ -197,13 +197,21 @@ class Temperature:
             # 1. SOLAR INPUT CALCULATION - Fast component (daily cycle)
             S0 = np.float32(params['solar_constant'])  # Solar constant
             
+            # Use the simulation's current hour of day to get solar factor
+            solar_factor = 1.0
+            if hasattr(self.sim, 'calculate_solar_factor'):
+                # Get solar factor based on the current hour of day
+                solar_factor = self.sim.calculate_solar_factor()
+                
             # Calculate solar zenith angle effect (vectorized)
             cos_phi = np.cos(self.sim.latitudes_rad).astype(np.float32)
-            day_length_factor = np.clip(cos_phi, 0, 1)  # Day/night cycle
+            
+            # Combine latitude effect with time-of-day solar factor
+            day_length_factor = np.clip(cos_phi * solar_factor, 0, 1)  # Day/night cycle
             
             # Calculate average insolation (vectorized)
             S_avg = S0 / 4
-            S_lat = S_avg * cos_phi
+            S_lat = S_avg * day_length_factor  # Modified to use combined day/night factor
                    
             # 2. CALCULATE ALBEDO - Use cached values when possible
             should_update_albedo = (self._update_counter % self._slow_component_update_freq == 0) or (self._albedo_cache is None)
@@ -657,8 +665,18 @@ class Temperature:
             # --- FAST COMPONENTS ---
             # Calculate solar input
             S0 = np.float32(params['solar_constant'])
+            
+            # Use the simulation's current hour of day to get solar factor
+            solar_factor = 1.0
+            if hasattr(self.sim, 'calculate_solar_factor'):
+                # Get solar factor based on the current hour of day
+                solar_factor = self.sim.calculate_solar_factor()
+                
+            # Calculate solar zenith angle effect (vectorized)
             cos_phi = np.cos(ds_lat).astype(np.float32)
-            day_length_factor = np.clip(cos_phi, 0, 1)
+            
+            # Combine latitude effect with time-of-day solar factor
+            day_length_factor = np.clip(cos_phi * solar_factor, 0, 1)  # Day/night cycle
             
             # Calculate albedo (simplified)
             albedo = np.where(is_land, params['albedo_land'], params['albedo_ocean']).astype(np.float32)
@@ -669,9 +687,9 @@ class Temperature:
             albedo[cold_land] = params['albedo_snow']
             albedo[cold_ocean] = params['albedo_ice']
             
-            # Solar input with albedo
+            # Calculate average insolation (vectorized)
             S_avg = S0 / 4
-            S_lat = S_avg * cos_phi
+            S_lat = S_avg * day_length_factor  # Modified to use combined day/night factor
             solar_in = S_lat * (1 - albedo)
             
             # Simplified greenhouse effect
