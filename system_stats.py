@@ -1,42 +1,176 @@
 import numpy as np
 import time
 import traceback
+import os
+import sys
 
 class SystemStats:
     """Class to handle system statistics printing and tracking for simulation"""
     
-    def __init__(self, simulation):
-        """Initialize the system stats object with reference to simulation app"""
-        self.sim = simulation
-        self.print_stats_enabled = True
+    def __init__(self, sim):
+        """Initialize statistics tracker with reference to main simulation"""
+        self.sim = sim
         self.last_cycle_time = time.time()
         self.last_values = {}
+        self.print_stats_enabled = True  # Enable by default
+        self.force_next_update = True  # Force first update
+        self.last_update_step = 0  # Track when last stats were calculated
+        self.update_frequency = 1  # Update stats every step by default
         
-    def print_stats(self):
-        """Print system statistics with live updates on the same lines"""
+        # Check if terminal supports ANSI escape codes for clear screen
+        self.supports_ansi = False
+        if sys.platform != 'win32' or 'ANSICON' in os.environ:
+            self.supports_ansi = True
+            
+        # Performance tracking
+        self.fps_history = []
+        self.last_step_timing = {
+            'total': 0,
+            'temperature': 0,
+            'pressure': 0,
+            'wind': 0,
+            'precipitation': 0
+        }
+        
+        # Add simulation log tracking (recent messages)
+        self.simulation_logs = []
+        self.max_log_entries = 5  # Keep last 5 log entries
+        
+        # Add debugging info
+        print(f"SystemStats initialized with print_stats_enabled={self.print_stats_enabled}")
+        
+    def _get_cloud_bias(self, day_factor):
+        """Calculate cloud bias with safety check for cloud_cover attribute"""
         try:
-            # Check if stats should be printed
-            if not self.print_stats_enabled:
+            if hasattr(self.sim, 'cloud_cover') and self.sim.cloud_cover is not None:
+                cloud_mean = np.mean(self.sim.cloud_cover) * 100
+                cloud_bias = cloud_mean - (self.sim.cloud_cover * (0.7 - day_factor)).mean() * 100
+                return cloud_bias
+            else:
+                return 0.0  # Default value when no cloud data
+        except Exception:
+            return 0.0  # Safe fallback on error
+    
+    def log_message(self, message):
+        """Add a message to the simulation log and optionally print it immediately"""
+        # Add timestamp to message
+        timestamp = time.strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        
+        # Add to logs
+        self.simulation_logs.append(log_entry)
+        
+        # Trim logs if they exceed the maximum
+        if len(self.simulation_logs) > self.max_log_entries:
+            self.simulation_logs = self.simulation_logs[-self.max_log_entries:]
+            
+        # Only force an immediate update if it's been a while since the last update
+        # This prevents too many updates when multiple log messages come in quickly
+        current_time = time.time()
+        last_update_time = getattr(self, 'last_log_update_time', 0)
+        
+        # Only print directly if stats are disabled, otherwise queue for stats update
+        if not self.print_stats_enabled:
+            # If stats aren't being displayed, print log messages directly
+            print(log_entry)
+        elif current_time - last_update_time > 0.5:  # Limit to one update per 0.5 second for logs
+            # Store time of update and force a stats refresh that will include the log
+            self.last_log_update_time = current_time
+            self.force_next_update = True
+            self.print_stats()
+    
+    def print_stats(self):
+        """Print detailed statistics about the simulation"""
+        try:
+            if not self.print_stats_enabled and not self.force_next_update:
                 return
                 
+            # Only update every few steps to reduce console spam
+            if self.sim.time_step <= self.last_update_step and not self.force_next_update:
+                return
+            
+            self.last_update_step = self.sim.time_step
+            self.force_next_update = False
+            
+            # If not running, just skip stats update
+            if not hasattr(self.sim, 'simulation_running') or not self.sim.simulation_running:
+                return
+            
+            # Clear the previous output if supported
+            if self.supports_ansi:
+                print("\033[H\033[J", end="")  # Clear screen and home cursor
+            else:
+                if sys.platform == 'win32':
+                    # Windows-specific clear (but only if detected)
+                    try:
+                        os.system('cls')
+                    except:
+                        # If that fails, print separator
+                        print("\n" + "="*80 + "\n")
+                else:
+                    # Just print a separator on other platforms
+                    print("\n" + "="*80 + "\n")
+                    
+            # --- SIMULATION IDENTIFICATION ---
+            # Print header text in cyan if color supported
+            if self.supports_ansi:
+                print("\033[96m===== PLANET SIMULATION STATISTICS =====\033[0m")
+            else:
+                print("===== PLANET SIMULATION STATISTICS =====")
+            
+            # --- SIMULATION TIME INFO ---
+            # Add simulation time information
+            time_info = []
+            time_info.append(f"Time Step: {self.sim.time_step}")
+            
+            # If the simulation has day/hour tracking
+            if hasattr(self.sim, 'simulation_day') and hasattr(self.sim, 'hour_of_day'):
+                time_info.append(f"Simulation Day: {self.sim.simulation_day}")
+                time_info.append(f"Hour of Day: {self.sim.hour_of_day}")
+                
+                # Print solar factor if available
+                if hasattr(self.sim, 'calculate_solar_factor'):
+                    solar_factor = self.sim.calculate_solar_factor()
+                    time_info.append(f"Solar Factor: {solar_factor:.2f}")
+                    
+                # Total hours simulated
+                if hasattr(self.sim, 'total_simulated_hours'):
+                    time_info.append(f"Total Hours: {self.sim.total_simulated_hours}")
+            
+            print(" | ".join(time_info))
+            
+            # --- PERFORMANCE METRICS ---
             # Calculate cycle time
             current_time = time.time()
             cycle_time = max(current_time - self.last_cycle_time, 0.000001)  # Prevent division by zero
             self.last_cycle_time = current_time
             
-            # Get average/min/max values
-            avg_temp = np.mean(self.sim.temperature_celsius)
-            min_temp = np.min(self.sim.temperature_celsius)
-            max_temp = np.max(self.sim.temperature_celsius)
+            # Calculate multiple statistics in a single pass where possible
             
-            avg_pressure = np.mean(self.sim.pressure)
-            min_pressure = np.min(self.sim.pressure)
-            max_pressure = np.max(self.sim.pressure)
+            # Temperature stats
+            temp_stats = np.array([
+                np.mean(self.sim.temperature_celsius),
+                np.min(self.sim.temperature_celsius),
+                np.max(self.sim.temperature_celsius)
+            ])
+            avg_temp, min_temp, max_temp = temp_stats
             
+            # Pressure stats
+            pressure_stats = np.array([
+                np.mean(self.sim.pressure),
+                np.min(self.sim.pressure),
+                np.max(self.sim.pressure)
+            ])
+            avg_pressure, min_pressure, max_pressure = pressure_stats
+            
+            # Wind stats (calculate wind_speed once and reuse)
             wind_speed = np.sqrt(self.sim.u**2 + self.sim.v**2)
-            min_wind = np.min(wind_speed)
-            avg_wind = np.mean(wind_speed)
-            max_wind = np.max(wind_speed)
+            wind_stats = np.array([
+                np.mean(wind_speed),
+                np.min(wind_speed),
+                np.max(wind_speed)
+            ])
+            avg_wind, min_wind, max_wind = wind_stats
             
             # Get energy budget values
             solar_in = self.sim.energy_budget.get('solar_in', 0)
@@ -109,42 +243,73 @@ class SystemStats:
             is_land = self.sim.elevation > 0
             is_ocean = ~is_land
             
-            if np.any(is_land) and np.any(is_ocean):
-                land_temp = np.mean(self.sim.temperature_celsius[is_land])
-                ocean_temp = np.mean(self.sim.temperature_celsius[is_ocean])
-                temp_diff = land_temp - ocean_temp
-                
-                # Store and calculate change in differential
-                if 'temp_diff' not in self.last_values:
+            # --- SELECTIVE STAT CALCULATION BASED ON SIMULATION SPEED ---
+            # If in high-speed mode, calculate less frequently the more complex stats
+            high_speed = getattr(self.sim, 'high_speed_mode', False)
+            sim_speed = 0
+            if hasattr(self.sim, 'simulation_speed'):
+                # Handle both regular value and DoubleVar
+                if hasattr(self.sim.simulation_speed, 'get'):
+                    sim_speed = self.sim.simulation_speed.get()  # Get value from DoubleVar
+                else:
+                    sim_speed = self.sim.simulation_speed  # Direct value
+            
+            # For very high speed, calculate complex stats only occasionally
+            calculate_complex_stats = not (high_speed and sim_speed >= 12) or (self.sim.time_step % 10 == 0)
+            
+            if calculate_complex_stats:
+                # Calculate land vs ocean temperature difference
+                if np.any(is_land) and np.any(is_ocean):
+                    land_temp = np.mean(self.sim.temperature_celsius[is_land])
+                    ocean_temp = np.mean(self.sim.temperature_celsius[is_ocean])
+                    temp_diff = land_temp - ocean_temp
+                    
+                    # Store and calculate change in differential
+                    if 'temp_diff' not in self.last_values:
+                        self.last_values['temp_diff'] = temp_diff
+                    diff_change = temp_diff - self.last_values['temp_diff']
                     self.last_values['temp_diff'] = temp_diff
-                diff_change = temp_diff - self.last_values['temp_diff']
-                self.last_values['temp_diff'] = temp_diff
+                    
+                    land_ocean_stats = f"Land-Ocean Temp   | Land: {land_temp:6.1f}°C | Ocean: {ocean_temp:6.1f}°C | Diff: {temp_diff:+6.1f}°C | Δ: {diff_change:+6.2f}°C"
+                else:
+                    land_ocean_stats = "Land-Ocean Temp   | No valid data"
                 
-                land_ocean_stats = f"Land-Ocean Temp   | Land: {land_temp:6.1f}°C | Ocean: {ocean_temp:6.1f}°C | Diff: {temp_diff:+6.1f}°C | Δ: {diff_change:+6.2f}°C"
-            else:
-                land_ocean_stats = "Land-Ocean Temp   | No valid data"
-            
-            # 3. Wind patterns - directional bias and correlation with pressure gradients
-            # Get predominant wind direction
-            u_mean = np.mean(self.sim.u)
-            v_mean = np.mean(self.sim.v)
-            mean_direction = self.sim.wind_system.calculate_direction(u_mean, v_mean)
-            
-            # Calculate wind vorticity (curl) - indicator of cyclonic/anticyclonic behavior
-            dy = self.sim.grid_spacing_y
-            dx = self.sim.grid_spacing_x
-            dvdx = np.gradient(self.sim.v, axis=1) / dx
-            dudy = np.gradient(self.sim.u, axis=0) / dy
-            vorticity = dvdx - dudy
-            mean_vorticity = np.mean(vorticity)
-            
-            # Store and calculate change
-            if 'vorticity' not in self.last_values:
+                # Calculate wind patterns - directional bias and vorticity
+                u_mean = np.mean(self.sim.u)
+                v_mean = np.mean(self.sim.v)
+                mean_direction = self.sim.wind_system.calculate_direction(u_mean, v_mean)
+                
+                # Calculate wind vorticity (curl) - indicator of cyclonic/anticyclonic behavior
+                dy = self.sim.grid_spacing_y
+                dx = self.sim.grid_spacing_x
+                dvdx = np.gradient(self.sim.v, axis=1) / dx
+                dudy = np.gradient(self.sim.u, axis=0) / dy
+                vorticity = dvdx - dudy
+                mean_vorticity = np.mean(vorticity)
+                
+                # Store and calculate change
+                if 'vorticity' not in self.last_values:
+                    self.last_values['vorticity'] = mean_vorticity
+                vorticity_change = mean_vorticity - self.last_values['vorticity']
                 self.last_values['vorticity'] = mean_vorticity
-            vorticity_change = mean_vorticity - self.last_values['vorticity']
-            self.last_values['vorticity'] = mean_vorticity
-            
-            wind_pattern_stats = f"Wind Patterns     | Dir: {mean_direction:5.1f}° | Vorticity: {mean_vorticity:+7.2e} | Δ: {vorticity_change:+7.2e}"
+                
+                # Cache the computed values for use when not calculating complex stats
+                self._cached_land_ocean_stats = f"Land-Ocean Temp   | Land: {land_temp:6.1f}°C | Ocean: {ocean_temp:6.1f}°C | Diff: {temp_diff:+6.1f}°C | Δ: {diff_change:+6.2f}°C"
+                self._cached_wind_pattern_stats = f"Wind Patterns     | Dir: {mean_direction:5.1f}° | Vorticity: {mean_vorticity:+7.2e} | Δ: {vorticity_change:+7.2e}"
+                
+                # Assign the wind_pattern_stats variable to use in output
+                wind_pattern_stats = self._cached_wind_pattern_stats
+            else:
+                # Use cached values for complex stats when in high-speed mode
+                if hasattr(self, '_cached_land_ocean_stats'):
+                    land_ocean_stats = self._cached_land_ocean_stats
+                else:
+                    land_ocean_stats = "Land-Ocean Temp   | [Calculating...]"
+                    
+                if hasattr(self, '_cached_wind_pattern_stats'):
+                    wind_pattern_stats = self._cached_wind_pattern_stats
+                else:
+                    wind_pattern_stats = "Wind Patterns     | [Calculating...]"
             
             # 4. Energy balance check (incoming vs outgoing)
             energy_in = solar_in + greenhouse
@@ -198,8 +363,21 @@ class SystemStats:
             # Calculate FPS with safety check
             fps = min(1/cycle_time, 999.9)  # Cap FPS display at 999.9
             
+            # Get simulation speed (hours per update)
+            sim_speed = 0
+            if hasattr(self.sim, 'simulation_speed'):
+                # Handle both regular value and DoubleVar
+                if hasattr(self.sim.simulation_speed, 'get'):
+                    sim_speed = self.sim.simulation_speed.get()  # Get value from DoubleVar
+                else:
+                    sim_speed = self.sim.simulation_speed  # Direct value
+            
+            # Check if high-speed mode is active
+            high_speed = getattr(self.sim, 'high_speed_mode', False)
+            high_speed_text = " (Approx)" if high_speed and sim_speed >= 12 else ""
+            
             # Create the output strings with fixed width
-            cycle_str = f"Simulation Cycle: {self.sim.time_step:6d} | Cycle Time: {cycle_time:6.3f}s | FPS: {fps:5.1f}"
+            cycle_str = f"Simulation Cycle: {self.sim.time_step:6d} | Cycle Time: {cycle_time:6.3f}s | FPS: {fps:5.1f} | Sim Speed: {sim_speed:4.1f}h/update{high_speed_text}"
             temp_str = f"Temperature (°C)   | Avg: {avg_temp:6.1f}  | Min: {min_temp:6.1f} | Max: {max_temp:6.1f} | Δ: {temp_change:+6.2f}"
             pres_str = f"Pressure (Pa)      | Avg: {avg_pressure:8.0f} | Min: {min_pressure:8.0f} | Max: {max_pressure:8.0f} | Δ: {pressure_change:+6.0f}"
             wind_str = f"Wind Speed (m/s)   | Avg: {avg_wind:6.1f}  | Min: {min_wind:6.1f} | Max: {max_wind:6.1f} | Δ: {wind_change:+6.2f}"
@@ -223,16 +401,18 @@ class SystemStats:
             extra_metrics.extend([
                 land_ocean_stats,
                 wind_pattern_stats,
-                energy_balance,
                 stability_stats,
                 
                 # 1. DIURNAL CYCLE TRACKING
                 # Calculate day/night phase more precisely
-                f"Day-Night Status   | Phase: {'Day' if day_factor > 0.5 else 'Night'} | Sol. Factor: {day_factor:0.2f} | Cloud Bias: {np.mean(self.sim.cloud_cover) * 100 - (self.sim.cloud_cover * (0.7 - day_factor)).mean() * 100:+.1f}%",
+                f"Day-Night Status   | Phase: {'Day' if day_factor > 0.5 else 'Night'} | Sol. Factor: {day_factor:0.2f} | Cloud Bias: {self._get_cloud_bias(day_factor):+.1f}%",
                 
                 # 2. ENERGY FLUX BREAKDOWN
                 # Calculate percentage contribution of each energy component
                 f"Energy Components  | Solar: {solar_in/max(energy_in, 1e-5)*100:4.1f}% | GHG: {greenhouse/max(energy_in, 1e-5)*100:4.1f}% | Cloud: {self.sim.energy_budget.get('cloud_effect', 0)/max(energy_in, 1e-5)*100:4.1f}% | Imbalance: {energy_imbalance/max(energy_in, 1e-5)*100:+4.1f}%",
+                
+                # Add the energy balance line here (moved from above)
+                energy_balance,
                 
                 # 3. HUMIDITY TRANSPORT METRICS
                 # Add moisture budget if humidity available
@@ -244,31 +424,43 @@ class SystemStats:
                 
                 hemisphere_stats
             ])
-            extra_lines += 9  # Added 4 new diagnostic lines
+            extra_lines += 9  # Added 9 new diagnostic lines
             
             total_lines = base_lines + extra_lines
             
-            # Only print these lines once at the start
-            if self.sim.time_step == 1:
-                print("\n" * total_lines)  # Create blank lines
-                print(f"\033[{total_lines}A", end='')  # Move cursor up
+            # Print each line without cursor repositioning
+            all_stats_lines = [
+                cycle_str,
+                temp_str,
+                pres_str,
+                wind_str,
+                energy_in_str,
+            ] + extra_metrics
             
-            # Update all lines in place
-            print(f"\033[K{cycle_str}", end='\r\n')      # Clear line and move to next
-            print(f"\033[K{temp_str}", end='\r\n')       # Clear line and move to next
-            print(f"\033[K{pres_str}", end='\r\n')       # Clear line and move to next
-            print(f"\033[K{wind_str}", end='\r\n')       # Clear line and move to next
-            print(f"\033[K{energy_in_str}", end='\r\n')  # Clear line and move to next
+            # Print each line normally - no repositioning
+            for line in all_stats_lines:
+                print(line)
             
-            # Print extra metrics
-            for metric in extra_metrics:
-                print(f"\033[K{metric}", end='\r\n')     # Clear line and move to next
+            # Include other energy exchanges if available
+            if 'land_atmosphere_exchange' in self.sim.energy_budget:
+                land_atm = self.sim.energy_budget['land_atmosphere_exchange']
+                other_str = f"Land-Atm Flux: {land_atm:+.2f} W/m²"
+                print(other_str)
             
-            # Last line doesn't need newline
-            print(f"\033[K{energy_balance}", end='\r')
+            # --- SIMULATION LOGS ---
+            if hasattr(self, 'simulation_logs') and self.simulation_logs:
+                if self.supports_ansi:
+                    print("\033[96m----- SIMULATION LOGS -----\033[0m")
+                else:
+                    print("----- SIMULATION LOGS -----")
+                
+                # Print each log entry
+                for log in self.simulation_logs:
+                    print(log)
             
-            # Move cursor back up to the start position
-            print(f"\033[{total_lines}A", end='')
+            # Force flush stdout to ensure display updates immediately
+            sys.stdout.flush()
+            
         except Exception as e:
             print(f"Error in print_system_stats: {e}")
             traceback.print_exc() 

@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, zoom
 import time
 import traceback
 from map_generation import MapGenerator
@@ -11,6 +11,25 @@ class Pressure:
         self._oscillation_phase = 0
         self._time_varying_factor = 0
         self._temp_avg_counter = 0
+        # Add adaptive resolution tracking
+        self._adaptive_mode = False
+        self._downsampling_factor = 2  # Default reduction factor
+        
+        # Pattern-Based Pressure System settings (Solution 1)
+        self._update_counter = 0
+        self._base_pattern_update_freq = 10    # Update base patterns less frequently
+        self._perturbation_update_freq = 1     # Update perturbations every step
+        
+        # Base patterns - decompose pressure into components
+        self._static_pattern = None          # Elevation-based component
+        self._latitude_pattern = None        # Global circulation component
+        self._thermal_pattern = None         # Temperature-driven component  
+        self._dynamic_pattern = None         # Time-varying oscillatory component
+        self._perturbation = None            # Fast-changing small-scale perturbations
+        
+        # Cached intermediate calculations
+        self._last_perturbation_time = 0     # Track when perturbations were last updated
+        self._persistent_systems = None      # Semi-persistent weather systems
 
     def initialize(self):
         """Initialize pressure field with standard pressure and elevation effects"""
@@ -96,229 +115,123 @@ class Pressure:
             traceback.print_exc()
 
     def update(self):
-        """Update pressure based on temperature gradients, wind patterns and global circulation"""
+        """Update pressure using pattern-based approach for performance optimization"""
         try:
             dt = self.sim.time_step_seconds
             P0 = 101325.0  # Standard sea-level pressure
             
-            # Basic masks and elevation
-            if not hasattr(self, '_elevation_factor'):
-                # Pre-compute elevation-based factors once and cache
-                is_land = self.sim.elevation > 0
-                max_height = 1000.0
-                limited_elevation = np.clip(self.sim.elevation, 0, max_height)
-                self._elevation_factor = np.exp(-limited_elevation / 7400.0)
-                self._is_land = is_land
+            # Check if high-speed mode is active
+            high_speed = getattr(self.sim, 'high_speed_mode', False)
+            
+            # Use adaptive resolution if in high-speed mode
+            if high_speed and high_speed != self._adaptive_mode:
+                # Mode switched to high-speed, prepare for adaptive resolution
+                self._adaptive_mode = True
+                # Clear cached fields to force recalculation
+                if hasattr(self, '_elevation_factor'):
+                    del self._elevation_factor
                 
-                # Initialize time-varying factors
-                self._time_varying_factor = 0.0
+            elif not high_speed and self._adaptive_mode:
+                # Mode switched to normal, revert to full resolution
+                self._adaptive_mode = False
+                # Clear cached fields
+                if hasattr(self, '_elevation_factor'):
+                    del self._elevation_factor
+            
+            # Use adaptive resolution calculations in high-speed mode
+            if self._adaptive_mode:
+                self._update_adaptive()
+                return
                 
-            # Update time-varying factor - adds periodic forcing to the system
-            self._time_varying_factor += 0.1 * dt
-            seasonal_factor = np.sin(self._time_varying_factor / 86400 * 2 * np.pi)  # Daily cycle
-            
-            # Calculate minimum pressure based on elevation (cached)
-            min_pressure = P0 * self._elevation_factor
-            
-            # --- TEMPERATURE-DRIVEN PRESSURE GRADIENTS ---
-            # Temperature has a strong effect on pressure (warm = low pressure, cold = high pressure)
-            T = self.sim.temperature_celsius
-            
-            # Calculate pressure changes due to wind convergence/divergence with wrapping
-            # Create wrapped arrays for proper edge handling
-            u_wrapped = np.hstack((self.sim.u[:, -1:], self.sim.u, self.sim.u[:, :1]))
-            v_wrapped = np.vstack((self.sim.v[-1:, :], self.sim.v, self.sim.v[:1, :]))
-            
-            # Calculate pressure changes due to wind convergence/divergence with wrapping
-            du_dx = np.gradient(u_wrapped, axis=1) / self.sim.grid_spacing_x
-            dv_dy = np.gradient(v_wrapped, axis=0) / self.sim.grid_spacing_y
-            
-            # Remove the padding from gradient results
-            du_dx = du_dx[:, 1:-1]
-            dv_dy = dv_dy[1:-1, :]
-            
-            wind_divergence = du_dx + dv_dy
-            
-            # --- ENHANCED WIND-PRESSURE COUPLING ---
-            
-            # 1. Stronger wind-driven pressure changes to represent real weather dynamics
-            # Increased convergence factor to allow winds to have stronger effect on pressure
-            convergence_factor = 0.35  # Increased from 0.25
-            pressure_change_wind = -self.sim.pressure * wind_divergence * dt * convergence_factor
-            
-            # 2. Vorticity-based pressure changes - key for cyclone formation
-            # Calculate relative vorticity with proper wrapping (curl of wind field)
-            # Create properly padded arrays with consistent dimensions
-            u_padded = np.pad(self.sim.u, ((1, 1), (1, 1)), mode='wrap')
-            v_padded = np.pad(self.sim.v, ((1, 1), (1, 1)), mode='wrap')
-            
-            # Calculate gradients in x and y directions
-            du_dy = (u_padded[2:, 1:-1] - u_padded[:-2, 1:-1]) / (2 * self.sim.grid_spacing_y)
-            dv_dx = (v_padded[1:-1, 2:] - v_padded[1:-1, :-2]) / (2 * self.sim.grid_spacing_x)
-            
-            # Now both arrays have the same shape as the original u and v
-            vorticity = dv_dx - du_dy
-            
-            # High positive vorticity (cyclonic) creates low pressure
-            # High negative vorticity (anticyclonic) creates high pressure
-            vorticity_factor = 0.3  # Increased from 0.2
-            pressure_change_vorticity = -vorticity_factor * vorticity * self.sim.pressure * dt
-            
-            # 3. Apply baroclinic instability effects (interactions of temperature and pressure gradients)
-            # Calculate magnitude of horizontal temperature gradient
-            T_wrapped = np.vstack((T[-1:, :], T, T[:1, :]))
-            T_wrapped = np.hstack((T_wrapped[:, -1:], T_wrapped, T_wrapped[:, :1]))
-            
-            # Calculate horizontal temperature gradients
-            dT_dx = np.gradient(T_wrapped, axis=1)[1:-1, 1:-1] / self.sim.grid_spacing_x
-            dT_dy = np.gradient(T_wrapped, axis=0)[1:-1, 1:-1] / self.sim.grid_spacing_y
-            
-            # Temperature gradient magnitude
-            temp_gradient_mag = np.sqrt(dT_dx**2 + dT_dy**2)
-            
-            # Simplified baroclinic instability effect - stronger in areas with large temperature gradients
-            # and where winds are already strong (reinforcing developing systems)
-            wind_mag = np.sqrt(self.sim.u**2 + self.sim.v**2)
-            baroclinic_factor = 0.2  # Increased from 0.15
-            pressure_change_baroclinic = -baroclinic_factor * temp_gradient_mag * wind_mag * dt
-            
-            # Modulate the baroclinic effect with latitude - stronger in mid-latitudes where
-            # frontogenesis and cyclone development are most common
-            lat_rad = np.abs(np.radians(self.sim.latitude))
-            midlat_enhancement = np.exp(-((lat_rad - np.radians(45)) / np.radians(25))**2)
-            pressure_change_baroclinic *= midlat_enhancement
-            
-            # 4. Enhanced temperature factor - still important for overall circulation
-            temperature_factor = 0.6  # Increased from 0.5
-            
-            # Cache global average temperature and update less frequently
-            if not hasattr(self, '_global_avg_temp') or not hasattr(self, '_temp_avg_counter'):
-                self._global_avg_temp = np.mean(T)
-                self._temp_avg_counter = 0
-            
-            self._temp_avg_counter += 1
-            if self._temp_avg_counter >= 10:  # Only update every 10 steps
-                self._global_avg_temp = np.mean(T)
-                self._temp_avg_counter = 0
-            
-            pressure_change_temp = -temperature_factor * (T - self._global_avg_temp) * dt
-            
-            # 5. Land-ocean thermal contrast - important for coastal weather
-            land_ocean_effect = 0.5 * self._land_ocean_factor * (1 - self._land_ocean_factor) * dt  # Increased from 0.4
-            pressure_change_land_ocean = land_ocean_effect * np.abs(np.gradient(T)[0] + np.gradient(T)[1])
-            
-            # 6. Background latitudinal pressure patterns - REDUCED influence to allow weather patterns
-            # to dominate more
-            lat_pressure_strength = 0.003  # Reduced from 0.005
-            pressure_change_lat = self._lat_pressure * lat_pressure_strength * dt
-            
-            # 7. Semi-permanent pressure systems - also reduced to allow more dynamism
-            persistent_system_strength = 0.01  # Keep at 0.01
-            pressure_change_persistent = self._persistent_systems * persistent_system_strength * dt
-            
-            # 8. Add time-varying oscillations with seasonal component
-            if not hasattr(self, '_oscillation_phase'):
-                self._oscillation_phase = 0.0
+            # Increment update counter
+            self._update_counter += 1
                 
-            self._oscillation_phase += 0.015  # Increased from 0.01
-            if self._oscillation_phase > 2 * np.pi:
-                self._oscillation_phase -= 2 * np.pi
-                
-            oscillation_x = np.sin(2 * np.pi * self.sim.longitude / 360 + self._oscillation_phase)
-            oscillation_y = np.sin(2 * np.pi * self.sim.latitude / 180 + self._oscillation_phase)
-            # Add seasonal influence
-            oscillation = oscillation_x * oscillation_y * (1 + 0.5 * seasonal_factor)
+            # Regular full-resolution update with pattern-based optimization
+            # Initialize masks and basic patterns if not already done
+            if self._static_pattern is None or self._latitude_pattern is None:
+                self._initialize_patterns()
             
-            oscillation_factor = 0.4  # Increased from 0.3
-            pressure_change_oscillation = oscillation * oscillation_factor * dt
+            # Update time-varying components
+            self._update_time_varying_components(dt)
             
-            # 9. Weather system persistence (memory effect) to simulate real weather patterns that
-            # develop and persist over time rather than rapidly changing
-            if not hasattr(self, '_pressure_anomaly'):
-                self._pressure_anomaly = np.zeros_like(self.sim.pressure)
+            # --- PATTERN-BASED PRESSURE CALCULATION ---
+            # The key idea is to decompose pressure into components that update at different rates
             
-            # Current anomaly is difference from "climate" (the background pattern)
-            climate_pressure = P0 * np.ones_like(self.sim.pressure)
-            climate_pressure += self._lat_pressure * 0.1  # Background climate pattern
-            current_anomaly = self.sim.pressure - climate_pressure
+            # 1. Start with static elevation-based pattern (rarely changes)
+            current_pressure = self._static_pattern.copy()
             
-            # Persistence factor - how much of the anomaly persists
-            # Reduce persistence to prevent systems from becoming too static
-            persistence_factor = 0.9  # Reduced from 0.95
-            self._pressure_anomaly = persistence_factor * self._pressure_anomaly + (1 - persistence_factor) * current_anomaly
+            # 2. Add latitude-based global circulation pattern (changes very slowly)
+            if self._update_counter % self._base_pattern_update_freq == 0 or self._latitude_pattern is None:
+                self._update_latitude_pattern()
+            current_pressure += self._latitude_pattern
             
-            # Apply the persistent anomaly effect to create weather pattern memory
-            weather_persistence_strength = 0.25  # Increased from 0.2
-            pressure_change_persistence = weather_persistence_strength * self._pressure_anomaly * dt
+            # 3. Add thermal pattern (changes moderately with temperature)
+            if self._update_counter % (self._base_pattern_update_freq // 2) == 0 or self._thermal_pattern is None:
+                self._update_thermal_pattern()
+            current_pressure += self._thermal_pattern
             
-            # 10. Combine all pressure changes with new weather dynamics
-            pressure_change = (pressure_change_wind + 
-                              pressure_change_temp + 
-                              pressure_change_lat + 
-                              pressure_change_vorticity +
-                              pressure_change_baroclinic +
-                              pressure_change_persistence +
-                              pressure_change_land_ocean +
-                              pressure_change_persistent +
-                              pressure_change_oscillation)
+            # 4. Add dynamic oscillatory pattern (changes slowly over time)
+            if self._update_counter % (self._base_pattern_update_freq // 5) == 0 or self._dynamic_pattern is None:
+                self._update_dynamic_pattern(dt)
+            current_pressure += self._dynamic_pattern
             
-            # 11. More localized, weather-like atmospheric variability
-            # Use a combination of simulation time and a fixed seed for the random noise
-            # This creates variability while ensuring it's not totally chaotic
-            seed_value = int((time.time() * 1000 + self.sim.time_step * 17) % 10000)
-            np.random.seed(seed_value)
+            # 5. Add fast-changing perturbations (updated every step)
+            self._update_perturbations(dt)
+            current_pressure += self._perturbation
             
-            # Create two scales of noise: large-scale and small-scale
-            # Large-scale weather systems
-            base_noise_large = np.random.normal(0, 1.2, pressure_change.shape)  # Increased variance
-            large_scale_noise = np.zeros_like(base_noise_large)
-            gaussian_filter(base_noise_large, sigma=5.0, mode='wrap', output=large_scale_noise)
+            # 6. Apply constraints - ensure pressure stays within realistic bounds
+            current_pressure = np.clip(current_pressure, 87000.0, 108600.0)
             
-            # Smaller-scale disturbances
-            base_noise_small = np.random.normal(0, 1.0, pressure_change.shape)
-            small_scale_noise = np.zeros_like(base_noise_small)
-            gaussian_filter(base_noise_small, sigma=2.0, mode='wrap', output=small_scale_noise)
+            # 7. Light smoothing to remove any artifacts from component combination
+            gaussian_filter(current_pressure, sigma=0.5, mode='wrap', output=self.sim.pressure)
             
-            # Third scale - very localized disturbances
-            base_noise_local = np.random.normal(0, 0.8, pressure_change.shape)
-            local_noise = np.zeros_like(base_noise_local)
-            gaussian_filter(base_noise_local, sigma=0.8, mode='wrap', output=local_noise)
+        except Exception as e:
+            print(f"Error updating pressure: {e}")
+            traceback.print_exc()
+    
+    def _initialize_patterns(self):
+        """Initialize the base pressure patterns"""
+        try:
+            P0 = 101325.0  # Standard sea-level pressure
             
-            # Combined noise with more emphasis on large-scale patterns
-            noise = large_scale_noise * 1.2 + small_scale_noise * 0.7 + local_noise * 0.3
+            # 1. STATIC PATTERN (elevation-based)
+            is_land = self.sim.elevation > 0
+            max_height = 1000.0
+            limited_elevation = np.clip(self.sim.elevation, 0, max_height)
+            elevation_factor = np.exp(-limited_elevation / 7400.0)
             
-            # Scale noise to have more effect in areas with strong temperature gradients
-            # This simulates frontal disturbances
-            frontal_enhancement = 1.0 + 0.5 * temp_gradient_mag / np.max(temp_gradient_mag + 1e-10)
-            noise *= frontal_enhancement
+            # Create static pressure pattern
+            self._static_pattern = P0 * elevation_factor
+            self._is_land = is_land
             
-            # Apply noise to pressure change with a stronger factor
-            pressure_change += noise * 2.0  # Increased noise influence
+            # 2. LATITUDE PATTERN (empty placeholder - will be filled on first update)
+            self._latitude_pattern = np.zeros_like(self.sim.pressure)
             
-            # 12. Lighter smoothing to preserve weather features
-            if not hasattr(self, '_pressure_change_smooth'):
-                self._pressure_change_smooth = np.zeros_like(pressure_change)
+            # 3. THERMAL PATTERN (empty placeholder - will be filled on first update)
+            self._thermal_pattern = np.zeros_like(self.sim.pressure)
             
-            # Reduce smoothing to preserve more weather detail
-            gaussian_filter(pressure_change, sigma=0.6, mode='wrap', output=self._pressure_change_smooth)  # Reduced from 0.8
+            # 4. DYNAMIC PATTERN (empty placeholder - will be filled on first update)
+            self._dynamic_pattern = np.zeros_like(self.sim.pressure)
             
-            # Apply pressure changes
-            self.sim.pressure += self._pressure_change_smooth
+            # 5. PERTURBATIONS (empty placeholder - will be filled on first update)
+            self._perturbation = np.zeros_like(self.sim.pressure)
             
-            # 13. Ensure pressure stays within realistic bounds
-            # First handle land areas with elevation-based minimum pressure
-            self.sim.pressure[self._is_land] = np.maximum(self.sim.pressure[self._is_land], min_pressure[self._is_land])
+            # 6. Initialize persistent weather systems
+            self._initialize_persistent_systems()
             
-            # For ocean areas, ensure more gradual pressure variation
-            is_ocean = ~self._is_land
+        except Exception as e:
+            print(f"Error initializing pressure patterns: {e}")
+            traceback.print_exc()
             
-            # Get latitude dependent factors for ocean
+    def _update_latitude_pattern(self):
+        """Update the latitude-based global circulation pattern"""
+        try:
+            P0 = 101325.0  # Standard sea-level pressure
             lat_rad = np.abs(np.radians(self.sim.latitude))
             
-            # Create references for ocean pressure constraints based on latitude bands
-            # These create smoother transitions between pressure zones in oceans
-            # Near equator (low pressure)
-            equator_band = np.exp(-(lat_rad / np.radians(15))**2)
+            # Latitude bands with typical pressure systems
+            # Equatorial trough (low pressure)
+            equator_band = np.exp(-((lat_rad - np.radians(0)) / np.radians(10))**2)
             # Near 30° N/S (high pressure)
             subtropical_band = np.exp(-((lat_rad - np.radians(30)) / np.radians(15))**2)
             # Near 60° N/S (low pressure)
@@ -326,41 +239,332 @@ class Pressure:
             # Near poles (high pressure)
             polar_band = np.exp(-((lat_rad - np.radians(90)) / np.radians(20))**2)
             
-            # Calculate reference pressure for each ocean point based on latitude
-            base_ocean_pressure = P0 * np.ones_like(self.sim.pressure)
+            # Create latitude-based pressure pattern
+            self._latitude_pattern = np.zeros_like(self.sim.pressure)
             
-            # Apply latitude-based pressure modifications with reduced strength for oceans
-            ocean_pressure_range = 3000.0
-            base_ocean_pressure -= equator_band * 0.3 * ocean_pressure_range
-            base_ocean_pressure += subtropical_band * 0.4 * ocean_pressure_range
-            base_ocean_pressure -= subpolar_band * 0.3 * ocean_pressure_range
-            base_ocean_pressure += polar_band * 0.3 * ocean_pressure_range
+            # Apply different pressure ranges for land and ocean
+            pressure_range = np.where(self._is_land, 2500.0, 3000.0)
             
-            # Allow pressure to deviate from base ocean pressure by more, increasing dynamism
-            max_ocean_deviation = 3000.0  # Increased from 2500.0
-            ocean_pressure_min = base_ocean_pressure - max_ocean_deviation
-            ocean_pressure_max = base_ocean_pressure + max_ocean_deviation
+            # Build latitude pattern with typical global circulation features
+            self._latitude_pattern -= equator_band * 0.4 * pressure_range
+            self._latitude_pattern += subtropical_band * 0.5 * pressure_range
+            self._latitude_pattern -= subpolar_band * 0.4 * pressure_range
+            self._latitude_pattern += polar_band * 0.3 * pressure_range
             
-            # Apply ocean-specific constraints before global clipping
-            self.sim.pressure[is_ocean] = np.clip(
-                self.sim.pressure[is_ocean],
-                ocean_pressure_min[is_ocean],
-                ocean_pressure_max[is_ocean]
-            )
-            
-            # Final global clipping
-            self.sim.pressure = np.clip(self.sim.pressure, 87000.0, 108600.0)
-            
-            # 14. Final smoothing - lighter to preserve weather features
-            if not hasattr(self, '_pressure_smooth'):
-                self._pressure_smooth = np.zeros_like(self.sim.pressure)
-            
-            # Reduced final smoothing for more detail
-            gaussian_filter(self.sim.pressure, sigma=0.5, mode='wrap', output=self._pressure_smooth)  # Reduced from 0.8
-            self.sim.pressure[:] = self._pressure_smooth
+            # Add persistent semi-permanent systems
+            if self._persistent_systems is not None:
+                self._latitude_pattern += self._persistent_systems
             
         except Exception as e:
-            print(f"Error updating pressure: {e}")
+            print(f"Error updating latitude pattern: {e}")
+            traceback.print_exc()
+            
+    def _update_thermal_pattern(self):
+        """Update the temperature-based pressure pattern"""
+        try:
+            # Calculate global average temperature for reference
+            global_avg_temp = np.mean(self.sim.temperature_celsius)
+            
+            # Temperature deviation from average
+            temp_deviation = self.sim.temperature_celsius - global_avg_temp
+            
+            # 1. Basic thermal effect - hot air rises (low pressure), cold air sinks (high pressure)
+            thermal_factor = -30.0  # Scale factor (negative because hot = low pressure)
+            self._thermal_pattern = thermal_factor * temp_deviation
+            
+            # 2. Apply land-sea thermal contrast effects
+            # Land-sea temperature differences drive pressure gradients
+            is_land = self._is_land
+            
+            # Calculate separate land and ocean average temperatures
+            if np.any(is_land):
+                land_avg_temp = np.mean(self.sim.temperature_celsius[is_land])
+            else:
+                land_avg_temp = global_avg_temp
+                
+            if np.any(~is_land):
+                ocean_avg_temp = np.mean(self.sim.temperature_celsius[~is_land])
+            else:
+                ocean_avg_temp = global_avg_temp
+            
+            # Enhance pressure differences along coastlines based on land-sea temperature contrast
+            if np.any(is_land) and np.any(~is_land):
+                # Find coastlines using simple dilation technique
+                from scipy.ndimage import binary_dilation
+                
+                # Define a kernel for finding coastal regions
+                kernel = np.ones((3, 3), dtype=bool)
+                kernel[1, 1] = False
+                
+                # Find cells that are land but adjacent to ocean
+                coastal_land = is_land & binary_dilation(~is_land, structure=kernel)
+                
+                # Find cells that are ocean but adjacent to land
+                coastal_ocean = (~is_land) & binary_dilation(is_land, structure=kernel)
+                
+                # Enhance thermal pattern along coastlines
+                coastal_factor = 15.0 * (land_avg_temp - ocean_avg_temp)
+                if np.any(coastal_land):
+                    self._thermal_pattern[coastal_land] += coastal_factor
+                if np.any(coastal_ocean):
+                    self._thermal_pattern[coastal_ocean] -= coastal_factor
+            
+            # 3. Apply light smoothing to thermal pattern
+            self._thermal_pattern = gaussian_filter(self._thermal_pattern, sigma=1.0, mode='wrap')
+            
+        except Exception as e:
+            print(f"Error updating thermal pattern: {e}")
+            traceback.print_exc()
+    
+    def _update_dynamic_pattern(self, dt):
+        """Update the dynamic oscillatory pressure pattern"""
+        try:
+            # Update time-varying oscillation phase
+            self._time_varying_factor += 0.1 * dt / 86400.0  # Convert to days
+            if self._time_varying_factor > 2*np.pi:
+                self._time_varying_factor -= 2*np.pi
+                
+            # 1. Create spatial oscillation patterns
+            height, width = self.sim.pressure.shape
+            x = np.linspace(0, 2*np.pi, width)
+            y = np.linspace(0, np.pi, height)
+            X, Y = np.meshgrid(x, y)
+            
+            # 2. Generate phase-shifted oscillation pattern
+            phase = self._oscillation_phase
+            wave1 = np.sin(X/2 + phase) * np.cos(Y*2)
+            wave2 = np.cos(X + phase*1.5) * np.sin(Y*3)
+            wave3 = np.sin(X*3 + Y + phase*0.7)
+            
+            # 3. Combine waves with varying amplitudes
+            self._dynamic_pattern = (wave1 * 400.0 + wave2 * 300.0 + wave3 * 250.0)
+            
+            # 4. Modulate strength with latitude (stronger in mid-latitudes)
+            lat_rad = np.abs(np.radians(self.sim.latitude))
+            midlat_factor = np.exp(-((lat_rad - np.radians(45)) / np.radians(30))**2)
+            self._dynamic_pattern *= midlat_factor
+            
+            # 5. Advance oscillation phase for next update
+            self._oscillation_phase += 0.02
+            if self._oscillation_phase > 2*np.pi:
+                self._oscillation_phase -= 2*np.pi
+                
+        except Exception as e:
+            print(f"Error updating dynamic pattern: {e}")
+            traceback.print_exc()
+    
+    def _update_perturbations(self, dt):
+        """Update fast-changing small-scale pressure perturbations"""
+        try:
+            # Only regenerate perturbations periodically to save computation
+            should_update = (time.time() - self._last_perturbation_time > 0.1) or (self._perturbation is None)
+            
+            if not should_update:
+                return
+                
+            # Record update time
+            self._last_perturbation_time = time.time()
+            
+            # 1. Generate small-scale noise pattern
+            # Use deterministic seed based on time and time step for reproducibility
+            np.random.seed(int((time.time() * 1000 + self.sim.time_step * 17) % 10000))
+            
+            # Generate different scales of noise
+            noise_small = np.random.normal(0, 1.0, self.sim.pressure.shape)
+            noise_medium = np.random.normal(0, 1.0, self.sim.pressure.shape)
+            
+            # 2. Smooth noise to create coherent patterns at different scales
+            noise_small = gaussian_filter(noise_small, sigma=1.0, mode='wrap')
+            noise_medium = gaussian_filter(noise_medium, sigma=3.0, mode='wrap')
+            
+            # 3. Combine noise scales with different weights
+            combined_noise = noise_small * 50.0 + noise_medium * 150.0
+            
+            # 4. Apply wind influence on perturbations
+            if hasattr(self.sim, 'u') and hasattr(self.sim, 'v'):
+                # Calculate wind convergence/divergence
+                du_dx = np.gradient(self.sim.u, axis=1)
+                dv_dy = np.gradient(self.sim.v, axis=0)
+                convergence = -(du_dx + dv_dy)  # Negative divergence
+                
+                # Scale and smooth convergence effect
+                convergence_effect = gaussian_filter(convergence * 500.0, sigma=1.0, mode='wrap')
+                
+                # Add to perturbations (convergence lowers pressure)
+                combined_noise += convergence_effect
+            
+            # 5. Update perturbation field with temporal smoothing
+            if self._perturbation is None:
+                self._perturbation = combined_noise
+            else:
+                # Blend with previous perturbation for temporal continuity
+                blend_factor = 0.7
+                self._perturbation = self._perturbation * blend_factor + combined_noise * (1 - blend_factor)
+            
+        except Exception as e:
+            print(f"Error updating pressure perturbations: {e}")
+            traceback.print_exc()
+            
+    def _initialize_persistent_systems(self):
+        """Initialize semi-permanent pressure systems (e.g., Aleutian Low, Azores High)"""
+        try:
+            # Create empty field for persistent systems
+            self._persistent_systems = np.zeros_like(self.sim.pressure)
+            
+            # Add known semi-permanent pressure systems
+            # Parameters: lon_center, lat_center, radius (km), strength (Pa)
+            
+            # Northern Hemisphere systems
+            self._add_pressure_system(self._persistent_systems, -30, 35, 1500, 1200)   # Azores/Bermuda High
+            self._add_pressure_system(self._persistent_systems, -165, 55, 1800, -1500) # Aleutian Low
+            self._add_pressure_system(self._persistent_systems, -100, 85, 1200, 800)   # North Polar High
+            self._add_pressure_system(self._persistent_systems, 100, 45, 2000, 1000)   # Siberian High
+            
+            # Southern Hemisphere systems
+            self._add_pressure_system(self._persistent_systems, -90, -40, 1500, 1200)  # South Pacific High
+            self._add_pressure_system(self._persistent_systems, 20, -35, 1500, 1000)   # South Atlantic High
+            self._add_pressure_system(self._persistent_systems, 120, -35, 1500, 1000)  # South Indian High
+            self._add_pressure_system(self._persistent_systems, 0, -88, 1200, 800)     # South Polar High
+            
+            # Apply smoothing to blend pressure systems
+            self._persistent_systems = gaussian_filter(self._persistent_systems, sigma=3.0, mode='wrap')
+            
+        except Exception as e:
+            print(f"Error initializing persistent pressure systems: {e}")
+            traceback.print_exc()
+    
+    def _update_time_varying_components(self, dt):
+        """Update time-varying parameters that affect pressure patterns"""
+        # Update oscillation phase - used for dynamic pattern
+        self._oscillation_phase += 0.015 * dt / 3600.0  # Scale by hours
+        if self._oscillation_phase > 2 * np.pi:
+            self._oscillation_phase -= 2 * np.pi
+            
+        # Update global time-varying factor - used for seasonal effects
+        self._time_varying_factor += 0.1 * dt / 86400.0  # Scale by days
+        if self._time_varying_factor > 2 * np.pi:
+            self._time_varying_factor -= 2 * np.pi
+
+    def _update_adaptive(self):
+        """Update pressure using lower resolution calculations for performance"""
+        try:
+            dt = self.sim.time_step_seconds
+            P0 = 101325.0  # Standard sea-level pressure
+            factor = self._downsampling_factor
+            
+            # Downsample key fields when needed
+            if not hasattr(self, '_downsampled_fields') or self.sim.time_step % 20 == 0:
+                # Create or update cached downsampled fields
+                h, w = self.sim.map_height, self.sim.map_width
+                h_low, w_low = h // factor, w // factor
+                
+                # Downsample elevation and land mask
+                elevation_low = zoom(self.sim.elevation, 1/factor, order=1)
+                is_land_low = elevation_low > 0
+                
+                # Cache elevation factor
+                max_height = 1000.0
+                limited_elevation = np.clip(elevation_low, 0, max_height)
+                elevation_factor_low = np.exp(-limited_elevation / 7400.0)
+                
+                # Cache latitude-based patterns at lower resolution
+                lat_rad = np.radians(zoom(self.sim.latitude, 1/factor, order=1))
+                lon_deg = zoom(self.sim.longitude, 1/factor, order=1)
+                
+                # Create basic pressure pattern based on latitude (simplified)
+                lat_pressure_low = (
+                    800.0 * np.exp(-((np.abs(lat_rad) - np.radians(30)) / np.radians(15))**2) +  # Subtropical high
+                    -600.0 * np.exp(-((np.abs(lat_rad) - np.radians(60)) / np.radians(15))**2) +  # Subpolar low
+                    600.0 * np.exp(-((np.abs(lat_rad) - np.radians(90)) / np.radians(20))**2) +   # Polar high
+                    -400.0 * np.exp(-(lat_rad / np.radians(10))**2)                               # Equatorial low
+                )
+                
+                # Create persistent systems (simplified version)
+                persistent_systems_low = np.zeros_like(lat_pressure_low)
+                
+                # Cache the downsampled fields
+                self._downsampled_fields = {
+                    'elevation': elevation_low,
+                    'is_land': is_land_low,
+                    'elevation_factor': elevation_factor_low,
+                    'lat_pressure': lat_pressure_low,
+                    'persistent_systems': persistent_systems_low,
+                    'shape': (h_low, w_low)
+                }
+            
+            # Get downsampled fields
+            ds = self._downsampled_fields
+            
+            # Downsample current fields
+            temp_low = zoom(self.sim.temperature_celsius, 1/factor, order=1)
+            u_low = zoom(self.sim.u, 1/factor, order=1)
+            v_low = zoom(self.sim.v, 1/factor, order=1)
+            pressure_low = zoom(self.sim.pressure, 1/factor, order=1)
+            
+            # Calculate global average temperature
+            global_avg_temp = np.mean(temp_low)
+            
+            # Update time-varying factor
+            self._time_varying_factor += 0.1 * dt
+            seasonal_factor = np.sin(self._time_varying_factor / 86400 * 2 * np.pi)
+            
+            # Calculate pressure changes (simplified for low resolution)
+            # 1. Wind-driven changes
+            du_dx = np.gradient(u_low, axis=1) 
+            dv_dy = np.gradient(v_low, axis=0)
+            wind_divergence = du_dx + dv_dy
+            pressure_change_wind = -pressure_low * wind_divergence * dt * 0.35
+            
+            # 2. Temperature-driven changes 
+            pressure_change_temp = -0.6 * (temp_low - global_avg_temp) * dt
+            
+            # 3. Background patterns
+            pressure_change_lat = ds['lat_pressure'] * 0.003 * dt
+            
+            # 4. Oscillation
+            self._oscillation_phase += 0.015
+            if self._oscillation_phase > 2 * np.pi:
+                self._oscillation_phase -= 2 * np.pi
+                
+            # Simple oscillation on low-res grid
+            x = np.linspace(0, 2*np.pi, ds['shape'][1])
+            y = np.linspace(0, np.pi, ds['shape'][0])
+            X, Y = np.meshgrid(x, y)
+            oscillation = np.sin(X + self._oscillation_phase) * np.sin(Y + self._oscillation_phase) * (1 + 0.5 * seasonal_factor)
+            pressure_change_oscillation = oscillation * 0.4 * dt
+            
+            # 5. Simplified stochastic weather patterns
+            np.random.seed(int((time.time() * 1000 + self.sim.time_step * 17) % 10000))
+            noise_large = np.random.normal(0, 1.0, ds['shape'])
+            gaussian_filter(noise_large, sigma=2.0, mode='wrap', output=noise_large)
+            
+            # Combine all pressure changes
+            pressure_change_low = (pressure_change_wind + 
+                               pressure_change_temp + 
+                               pressure_change_lat + 
+                               pressure_change_oscillation + 
+                               noise_large * 2.0)
+            
+            # Apply light smoothing
+            gaussian_filter(pressure_change_low, sigma=0.5, mode='wrap', output=pressure_change_low)
+            
+            # Update low-resolution pressure
+            pressure_low += pressure_change_low
+            
+            # Apply constraints
+            pressure_low = np.clip(pressure_low, 87000.0, 108600.0)
+            
+            # Upsample back to full resolution and update sim's pressure field
+            full_res_pressure = zoom(pressure_low, factor, order=1)
+            
+            # Ensure proper dimensions (in case of rounding differences)
+            if full_res_pressure.shape != self.sim.pressure.shape:
+                full_res_pressure = np.resize(full_res_pressure, self.sim.pressure.shape)
+                
+            self.sim.pressure[:] = full_res_pressure
+            
+        except Exception as e:
+            print(f"Error in adaptive pressure update: {e}")
             traceback.print_exc()
 
     def _add_pressure_system(self, field, lon_center, lat_center, radius, strength):
